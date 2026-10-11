@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 
+http_api_token.json
 # Runtime output
 logs/
 已下单委托记录.json

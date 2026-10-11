@@ -31,6 +31,8 @@ import queue as qqueue
 import unicodedata as _ucd
 from datetime import datetime
 
+from http信号服务 import HTTPSignalServer
+
 # ---------------------------------------------------------------------------
 # macOS 提示: 系统自带的 Tk 是 8.5 老版本, 一启动界面就会在终端打印一行
 #   "DEPRECATION WARNING: The system version of Tk is deprecated ..."
@@ -93,17 +95,22 @@ DEFAULT_CONFIG = {
     "ignore_buy": False,
     "ignore_sell": False,
     "allow_reorder": False,             # 允许当天重复下单(跳过去重检查)
-    # --- Redis 实时信号源 (与 tools_ths.py 对接, 独立于 miniQMT 的 jq_signals 通道) ---
-    "signal_source": "redis",          # 固定 Redis 实时信号(网页扫描模式已移除)
-    "redis_host": "",               # 默认留空: 防止配置文件缺失时误连到原作者地址(朋友分享场景), 必须由用户填写
+    # --- Redis 实时信号源 ---
+    "signal_source": "redis",          # redis / http / both
+    "redis_host": "",                   # 默认留空: 防止误连未知服务器
     "redis_port": 1552,
     "redis_password": "",
     "redis_db": 0,
-    "redis_channel": "jq_signals_ths_mac",  # 必须与 tools_ths.py 的 CHANNELS 保持一致
-    "redis_strategy_filter": "",        # 策略名白名单, 逗号分隔, 空=不过滤(建议填 THS 专用策略名)
-    "redis_backtest_skip_hours": 2,     # 信号时间早于 N 小时视为回测信号, 跳过
-    "redis_allow_backtest_live": False, # 盘内(周一~五 09:00-15:30)默认禁止回测信号实盘下单, 勾选才放行
-    "strategy_ratios": "",              # 按策略单独设比例: 策略A_THS:1.0/0.5 (买入/卖出, 空=使用全局比例)
+    "redis_channel": "jq_signals_ths_mac",
+    "redis_strategy_filter": "",
+    "redis_backtest_skip_hours": 2,
+    "redis_allow_backtest_live": False,
+    # --- HTTP 信号源 ---
+    "http_enabled": False,
+    "http_host": "127.0.0.1",
+    "http_port": 8765,
+    "http_api_token": "",
+    "strategy_ratios": "",
 }
 
 
@@ -1027,19 +1034,56 @@ class FollowerEngine:
         self.order_executor = order_executor
         self.app = None
         self.state = "idle"
-        self._stop_event = None
         self._follow_thread = None
+        self._http_server = None
+        self._order_lock = threading.Lock()
         self.processed_orders, self.order_records = load_processed_orders()
         self.order_count = 0
 
+    def _start_http_server(self):
+        if not self.config.get("http_enabled", False):
+            return
+        try:
+            self._http_server = HTTPSignalServer(
+                self.config.get("http_host", "127.0.0.1"),
+                self.config.get("http_port", 8765),
+                self.config.get("http_api_token", ""),
+                self.submit_signal,
+                gui_log,
+            )
+            self._http_server.start()
+        except Exception as exc:
+            self._http_server = None
+            gui_log("HTTP 信号服务启动失败: %s" % exc, "ERROR")
+
+    def submit_signal(self, data):
+        """接收任一信号源的 JSON，并复用统一跟单管线。"""
+        if not isinstance(data, dict):
+            raise ValueError("信号必须是 JSON 对象")
+        with self._order_lock:
+            order = self._signal_to_order(data)
+            if not order:
+                return {"status": "filtered"}
+            if order["uid"] in self.processed_orders and not self.config.get("allow_reorder", False):
+                return {"status": "duplicate", "signal_id": order["uid"]}
+            self._process_order(order)
+            return {"status": "accepted", "signal_id": order["uid"]}
+
+    def _stop_http_server(self):
+        if self._http_server is not None:
+            self._http_server.stop()
+            self._http_server = None
+
     def stop(self):
+        self._stop_http_server()
         if self._stop_event:
             self._stop_event.set()
 
     def start_following(self):
-        # Redis 实时信号模式: 不需要浏览器, 直接启动监听线程
+        # Redis 和 HTTP 共用同一个跟单引擎。
         self._stop_event = threading.Event()
         self.state = "following"
+        self._start_http_server()
         self._follow_thread = threading.Thread(target=self._redis_follow_loop, daemon=True)
         self._follow_thread.start()
         gui_log(">>> Redis 跟单已启动 (通道 %s): blpop 实时接收 -> 键盘跟单" %
@@ -1181,22 +1225,13 @@ class FollowerEngine:
                         if isinstance(raw, bytes):
                             raw = raw.decode("utf-8", "ignore")
                         data = json.loads(raw)
+                        gui_log("收到信号: [%s] %s %s %s股" % (
+                            data.get("strategy_name", ""), data.get("security", ""),
+                            data.get("action", ""), data.get("amount_diff", "")), "INFO")
+                        self.submit_signal(data)
                     except Exception as e:
-                        gui_log("信号解析失败: %s" % e, "WARN")
+                        gui_log("信号解析或处理失败: %s" % e, "WARN")
                         continue
-                    # 收到就先记一条: 这样"发了几个信号 / 实际跟了几单"可以对上账。
-                    # 中间被过滤掉的, 紧接着会给出具体原因, 不会再出现"信号凭空消失"。
-                    gui_log("收到信号: [%s] %s %s %s股" % (
-                        data.get("strategy_name", ""), data.get("security", ""),
-                        data.get("action", ""), data.get("amount_diff", "")), "INFO")
-                    order = self._signal_to_order(data)
-                    if not order:
-                        continue
-                    if order["uid"] in self.processed_orders and not self.config.get("allow_reorder", False):
-                        gui_log("跳过信号: 与已处理过的信号重复(去重键相同) %s" % order.get("stock_code", ""), "INFO")
-                        continue
-                    # 复用现有管线: ignore_buy/sell + 买入/卖出比例 + min_amount + 键盘下单 + 记录
-                    self._process_order(order)
             except Exception as e:
                 gui_log("Redis 连接异常: %s, %ds 后重连" % (e, delay), "WARN")
                 if self._stop_event is not None:
@@ -2273,6 +2308,23 @@ class ControlPanel:
         ttk.Label(row4, text="(盘内09:00-15:30默认禁止，避免误下单)", foreground=UI.TEXT_MUTED,
                   font=(self._FONT_NAME, 7)).pack(side="left", padx=4)
 
+        self._card_hairline(g)
+        http_row = ttk.Frame(g); http_row.pack(fill="x", pady=2)
+        self.vars["http_enabled"] = tk.BooleanVar(value=self.cfg.get("http_enabled", False))
+        ttk.Checkbutton(http_row, text="启用 HTTP 信号", variable=self.vars["http_enabled"]).pack(side="left")
+        http_host = ttk.Frame(g); http_host.pack(fill="x", pady=2)
+        ttk.Label(http_host, text="HTTP地址:", width=_LBL_W, anchor="w").pack(side="left")
+        self.vars["http_host"] = tk.StringVar(value=self.cfg.get("http_host", "127.0.0.1"))
+        ttk.Entry(http_host, textvariable=self.vars["http_host"], width=12).pack(side="right", padx=(4, 2))
+        http_port = ttk.Frame(g); http_port.pack(fill="x", pady=2)
+        ttk.Label(http_port, text="HTTP端口:", width=_LBL_W, anchor="w").pack(side="left")
+        self.vars["http_port"] = tk.StringVar(value=str(self.cfg.get("http_port", 8765)))
+        ttk.Entry(http_port, textvariable=self.vars["http_port"], width=12).pack(side="right", padx=(4, 2))
+        http_token = ttk.Frame(g); http_token.pack(fill="x", pady=2)
+        ttk.Label(http_token, text="HTTP Token:", width=_LBL_W, anchor="w").pack(side="left")
+        self.vars["http_api_token"] = tk.StringVar(value=self.cfg.get("http_api_token", ""))
+        ttk.Entry(http_token, textvariable=self.vars["http_api_token"], width=12, show="●").pack(side="right", padx=(4, 2))
+
     def _toggle_redis_masked(self):
         """小眼睛按钮: 点击切换「显示/隐藏」Redis 地址与端口(脱敏防偷看)。
         隐藏时: 地址与端口显示成掩码, 且不可编辑(真实值保存在 _redis_real_* 里);
@@ -2729,8 +2781,8 @@ class ControlPanel:
         cfg["ignore_buy"] = self.vars["ignore_buy"].get()
         cfg["ignore_sell"] = self.vars["ignore_sell"].get()
         cfg["allow_reorder"] = self.vars["allow_reorder"].get()
-        # --- Redis 实时信号源 ---
-        cfg["signal_source"] = "redis"
+        # Redis 与 HTTP 可同时启用；兼容旧配置时默认保持 Redis。
+        cfg["signal_source"] = "both" if bool(self.vars["http_enabled"].get()) else "redis"
         # 眼睛处于隐藏状态时, 界面上显示的是掩码(●●●●), 保存必须用真实值,
         # 否则会把掩码写进配置, 导致 Redis 连不上(这就是之前 redis_host 变掩码的原因)
         if getattr(self, "_redis_hidden", False) and getattr(self, "_redis_real_host", ""):
@@ -2758,6 +2810,13 @@ class ControlPanel:
         # --- 定时激活(测试版新增) ---
         cfg["activation_times"] = self._collect_activation_times()
         cfg["activate_enabled"] = bool(self.vars["activate_enabled"].get())
+        cfg["http_enabled"] = bool(self.vars["http_enabled"].get())
+        cfg["http_host"] = self.vars["http_host"].get().strip() or "127.0.0.1"
+        try:
+            cfg["http_port"] = int(self.vars["http_port"].get().strip())
+        except Exception:
+            cfg["http_port"] = 8765
+        cfg["http_api_token"] = self.vars["http_api_token"].get().strip()
         return cfg
 
     def on_open_ths(self):
