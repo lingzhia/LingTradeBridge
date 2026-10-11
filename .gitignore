@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+
+# Runtime output
+logs/
+已下单委托记录.json
+崩溃日志.txt
+
+# macOS
+.DS_Store
+__MACOSX/

@@ -1,0 +1,11 @@
+{
+  "ths测试": {
+    "whitelisted": true,
+    "ratio_buy": 1.0,
+    "ratio_sell": 1.0,
+    "holdings": {}
+  },
+  "__order__": [
+    "ths测试"
+  ]
+}

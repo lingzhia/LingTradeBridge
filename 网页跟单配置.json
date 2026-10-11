@@ -1,0 +1,31 @@
+{
+  "ths_exe_path": "/Applications/同花顺.app",
+  "key_delay": 0.0001,
+  "window_title_keyword": "同花顺",
+  "follow_ratio_buy": 1.0,
+  "follow_ratio_sell": 1.0,
+  "strategy_ratios": "",
+  "redis_strategy_filter": "",
+  "min_amount": 100,
+  "buy_price_max": 0,
+  "test_buy_mode": "一次下三单",
+  "enable_market_price": true,
+  "ignore_buy": false,
+  "ignore_sell": false,
+  "allow_reorder": false,
+  "signal_source": "redis",
+  "redis_host": "",
+  "redis_port": 6379,
+  "redis_password": "",
+  "redis_db": 0,
+  "redis_channel": "jq_signals_ths_mac",
+  "redis_backtest_skip_hours": 8,
+  "redis_allow_backtest_live": false,
+  "activation_times": [
+    {
+      "time": "09:29",
+      "note": ""
+    }
+  ],
+  "activate_enabled": true
+}
