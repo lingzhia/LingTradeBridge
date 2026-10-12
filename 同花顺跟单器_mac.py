@@ -1776,7 +1776,7 @@ class ControlPanel:
             gui_log("辅助功能权限自查失败: %s" % e, "WARN")
 
     def _build_ui(self):
-        self.root.title("👺同花顺跟单器20261010   @冰山大火")
+        self.root.title("同花顺跟单器")
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
         # ---- 界面缩放: 固定 1.0 (小屏由 _autofit_check 自动下调, 无手动调节) ----
@@ -2550,97 +2550,154 @@ class ControlPanel:
             gui_log("若提示辅助功能权限问题, 请到「系统设置 -> 隐私与安全性 -> 辅助功能」授权", "INFO")
 
     def _build_group_redis(self, parent):
-        # ② 信号源 · Redis 标题行: 左边标题, 右边放小眼睛(脱敏地址/端口用)
+        # ② 信号源 标题行: 左边标题, 右边放小眼睛(脱敏 Redis 地址/端口用)
         # 注意: 必须用 tk.Frame 并指定 bg=UI.BG —— ttk.Frame 不接受 bg 参数,
         # 会露出主题默认的白色, 让这一行和周围的灰底不一致
         caption_row = tk.Frame(parent, bg=UI.BG)
         caption_row.pack(fill="x", padx=6, pady=(2, 1))
-        tk.Label(caption_row, text="② 信号源 (Redis / HTTP)", fg=UI.TEXT_MUTED, bg=UI.BG,
+        tk.Label(caption_row, text="② 信号源", fg=UI.TEXT_MUTED, bg=UI.BG,
                  font=self._font_medium).pack(side="left")
         self._redis_hidden = False
         # 用 tk.Button 并指定与标题完全一致的底纹/文字色(UI.BG + UI.TEXT_MUTED),
-        # 让眼睛按钮和「② 信号源 · Redis」看起来像一体
+        # 让眼睛按钮和标题看起来像一体。这里先不 pack —— 由
+        # _apply_signal_source_ui() 按当前信号源决定要不要露出来
         self.btn_redis_eye = tk.Button(caption_row, text="👁", width=2,
                                        command=self._toggle_redis_masked,
                                        bg=UI.BG, fg=UI.TEXT_MUTED,
                                        activebackground=UI.BG, activeforeground=UI.TEXT_MUTED,
                                        bd=0, relief="flat", highlightthickness=0, pady=0)
-        # 紧挨在标题文字右边, 不推去最右端
-        self.btn_redis_eye.pack(side="left", padx=(1, 0))
         card = RoundedCard(parent, pad=8)
         card.pack(fill="x", padx=2, pady=(0, 8))
         g = card.body
 
-        # 六行纵向排版: 文字左对齐, 填空框顶到右边
-        # 每行 = 一个 Frame, 左边放左对齐标签(统一宽度), 右边放填写框(side="right" 让它贴右边)
-        _LBL_W = 14   # 六行统一这个宽度, 文字起点才会对齐(标签文字本身更长会自动撑开)
-        r_host = ttk.Frame(g); r_host.pack(fill="x", pady=2)
-        ttk.Label(r_host, text="Redis地址:", width=_LBL_W, anchor="w").pack(side="left")
-        self.vars["redis_host"] = tk.StringVar(value=self.cfg.get("redis_host", "124.220.21.154"))
-        self._redis_host_entry = ttk.Entry(r_host, textvariable=self.vars["redis_host"], width=12)
-        self._redis_host_entry.pack(side="right", padx=(4, 2))
+        # 下面每个配置区都用统一的标签宽度, 文字起点才会对齐
+        _LBL_W = 14
 
-        r_port = ttk.Frame(g); r_port.pack(fill="x", pady=2)
-        ttk.Label(r_port, text="端口:", width=_LBL_W, anchor="w").pack(side="left")
-        self.vars["redis_port"] = tk.StringVar(value=str(self.cfg.get("redis_port", 1552)))
-        self._redis_port_entry = ttk.Entry(r_port, textvariable=self.vars["redis_port"], width=12)
-        self._redis_port_entry.pack(side="right", padx=(4, 2))
-
-        r_db = ttk.Frame(g); r_db.pack(fill="x", pady=2)
-        ttk.Label(r_db, text="DB:", width=_LBL_W, anchor="w").pack(side="left")
-        self.vars["redis_db"] = tk.StringVar(value=str(self.cfg.get("redis_db", 0)))
-        ttk.Entry(r_db, textvariable=self.vars["redis_db"], width=12).pack(side="right", padx=(4, 2))
-
-        r_pwd = ttk.Frame(g); r_pwd.pack(fill="x", pady=2)
-        ttk.Label(r_pwd, text="密码:", width=_LBL_W, anchor="w").pack(side="left")
-        self.vars["redis_password"] = tk.StringVar(value=self.cfg.get("redis_password", ""))
-        ttk.Entry(r_pwd, textvariable=self.vars["redis_password"], width=12, show="●").pack(side="right", padx=(4, 2))
-
-        r_ch = ttk.Frame(g); r_ch.pack(fill="x", pady=2)
-        ttk.Label(r_ch, text="通道:", width=_LBL_W, anchor="w").pack(side="left")
-        self.vars["redis_channel"] = tk.StringVar(value=self.cfg.get("redis_channel", "jq_signals_ths"))
-        ttk.Entry(r_ch, textvariable=self.vars["redis_channel"], width=12).pack(side="right", padx=(4, 2))
-
-        r_skip = ttk.Frame(g); r_skip.pack(fill="x", pady=2)
-        ttk.Label(r_skip, text="回测过滤:", width=_LBL_W, anchor="w").pack(side="left")
-        self.vars["redis_backtest_skip_hours"] = tk.StringVar(value=str(self.cfg.get("redis_backtest_skip_hours", 2)))
-        ttk.Entry(r_skip, textvariable=self.vars["redis_backtest_skip_hours"], width=12).pack(side="right", padx=(4, 2))
-        ttk.Label(r_skip, text="早于N=回测", foreground=UI.TEXT_MUTED,
-                  font=(self._FONT_NAME, 7)).pack(side="right")
-
-        self._card_hairline(g)
-        row4 = ttk.Frame(g); row4.pack(fill="x", pady=2)
-        self.vars["redis_allow_backtest_live"] = tk.BooleanVar(value=self.cfg.get("redis_allow_backtest_live", False))
-        ttk.Checkbutton(row4, text="允许回测信号实盘下单", variable=self.vars["redis_allow_backtest_live"],
-                        command=self._ask_backtest_live).pack(side="left")
-        ttk.Label(row4, text="(盘内09:00-15:30默认禁止，避免误下单)", foreground=UI.TEXT_MUTED,
-                  font=(self._FONT_NAME, 7)).pack(side="left", padx=4)
-
-        self._card_hairline(g)
-        # 信号源选择: HTTP / Redis / 两者 (默认 HTTP, 不启用 Redis)
+        # ---- 信号源选择 (放卡片最上面: 选哪个就只展开哪个的配置) ----
         src_row = ttk.Frame(g); src_row.pack(fill="x", pady=2)
         ttk.Label(src_row, text="信号源:", width=_LBL_W, anchor="w").pack(side="left")
         self._src_labels = {"redis": "Redis", "http": "HTTP", "both": "HTTP + Redis"}
         self._src_label_by_key = {v: k for k, v in self._src_labels.items()}
         src_now = normalize_signal_source(self.cfg.get("signal_source"))
         self.vars["signal_source_display"] = tk.StringVar(value=self._src_labels[src_now])
-        ttk.Combobox(src_row, textvariable=self.vars["signal_source_display"], width=12,
-                     state="readonly", values=tuple(self._src_labels.values())).pack(side="right", padx=(4, 2))
-        http_row = ttk.Frame(g); http_row.pack(fill="x", pady=2)
-        ttk.Label(http_row, text="(HTTP 需 Token 鉴权; Redis 需填地址/通道)", foreground=UI.TEXT_MUTED,
-                  font=(self._FONT_NAME, 7)).pack(side="left")
-        http_host = ttk.Frame(g); http_host.pack(fill="x", pady=2)
+        self._src_combo = ttk.Combobox(src_row, textvariable=self.vars["signal_source_display"],
+                                       width=12, state="readonly",
+                                       values=tuple(self._src_labels.values()))
+        self._src_combo.pack(side="right", padx=(4, 2))
+        self._src_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_signal_source_ui())
+
+        # ================= HTTP 配置区 (选 HTTP / HTTP+Redis 时展开) =================
+        self._http_box = ttk.Frame(g)
+        self._card_hairline(self._http_box)
+        _hint = ttk.Frame(self._http_box); _hint.pack(fill="x", pady=(0, 2))
+        ttk.Label(_hint, text="本机 HTTP 信号服务, 请求需带 Token 鉴权",
+                  foreground=UI.TEXT_MUTED, font=(self._FONT_NAME, 8)).pack(side="left")
+
+        http_host = ttk.Frame(self._http_box); http_host.pack(fill="x", pady=2)
         ttk.Label(http_host, text="HTTP地址:", width=_LBL_W, anchor="w").pack(side="left")
         self.vars["http_host"] = tk.StringVar(value=self.cfg.get("http_host", "127.0.0.1"))
         ttk.Entry(http_host, textvariable=self.vars["http_host"], width=12).pack(side="right", padx=(4, 2))
-        http_port = ttk.Frame(g); http_port.pack(fill="x", pady=2)
+
+        http_port = ttk.Frame(self._http_box); http_port.pack(fill="x", pady=2)
         ttk.Label(http_port, text="HTTP端口:", width=_LBL_W, anchor="w").pack(side="left")
         self.vars["http_port"] = tk.StringVar(value=str(self.cfg.get("http_port", 8765)))
         ttk.Entry(http_port, textvariable=self.vars["http_port"], width=12).pack(side="right", padx=(4, 2))
-        http_token = ttk.Frame(g); http_token.pack(fill="x", pady=2)
+
+        http_token = ttk.Frame(self._http_box); http_token.pack(fill="x", pady=2)
         ttk.Label(http_token, text="HTTP Token:", width=_LBL_W, anchor="w").pack(side="left")
         self.vars["http_api_token"] = tk.StringVar(value=self.cfg.get("http_api_token", ""))
-        ttk.Entry(http_token, textvariable=self.vars["http_api_token"], width=12, show="●").pack(side="right", padx=(4, 2))
+        ttk.Entry(http_token, textvariable=self.vars["http_api_token"], width=12,
+                  show="●").pack(side="right", padx=(4, 2))
+
+        # ================= Redis 配置区 (选 Redis / HTTP+Redis 时展开) =================
+        self._redis_box = ttk.Frame(g)
+        self._card_hairline(self._redis_box)
+        _rhint = ttk.Frame(self._redis_box); _rhint.pack(fill="x", pady=(0, 2))
+        ttk.Label(_rhint, text="订阅 Redis 通道, 与 tools_ths_redis.py 保持一致",
+                  foreground=UI.TEXT_MUTED, font=(self._FONT_NAME, 8)).pack(side="left")
+
+        r_host = ttk.Frame(self._redis_box); r_host.pack(fill="x", pady=2)
+        ttk.Label(r_host, text="Redis地址:", width=_LBL_W, anchor="w").pack(side="left")
+        self.vars["redis_host"] = tk.StringVar(value=self.cfg.get("redis_host", "124.220.21.154"))
+        self._redis_host_entry = ttk.Entry(r_host, textvariable=self.vars["redis_host"], width=12)
+        self._redis_host_entry.pack(side="right", padx=(4, 2))
+
+        r_port = ttk.Frame(self._redis_box); r_port.pack(fill="x", pady=2)
+        ttk.Label(r_port, text="端口:", width=_LBL_W, anchor="w").pack(side="left")
+        self.vars["redis_port"] = tk.StringVar(value=str(self.cfg.get("redis_port", 1552)))
+        self._redis_port_entry = ttk.Entry(r_port, textvariable=self.vars["redis_port"], width=12)
+        self._redis_port_entry.pack(side="right", padx=(4, 2))
+
+        r_db = ttk.Frame(self._redis_box); r_db.pack(fill="x", pady=2)
+        ttk.Label(r_db, text="DB:", width=_LBL_W, anchor="w").pack(side="left")
+        self.vars["redis_db"] = tk.StringVar(value=str(self.cfg.get("redis_db", 0)))
+        ttk.Entry(r_db, textvariable=self.vars["redis_db"], width=12).pack(side="right", padx=(4, 2))
+
+        r_pwd = ttk.Frame(self._redis_box); r_pwd.pack(fill="x", pady=2)
+        ttk.Label(r_pwd, text="密码:", width=_LBL_W, anchor="w").pack(side="left")
+        self.vars["redis_password"] = tk.StringVar(value=self.cfg.get("redis_password", ""))
+        ttk.Entry(r_pwd, textvariable=self.vars["redis_password"], width=12,
+                  show="●").pack(side="right", padx=(4, 2))
+
+        r_ch = ttk.Frame(self._redis_box); r_ch.pack(fill="x", pady=2)
+        ttk.Label(r_ch, text="通道:", width=_LBL_W, anchor="w").pack(side="left")
+        self.vars["redis_channel"] = tk.StringVar(value=self.cfg.get("redis_channel", "jq_signals_ths"))
+        ttk.Entry(r_ch, textvariable=self.vars["redis_channel"], width=12).pack(side="right", padx=(4, 2))
+
+        r_skip = ttk.Frame(self._redis_box); r_skip.pack(fill="x", pady=2)
+        ttk.Label(r_skip, text="回测过滤:", width=_LBL_W, anchor="w").pack(side="left")
+        self.vars["redis_backtest_skip_hours"] = tk.StringVar(
+            value=str(self.cfg.get("redis_backtest_skip_hours", 2)))
+        ttk.Entry(r_skip, textvariable=self.vars["redis_backtest_skip_hours"], width=12).pack(
+            side="right", padx=(4, 2))
+        ttk.Label(r_skip, text="早于N=回测", foreground=UI.TEXT_MUTED,
+                  font=(self._FONT_NAME, 7)).pack(side="right")
+
+        self._card_hairline(self._redis_box)
+        row4 = ttk.Frame(self._redis_box); row4.pack(fill="x", pady=2)
+        self.vars["redis_allow_backtest_live"] = tk.BooleanVar(
+            value=self.cfg.get("redis_allow_backtest_live", False))
+        ttk.Checkbutton(row4, text="允许回测信号实盘下单", variable=self.vars["redis_allow_backtest_live"],
+                        command=self._ask_backtest_live).pack(side="left")
+        ttk.Label(row4, text="(盘内09:00-15:30默认禁止)", foreground=UI.TEXT_MUTED,
+                  font=(self._FONT_NAME, 7)).pack(side="left", padx=4)
+
+        # 按配置里已保存的信号源决定初始展开哪一块(默认 http)
+        self._apply_signal_source_ui()
+
+    def _apply_signal_source_ui(self):
+        """按选中的信号源只展开对应的配置区: HTTP 只显示 HTTP 配置, Redis 只显示
+        Redis 配置, 选「HTTP + Redis」时两块都展开。"""
+        key = self._src_label_by_key.get(self.vars["signal_source_display"].get(),
+                                         DEFAULT_SIGNAL_SOURCE)
+        show_http = key in ("http", "both")
+        show_redis = key in ("redis", "both")
+        # 固定按 http -> redis 的顺序重排, 保证两块同时显示时顺序稳定
+        for box, show in ((self._http_box, show_http), (self._redis_box, show_redis)):
+            box.pack_forget()
+            if show:
+                box.pack(fill="x")
+        # 小眼睛(Redis 地址脱敏)只在 Redis 配置可见时才有意义
+        try:
+            self.btn_redis_eye.pack_forget()
+            if show_redis:
+                self.btn_redis_eye.pack(side="left", padx=(1, 0))
+        except Exception:
+            pass
+        self._refresh_scroll_region()
+
+    def _refresh_scroll_region(self):
+        """内容高度变化后重算外层滚动区域, 否则切换配置区时多出来的部分会被裁掉。"""
+        try:
+            cvs = getattr(self, "_main_canvas", None)
+            inner = getattr(self, "_main_inner", None)
+            if cvs is None or inner is None:
+                return
+            self.root.update_idletasks()
+            cvs.itemconfig("inner", height=max(inner.winfo_reqheight(), cvs.winfo_height()))
+            cvs.configure(scrollregion=cvs.bbox("all"))
+        except Exception:
+            pass
 
     def _toggle_redis_masked(self):
         """小眼睛按钮: 点击切换「显示/隐藏」Redis 地址与端口(脱敏防偷看)。
@@ -3114,13 +3171,15 @@ class ControlPanel:
         cfg["http_enabled"] = cfg["signal_source"] in ("http", "both")
         # 眼睛处于隐藏状态时, 界面上显示的是掩码(●●●●), 保存必须用真实值,
         # 否则会把掩码写进配置, 导致 Redis 连不上(这就是之前 redis_host 变掩码的原因)
-        if getattr(self, "_redis_hidden", False) and getattr(self, "_redis_real_host", ""):
-            cfg["redis_host"] = self._redis_real_host.strip()
+        # 注意: 判据只看 _redis_hidden, 不能加 "真实值非空" —— 真实值本来就是
+        # 空字符串时(还没填地址)那样判断会漏掉, 照样把掩码存进去
+        if getattr(self, "_redis_hidden", False):
+            cfg["redis_host"] = str(getattr(self, "_redis_real_host", "")).strip()
         else:
             cfg["redis_host"] = self.vars["redis_host"].get().strip()
         try:
-            if getattr(self, "_redis_hidden", False) and getattr(self, "_redis_real_port", ""):
-                cfg["redis_port"] = int(str(self._redis_real_port).strip())
+            if getattr(self, "_redis_hidden", False):
+                cfg["redis_port"] = int(str(getattr(self, "_redis_real_port", "")).strip())
             else:
                 cfg["redis_port"] = int(self.vars["redis_port"].get().strip())
         except Exception:
