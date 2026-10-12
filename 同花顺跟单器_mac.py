@@ -1498,6 +1498,11 @@ class UI:
     SURFACE_MUTED = "#E9E9EB"  # 工具栏/次级区域 (systemGray5)
     FOOTER = "#EFEFF4"         # 状态条 (systemGray5Light)
     BORDER = "#D8D8DC"         # 细分隔线 (systemSeparator)
+    CARD_BORDER = "#E6E6EB"    # 卡片极浅描边, 让白卡在灰底上"浮"起来
+    HAIRLINE = "#EDEDF2"       # 卡片内行分隔线(比 BORDER 更淡)
+    FIELD_BORDER = "#DCDCE1"   # 输入框描边
+    HOVER_SOFT = "#F0F0F5"     # 幽灵按钮悬停底色
+    PRESS_SOFT = "#E3E3E9"     # 幽灵按钮按下底色
     # 文字
     TEXT = "#1C1C1E"           # 主文字
     TEXT_MUTED = "#8E8E93"     # 次级/提示文字 (systemGray)
@@ -1524,14 +1529,18 @@ class UI:
 class RoundedCard(tk.Frame):
     """苹果风圆角白卡容器: 在灰底上自绘圆角白卡, 内容放入 .body。
     body 用 pack 驱动卡片自然尺寸(不被 Canvas 默认尺寸撑高),
-    Canvas 仅 place 铺底绘制圆角背景(不参与 reqsize), 内容内缩一个圆角半径使圆角可见。"""
+    Canvas 仅 place 铺底绘制圆角背景(不参与 reqsize), 内容内缩一个圆角半径使圆角可见。
+    描边用"外圈深色多边形 + 内圈浅色多边形"两层叠加实现(比给 smooth 多边形描边更干净),
+    默认只在灰底上才画, 顶栏那种同色背景可以传 border=None 关掉。"""
 
-    def __init__(self, master, radius=12, fill=UI.SURFACE, pad=8, bg=None, **kw):
+    def __init__(self, master, radius=14, fill=UI.SURFACE, pad=8, bg=None,
+                 border=UI.CARD_BORDER, **kw):
         bg = bg if bg is not None else UI.BG
         super().__init__(master, bg=bg, **kw)
         self._r = int(radius)
         self._fill = fill
         self._pad = int(pad)
+        self._border = border
         # 先创建 Canvas(铺底) 再创建 body: Tk 的 z-order 后创建者在上,
         # 避免对 Canvas 调用 .lower()(会派发到 item lower 命令而报错)。
         # width/height 必须设为 1: tk.Canvas 默认尺寸是 283x198, 会强行撑大卡片宽度
@@ -1541,6 +1550,12 @@ class RoundedCard(tk.Frame):
         self.body.pack(fill="both", expand=True, padx=self._pad + self._r, pady=self._pad + self._r)
         self.bind("<Configure>", self._redraw)
 
+    def _round_rect(self, x1, y1, x2, y2, r, fill):
+        r = max(2, min(r, (x2 - x1) // 2, (y2 - y1) // 2))
+        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+               x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        self._canvas.create_polygon(pts, smooth=True, fill=fill, outline="", tags="cardbg")
+
     def _redraw(self, _e=None):
         w = self.winfo_width()
         h = self.winfo_height()
@@ -1548,10 +1563,168 @@ class RoundedCard(tk.Frame):
             return
         self._canvas.delete("cardbg")
         x1, y1, x2, y2 = self._pad, self._pad, w - self._pad, h - self._pad
-        r = min(self._r, (x2 - x1) // 2, (y2 - y1) // 2)
+        if self._border:
+            # 外圈描边色 + 内圈卡片色, 视觉上就是 1px 的极浅描边
+            self._round_rect(x1, y1, x2, y2, self._r, self._border)
+            self._round_rect(x1 + 1, y1 + 1, x2 - 1, y2 - 1, self._r - 1, self._fill)
+        else:
+            self._round_rect(x1, y1, x2, y2, self._r, self._fill)
+
+
+class RoundButton(tk.Canvas):
+    """苹果风圆角按钮: Canvas 自绘圆角矩形 + 居中文字, 带悬停/按下反馈。
+
+    替代 ttk 在 clam 主题下的方角按钮, 与圆角卡片视觉统一。
+    用法与 ttk.Button 基本一致: RoundButton(parent, text=..., command=..., kind=...),
+    支持 pack/grid 的 fill="x"(内部按 <Configure> 重绘)。
+    kind 取值: primary(实心蓝) / danger(实心红) / success(实心绿)
+              / ghost(白底蓝字带描边) / bar(顶栏灰, 默认) / text(弱化灰字)
+    """
+
+    _STYLES = {
+        "primary": dict(bg=UI.BRAND, hover=UI.BRAND_DARK, press="#0055B3",
+                        fg="#FFFFFF", border=None),
+        "danger": dict(bg=UI.DANGER, hover="#D9261B", press="#B71C1C",
+                       fg="#FFFFFF", border=None),
+        "success": dict(bg=UI.SUCCESS, hover=UI.SUCCESS_DARK, press="#1E8C3C",
+                        fg="#FFFFFF", border=None),
+        "ghost": dict(bg=UI.SURFACE, hover=UI.BRAND_SOFT, press="#D9E8FF",
+                      fg=UI.BRAND, border=UI.FIELD_BORDER),
+        "bar": dict(bg=UI.HEADER, hover=UI.SURFACE_MUTED, press=UI.PRESS_SOFT,
+                    fg=UI.TEXT, border=None),
+        "text": dict(bg=UI.HEADER, hover=UI.SURFACE_MUTED, press=UI.PRESS_SOFT,
+                     fg=UI.TEXT_MUTED, border=None),
+        "soft": dict(bg=UI.SURFACE_MUTED, hover=UI.PRESS_SOFT, press="#D2D2D8",
+                     fg=UI.TEXT, border=None),
+    }
+
+    def __init__(self, master, text="", command=None, kind="bar", width=None,
+                 height=30, radius=8, font=None, parent_bg=None, padx=12, **kw):
+        self._style = self._STYLES.get(kind, self._STYLES["bar"])
+        self._mbg = parent_bg if parent_bg is not None else self._guess_bg(master)
+        self._font = font or ("TkDefaultFont", 12)
+        self._text = text
+        self._command = command
+        self._radius = radius
+        self._height = height
+        self._padx = padx
+        self._hover = False
+        self._pressed = False
+        self._enabled = True
+        w = width if width is not None else self._text_width(text) + 2 * padx
+        super().__init__(master, bd=0, highlightthickness=0, bg=self._mbg,
+                         width=w, height=height, takefocus=0, **kw)
+        self.bind("<Configure>", lambda e: self._redraw())
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self._redraw()
+
+    # ---------- 内部 ----------
+    @staticmethod
+    def _guess_bg(master):
+        """推断父容器底色, 用来填圆角外的四个角(ttk 控件取不到 bg 就按白卡处理)。"""
+        try:
+            return master.cget("bg")
+        except Exception:
+            return UI.SURFACE
+
+    def _text_width(self, text):
+        try:
+            import tkinter.font as _tkfont
+            return _tkfont.Font(font=self._font).measure(text)
+        except Exception:
+            return len(text) * 9
+
+    def _colors(self):
+        st = self._style
+        if not self._enabled:
+            return UI.SURFACE_MUTED, UI.TEXT_FAINT
+        if self._pressed:
+            return st["press"], st["fg"]
+        if self._hover:
+            return st["hover"], st["fg"]
+        return st["bg"], st["fg"]
+
+    def _redraw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 2 or h <= 2:
+            return
+        bgc, fgc = self._colors()
+        r = max(2, min(self._radius, h // 2))
+        x1, y1, x2, y2 = 0.5, 0.5, w - 0.5, h - 0.5
         pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
                x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-        self._canvas.create_polygon(pts, smooth=True, fill=self._fill, outline="", tags="cardbg")
+        if self._style["border"] and self._enabled:
+            self.create_polygon(pts, smooth=True, fill=self._style["border"], outline="")
+            ix1, iy1, ix2, iy2 = 1.5, 1.5, w - 1.5, h - 1.5
+            r2 = max(2, r - 1)
+            ipts = [ix1 + r2, iy1, ix2 - r2, iy1, ix2, iy1, ix2, iy1 + r2,
+                    ix2, iy2 - r2, ix2, iy2, ix2 - r2, iy2, ix1 + r2, iy2,
+                    ix1, iy2, ix1, iy2 - r2, ix1, iy1 + r2, ix1, iy1]
+            self.create_polygon(ipts, smooth=True, fill=bgc, outline="")
+        else:
+            self.create_polygon(pts, smooth=True, fill=bgc, outline="")
+        self.create_text(w / 2, h / 2, text=self._text, fill=fgc, font=self._font)
+
+    def _on_enter(self, _e):
+        self._hover = True
+        if self._enabled:
+            self.config(cursor="pointinghand")
+        self._redraw()
+
+    def _on_leave(self, _e):
+        self._hover = False
+        self._pressed = False
+        self._redraw()
+
+    def _on_press(self, _e):
+        if not self._enabled:
+            return
+        self._pressed = True
+        self._redraw()
+
+    def _on_release(self, _e):
+        if not self._enabled or not self._pressed:
+            self._pressed = False
+            return
+        self._pressed = False
+        self._redraw()
+        self.invoke()
+
+    # ---------- 对外接口(兼容 ttk.Button 的常用调用) ----------
+    def invoke(self):
+        if self._enabled and self._command:
+            try:
+                self._command()
+            except Exception as e:
+                # 不让界面因为一个按钮回调出错就整体崩掉, 但错误必须留痕
+                try:
+                    gui_log("按钮[%s]执行异常: %s" % self._text, e, "ERROR")
+                except Exception:
+                    pass
+
+    def config(self, **kw):
+        """支持 text / kind / state / command / font 的原地修改。"""
+        if "text" in kw:
+            self._text = kw.pop("text")
+        if "command" in kw:
+            self._command = kw.pop("command")
+        if "kind" in kw:
+            self._style = self._STYLES.get(kw.pop("kind"), self._STYLES["bar"])
+        if "font" in kw:
+            self._font = kw.pop("font")
+        if "state" in kw:
+            self._enabled = kw.pop("state") != "disabled"
+        if kw:
+            super().config(**kw)
+        self._redraw()
+        return self
+
+    configure = config
 
 
 # ===========================================================================
@@ -1581,6 +1754,26 @@ class ControlPanel:
                      "redis": "Redis (通道 %s)" % self.cfg.get("redis_channel", ""),
                      "both": "HTTP + Redis"}.get(_src, _src)
         gui_log("当前信号源: %s —— 点击[开始跟单]启动对应通道" % _src_desc, "INFO")
+        # 辅助功能权限自查(后台线程, 避免和系统对话框抢主线程)
+        threading.Thread(target=self._check_ax_permission, daemon=True).start()
+
+    def _check_ax_permission(self):
+        """启动后自查「辅助功能」权限; 未授权就弹一次系统授权对话框。
+
+        为什么要主动弹: macOS 按"责任进程"记账, 从终端启动时权限记在终端头上,
+        换成双击「启动跟单器.app」后记账对象变成这个 .app —— 不重新授权的话,
+        读持仓/委托和下单都会被系统拒绝, 而且要到点[测试连接]时才发现。"""
+        try:
+            if _mac_order._ax_trusted():
+                return
+            gui_log("检测到尚未授予「辅助功能」权限, 正在弹出系统授权窗口...", "WARN")
+            if _mac_order._ax_request_trust():
+                gui_log("辅助功能权限已就绪", "OK")
+            else:
+                gui_log("还没拿到辅助功能权限: 请在弹窗里点「打开系统设置」, "
+                        "把「同花顺跟单器」勾上后重启本程序", "WARN")
+        except Exception as e:
+            gui_log("辅助功能权限自查失败: %s" % e, "WARN")
 
     def _build_ui(self):
         self.root.title("👺同花顺跟单器20261010   @冰山大火")
@@ -1610,13 +1803,20 @@ class ControlPanel:
         except Exception:
             pass
 
-        # 字体检测: 微软雅黑在 Windows Server 上可能未安装, 回退到 Tahoma
+        # 字体检测: 优先系统原生中文字体(中文渲染最清晰), 逐级回退
+        # (微软雅黑是 Windows 版遗留; macOS 上命中它才会回退到 Tahoma 那种点阵观感)
         try:
             import tkinter.font as _tkfont
-            _avail = _tkfont.families()
-            self._FONT_NAME = "Microsoft YaHei" if "Microsoft YaHei" in _avail else "Tahoma"
+            _avail = set(_tkfont.families())
         except Exception:
-            self._FONT_NAME = "Tahoma"
+            _avail = set()
+        self._FONT_NAME = next(
+            (f for f in ("PingFang SC", "Hiragino Sans GB", "Heiti SC",
+                         "Microsoft YaHei", "Tahoma") if f in _avail), "Tahoma")
+        # 等宽字体: 日志/时钟/编号用, 数字等宽才不会跳动
+        self._FONT_MONO = next(
+            (f for f in ("SF Mono", "Menlo", "Monaco", "Consolas",
+                         "Courier New") if f in _avail), "Courier New")
         _font_base = (self._FONT_NAME, 9)
         _font_small = (self._FONT_NAME, 8)
         self._font_medium = (self._FONT_NAME, 10)
@@ -1663,13 +1863,43 @@ class ControlPanel:
         style.map("Test.TButton",
                   background=[("active", UI.SURFACE_MUTED), ("pressed", UI.SURFACE_MUTED)],
                   foreground=[("active", UI.TEXT), ("pressed", UI.TEXT)])
-        style.configure("TEntry", padding=3)
+        # 输入框: 加极浅描边与内边距, 聚焦时描边变品牌蓝 (clam 下 bordercolor 才生效)
+        style.configure("TEntry", padding=(6, 4), borderwidth=1, relief="solid",
+                        fieldbackground=UI.SURFACE, foreground=UI.TEXT,
+                        bordercolor=UI.FIELD_BORDER, lightcolor=UI.FIELD_BORDER,
+                        darkcolor=UI.FIELD_BORDER, insertcolor=UI.BRAND)
+        style.map("TEntry",
+                  bordercolor=[("focus", UI.BRAND)],
+                  lightcolor=[("focus", UI.BRAND)],
+                  darkcolor=[("focus", UI.BRAND)],
+                  fieldbackground=[("disabled", UI.BG)])
+        # 下拉框: 同款描边; readonly 态去掉系统蓝色选中底, 避免值显示成"反白"
+        style.configure("TCombobox", padding=(6, 3), borderwidth=1,
+                        fieldbackground=UI.SURFACE, background=UI.SURFACE,
+                        foreground=UI.TEXT, arrowcolor=UI.TEXT_MUTED,
+                        bordercolor=UI.FIELD_BORDER, lightcolor=UI.FIELD_BORDER,
+                        darkcolor=UI.FIELD_BORDER)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", UI.SURFACE), ("disabled", UI.BG)],
+                  selectbackground=[("readonly", UI.SURFACE)],
+                  selectforeground=[("readonly", UI.TEXT)],
+                  bordercolor=[("focus", UI.BRAND), ("hover", UI.FIELD_BORDER)],
+                  lightcolor=[("focus", UI.BRAND)], darkcolor=[("focus", UI.BRAND)])
+        # 滚动条: 收窄并换成浅灰滑块(clam 默认那条粗凹槽太抢眼)
+        style.configure("Vertical.TScrollbar", width=10, borderwidth=0, arrowsize=12,
+                        background=UI.SURFACE_MUTED, troughcolor=UI.BG,
+                        bordercolor=UI.BG, lightcolor=UI.SURFACE_MUTED,
+                        darkcolor=UI.SURFACE_MUTED, arrowcolor=UI.TEXT_FAINT,
+                        relief="flat")
+        style.map("Vertical.TScrollbar",
+                  background=[("active", UI.BORDER), ("pressed", UI.BORDER)])
         # Treeview 零边框零内边距, 确保数据行与合计列像素级对齐
-        style.configure("Treeview", borderwidth=0, padding=0, relief="flat")
+        style.configure("Treeview", borderwidth=0, padding=0, relief="flat", rowheight=26)
         # 表头灰底加粗, 与数据行视觉分离
         style.configure("Treeview.Heading", background=UI.SURFACE_MUTED,
                         foreground=UI.TEXT, borderwidth=0, relief="flat",
-                        padding=(4, 2), font=(self._FONT_NAME, 9, "bold"))
+                        padding=(6, 4), font=(self._FONT_NAME, 9, "bold"))
+        style.map("Treeview.Heading", background=[("active", UI.PRESS_SOFT)])
         # 白底卡片内容统一用 SURFACE, 避免卡片上出现灰底块
         style.configure("TLabel", background=UI.SURFACE)
         style.configure("TFrame", background=UI.SURFACE)
@@ -1744,19 +1974,23 @@ class ControlPanel:
         _vsep()
 
         # ② 工具组: 保存配置 / 窗口置顶
-        ttk.Button(header, text="保存配置", style="Toolbar.TButton",
-                   command=self.on_save).pack(side="left", padx=2, pady=6)
+        RoundButton(header, text="保存配置", kind="bar", font=self._font_medium,
+                    parent_bg=UI.HEADER, height=32, command=self.on_save
+                    ).pack(side="left", padx=2, pady=7)
         self._topmost_var = tk.BooleanVar(value=False)
-        self.btn_topmost = ttk.Button(header, text="窗口置顶", style="Ghost.TButton",
-                                      command=self.on_toggle_topmost)
-        self.btn_topmost.pack(side="left", padx=2, pady=6)
+        self.btn_topmost = RoundButton(header, text="窗口置顶", kind="ghost",
+                                       font=self._font_medium, parent_bg=UI.HEADER,
+                                       height=32, command=self.on_toggle_topmost)
+        self.btn_topmost.pack(side="left", padx=2, pady=7)
         _vsep()
 
         # ③ 测试组 (弱化样式): 买入测试 / 卖出测试 / 模式
-        ttk.Button(header, text="买入测试", style="Test.TButton",
-                   command=self.on_test_signal).pack(side="left", padx=2, pady=6)
-        ttk.Button(header, text="卖出测试", style="Test.TButton",
-                   command=self.on_test_sell).pack(side="left", padx=2, pady=6)
+        RoundButton(header, text="买入测试", kind="text", font=self._font_medium,
+                    parent_bg=UI.HEADER, height=32, command=self.on_test_signal
+                    ).pack(side="left", padx=2, pady=7)
+        RoundButton(header, text="卖出测试", kind="text", font=self._font_medium,
+                    parent_bg=UI.HEADER, height=32, command=self.on_test_sell
+                    ).pack(side="left", padx=2, pady=7)
         # 模式选择: 仅保留下拉框(自解释), 省出顶栏宽度
         self.vars["test_buy_mode"] = tk.StringVar(value=self.cfg.get("test_buy_mode", "一次下三单"))
         ttk.Combobox(header, textvariable=self.vars["test_buy_mode"], width=8, state="readonly",
@@ -1775,8 +2009,9 @@ class ControlPanel:
         card_o, self._card_labels["已下单"] = _mk_stat_card("已下单 0")
         card_o.pack(side="right", padx=(0, 4), pady=8)
         # 清空计数按钮 (位于已处理卡片左侧)
-        ttk.Button(header, text="清空计数", style="Test.TButton",
-                   command=self.on_clear_stats).pack(side="right", padx=(0, 4), pady=8)
+        RoundButton(header, text="清空计数", kind="text", font=self._font_medium,
+                    parent_bg=UI.HEADER, height=26, radius=7, padx=9,
+                    command=self.on_clear_stats).pack(side="right", padx=(0, 4), pady=10)
 
         # 顶栏底部分隔线 (hairline)
         tk.Frame(self.root, bg=UI.BORDER, height=1).pack(fill="x")
@@ -1875,7 +2110,7 @@ class ControlPanel:
         self._card_labels["跟单状态"] = pill
         # 时钟行: 同样放中间列(col1), 数字本身居中, 与状态文字对齐
         clock = tk.Label(center_frame, text="--:--:--", fg="#FFFFFF", bg=UI.PILL_DARK,
-                         font=("Consolas", 11, "bold"))
+                         font=(self._FONT_MONO, 11, "bold"))
         clock.grid(row=1, column=1, pady=(1, 0))
         self._pill_clock = clock
         # 初始同步一次(文字块宽对齐时间宽); 运行态切换文字时由 _sync_pill_width 再次校准
@@ -1892,22 +2127,25 @@ class ControlPanel:
         log_titlebar = ttk.Frame(log_frame)
         log_titlebar.pack(fill="x", pady=(0, 2))
         ttk.Label(log_titlebar, text="运行日志").pack(side="left")
-        ttk.Button(log_titlebar, text="打开日志目录",
-                   command=self._open_log_dir, width=12).pack(side="right")
-        ttk.Button(log_titlebar, text="清空日志",
-                   command=self._clear_log_display, width=10).pack(side="right", padx=(0, 4))
-        ttk.Button(log_titlebar, text="加载日志",
-                   command=self.on_load_log, width=10).pack(side="right", padx=(0, 4))
+        RoundButton(log_titlebar, text="打开日志目录", kind="soft", font=(self._FONT_NAME, 9),
+                    height=24, radius=6, padx=9,
+                    command=self._open_log_dir).pack(side="right")
+        RoundButton(log_titlebar, text="清空日志", kind="soft", font=(self._FONT_NAME, 9),
+                    height=24, radius=6, padx=9,
+                    command=self._clear_log_display).pack(side="right", padx=(0, 4))
+        RoundButton(log_titlebar, text="加载日志", kind="soft", font=(self._FONT_NAME, 9),
+                    height=24, radius=6, padx=9,
+                    command=self.on_load_log).pack(side="right", padx=(0, 4))
 
         # 表头行(固定不随日志滚动): 时间 | 耗时 | 内容, 与正文等宽对齐
         log_head = tk.Frame(log_frame, bg=UI.SURFACE_MUTED)
         log_head.pack(fill="x", pady=(0, 2))
-        tk.Label(log_head, text=_LOG_HDR, font=("Consolas", 9), anchor="w",
+        tk.Label(log_head, text=_LOG_HDR, font=(self._FONT_MONO, 9), anchor="w",
                  bg=UI.SURFACE_MUTED, fg=UI.TEXT_MUTED).pack(fill="x", padx=4, pady=1)
 
         # 日志框: 弹性填满剩余空间, 不设固定行数, 由 rowconfigure(1, weight=1) 控制高度
         self.log_text = scrolledtext.ScrolledText(log_frame, wrap="word",
-                                                   font=("Consolas", 9), state="disabled",
+                                                   font=(self._FONT_MONO, 9), state="disabled",
                                                    bg=UI.SURFACE, bd=0, highlightthickness=1,
                                                    highlightbackground=UI.BORDER, highlightcolor=UI.BRAND)
         self.log_text.pack(fill="both", expand=True)
@@ -2045,12 +2283,12 @@ class ControlPanel:
 
     def _card_hairline(self, parent):
         """卡片内细分隔线 (iOS 分组行分隔)。"""
-        tk.Frame(parent, bg=UI.BORDER, height=1).pack(fill="x", padx=6, pady=2)
+        tk.Frame(parent, bg=UI.HAIRLINE, height=1).pack(fill="x", padx=6, pady=3)
 
     def _build_group_ths(self, parent):
         self._card_caption(parent, "① 同花顺客户端")
         card = RoundedCard(parent, pad=8)
-        card.pack(fill="x", padx=2, pady=(0, 5))
+        card.pack(fill="x", padx=2, pady=(0, 8))
         g = card.body
 
         row = ttk.Frame(g); row.pack(fill="x", pady=2)
@@ -2058,7 +2296,9 @@ class ControlPanel:
         self.vars["ths_exe_path"] = tk.StringVar(value=self.cfg["ths_exe_path"])
         # 宽度与「窗口关键词」框统一(9); 去掉 fill/expand, 否则会被拉伸成占满整行
         ttk.Entry(row, textvariable=self.vars["ths_exe_path"], width=9).pack(side="left", padx=6)
-        ttk.Button(row, text="浏览...", command=self._browse_ths).pack(side="left", padx=(0, 4))
+        RoundButton(row, text="浏览...", kind="soft", font=(self._FONT_NAME, 9),
+                    height=24, radius=6, padx=8, parent_bg=UI.SURFACE,
+                    command=self._browse_ths).pack(side="left", padx=(0, 4))
 
         self._card_hairline(g)
         rowk = ttk.Frame(g); rowk.pack(fill="x", pady=2)
@@ -2070,13 +2310,11 @@ class ControlPanel:
         rowb = ttk.Frame(g); rowb.pack(fill="x", pady=2)
         # 按钮文字改短(打开/预热/测试/列出), 好让这一行收窄 ——
         # 之前 4 个长按钮把卡片撑到 400px, 连带把 ⑤⑥⑦ 全拉宽、空位变大
-        ttk.Button(rowb, text="打开", command=self.on_open_ths).pack(side="left")
-        ttk.Button(rowb, text="预热", command=self.on_preheat_activate,
-                   width=6).pack(side="left", padx=(6, 0))
-        ttk.Button(rowb, text="测试", command=self.on_test_order,
-                   width=6).pack(side="left", padx=(6, 0))
-        ttk.Button(rowb, text="列出", command=self.on_list_windows,
-                   width=6).pack(side="left", padx=(6, 0))
+        for _txt, _cmd in (("打开", self.on_open_ths), ("预热", self.on_preheat_activate),
+                           ("测试", self.on_test_order), ("列出", self.on_list_windows)):
+            RoundButton(rowb, text=_txt, kind="ghost", font=(self._FONT_NAME, 9),
+                        height=26, radius=7, padx=11, parent_bg=UI.SURFACE,
+                        command=_cmd).pack(side="left", padx=(0, 6))
 
     def _browse_ths(self):
         """[浏览...]: macOS 版选择 同花顺.app 应用程序包。
@@ -2096,7 +2334,7 @@ class ControlPanel:
     def _build_group_params(self, parent):
         self._card_caption(parent, "③ 跟单规则")
         card = RoundedCard(parent, pad=8)
-        card.pack(fill="x", padx=2, pady=(0, 5))
+        card.pack(fill="x", padx=2, pady=(0, 8))
         g = card.body
 
         # 三行纵向排版: 文字左对齐, 填写框顶到右边
@@ -2160,12 +2398,15 @@ class ControlPanel:
         nv = tk.StringVar(value=note_str)
         ttk.Entry(row, textvariable=tv, width=8).pack(side="left", padx=(4, 4))
         ttk.Entry(row, textvariable=nv, width=18).pack(side="left", padx=4)
-        ttk.Button(row, text="删除", style="Ghost.TButton", width=5,
-                   command=lambda r=row: self._remove_act_row(r)).pack(side="left", padx=4)
-        ttk.Button(row, text="↑", style="Ghost.TButton", width=2,
-                   command=lambda r=row: self._move_act_row(r, -1)).pack(side="left", padx=2)
-        ttk.Button(row, text="↓", style="Ghost.TButton", width=2,
-                   command=lambda r=row: self._move_act_row(r, 1)).pack(side="left", padx=2)
+        RoundButton(row, text="删除", kind="ghost", font=(self._FONT_NAME, 9),
+                    height=24, radius=6, padx=8, parent_bg=UI.SURFACE,
+                    command=lambda r=row: self._remove_act_row(r)).pack(side="left", padx=4)
+        RoundButton(row, text="↑", kind="ghost", font=(self._FONT_NAME, 9),
+                    height=24, radius=6, padx=7, parent_bg=UI.SURFACE,
+                    command=lambda r=row: self._move_act_row(r, -1)).pack(side="left", padx=2)
+        RoundButton(row, text="↓", kind="ghost", font=(self._FONT_NAME, 9),
+                    height=24, radius=6, padx=7, parent_bg=UI.SURFACE,
+                    command=lambda r=row: self._move_act_row(r, 1)).pack(side="left", padx=2)
         self._act_rows.append((row, tv, nv))
 
     def _remove_act_row(self, row):
@@ -2229,7 +2470,7 @@ class ControlPanel:
         """⑤ 激活时间列表 + ⑥ 启用与执行: 多时间点自动窗口激活配置页。"""
         self._card_caption(parent, "⑤ 激活时间列表")
         card = RoundedCard(parent, pad=8)
-        card.pack(fill="x", padx=2, pady=(0, 5))
+        card.pack(fill="x", padx=2, pady=(0, 8))
         g = card.body
 
         head = ttk.Frame(g); head.pack(fill="x", pady=(0, 2))
@@ -2242,12 +2483,13 @@ class ControlPanel:
         self._act_list_box.pack(fill="x")
         for item in self._act_list_from_cfg():
             self._append_act_row(item["time"], item["note"])
-        ttk.Button(g, text="+ 添加激活时间", style="Ghost.TButton",
-                   command=self._on_add_act_row).pack(fill="x", pady=(4, 0))
+        RoundButton(g, text="+ 添加激活时间", kind="ghost", font=(self._FONT_NAME, 9),
+                    height=26, radius=7, parent_bg=UI.SURFACE,
+                    command=self._on_add_act_row).pack(fill="x", pady=(4, 0))
 
         self._card_caption(parent, "⑥ 启用与执行")
         card2 = RoundedCard(parent, pad=8)
-        card2.pack(fill="x", padx=2, pady=(0, 5))
+        card2.pack(fill="x", padx=2, pady=(0, 8))
         g2 = card2.body
 
         self.vars["activate_enabled"] = tk.BooleanVar(
@@ -2255,8 +2497,9 @@ class ControlPanel:
         ttk.Checkbutton(g2, text="启用定时激活（仅交易日，按列表时间依次执行窗口激活）",
                         variable=self.vars["activate_enabled"]).pack(anchor="w", pady=2)
         rowb = ttk.Frame(g2); rowb.pack(fill="x", pady=2)
-        ttk.Button(rowb, text="立即激活一次", style="Follow.TButton",
-                   command=self.on_preheat_activate).pack(side="left", padx=4)
+        RoundButton(rowb, text="立即激活一次", kind="primary", font=(self._FONT_NAME, 9),
+                    height=28, radius=7, parent_bg=UI.SURFACE,
+                    command=self.on_preheat_activate).pack(side="left", padx=4)
         self._act_status_label = ttk.Label(rowb, text="", foreground=UI.TEXT_MUTED)
         self._act_status_label.pack(side="left", padx=12)
 
@@ -2325,7 +2568,7 @@ class ControlPanel:
         # 紧挨在标题文字右边, 不推去最右端
         self.btn_redis_eye.pack(side="left", padx=(1, 0))
         card = RoundedCard(parent, pad=8)
-        card.pack(fill="x", padx=2, pady=(0, 5))
+        card.pack(fill="x", padx=2, pady=(0, 8))
         g = card.body
 
         # 六行纵向排版: 文字左对齐, 填空框顶到右边
@@ -2459,8 +2702,8 @@ class ControlPanel:
 
         # 策略总览区域 (弹性填充: 表格吸收页面剩余高度)
         self._card_caption(parent, "④ 策略资金总览")
-        _fund_card = RoundedCard(parent, pad=8, radius=8)
-        _fund_card.pack(fill="both", expand=True, padx=2, pady=(0, 5))
+        _fund_card = RoundedCard(parent, pad=8, radius=12)
+        _fund_card.pack(fill="both", expand=True, padx=2, pady=(0, 8))
         strategy_frame = _fund_card.body
         strategy_frame.columnconfigure(0, weight=1)
         strategy_frame.rowconfigure(0, weight=1)
@@ -2515,9 +2758,15 @@ class ControlPanel:
 
         s_btn = tk.Frame(strategy_frame, bg=UI.SURFACE_MUTED)
         s_btn.grid(row=2, column=0, sticky="ew", padx=2, pady=(0, 2))
-        ttk.Button(s_btn, text="+ 添加策略", command=self._on_add_strategy, width=10).pack(side="left", padx=2)
-        ttk.Button(s_btn, text="删除策略", command=self._on_delete_strategy, width=8).pack(side="left", padx=2)
-        ttk.Button(s_btn, text="刷新", command=self._on_refresh_fund, width=5).pack(side="right", padx=2)
+        RoundButton(s_btn, text="+ 添加策略", kind="soft", font=(self._FONT_NAME, 9),
+                    height=26, radius=7, parent_bg=UI.SURFACE_MUTED,
+                    command=self._on_add_strategy).pack(side="left", padx=2, pady=2)
+        RoundButton(s_btn, text="删除策略", kind="soft", font=(self._FONT_NAME, 9),
+                    height=26, radius=7, parent_bg=UI.SURFACE_MUTED,
+                    command=self._on_delete_strategy).pack(side="left", padx=2, pady=2)
+        RoundButton(s_btn, text="刷新", kind="soft", font=(self._FONT_NAME, 9),
+                    height=26, radius=7, parent_bg=UI.SURFACE_MUTED,
+                    command=self._on_refresh_fund).pack(side="right", padx=2, pady=2)
         tk.Label(s_btn, text="双击单元格可编辑", fg=UI.TEXT_MUTED, bg=UI.SURFACE_MUTED,
                  font=_font_small).pack(side="right", padx=8)
 
@@ -2566,13 +2815,13 @@ class ControlPanel:
                 strategies.append(self.s_tree.set(s_item, 0))
             if not strategies:
                 strategies = self.pos_mgr.get_strategies()
-            widget = ttk.Combobox(tree, values=strategies, font=("Consolas", 9), state="readonly")
+            widget = ttk.Combobox(tree, values=strategies, font=(self._FONT_MONO, 9), state="readonly")
             widget.set(val)
         elif col_name == "白名单":
-            widget = ttk.Combobox(tree, values=["是", "否"], font=("Consolas", 9), state="readonly")
+            widget = ttk.Combobox(tree, values=["是", "否"], font=(self._FONT_MONO, 9), state="readonly")
             widget.set(val)
         else:
-            widget = ttk.Entry(tree, font=("Consolas", 9))
+            widget = ttk.Entry(tree, font=(self._FONT_MONO, 9))
             widget.insert(0, val)
             widget.select_range(0, "end")
 
@@ -2773,8 +3022,12 @@ class ControlPanel:
 
         btn_frame = tk.Frame(dialog, bg=UI.SURFACE_MUTED)
         btn_frame.pack(fill="x", pady=8)
-        ttk.Button(btn_frame, text="确认添加", command=_confirm).pack(side="left", padx=(50, 5))
-        ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side="left", padx=(5, 50))
+        RoundButton(btn_frame, text="确认添加", kind="primary", font=(self._FONT_NAME, 9),
+                    height=28, radius=7, parent_bg=UI.SURFACE_MUTED,
+                    command=_confirm).pack(side="left", padx=(50, 5), pady=2)
+        RoundButton(btn_frame, text="取消", kind="soft", font=(self._FONT_NAME, 9),
+                    height=28, radius=7, parent_bg=UI.SURFACE_MUTED,
+                    command=dialog.destroy).pack(side="left", padx=(5, 50), pady=2)
 
     def _on_delete_strategy(self):
         """删除策略"""
@@ -3041,7 +3294,7 @@ class ControlPanel:
         self._topmost_var.set(on)
         self.root.attributes("-topmost", on)
         self.btn_topmost.config(text="取消置顶" if on else "窗口置顶",
-                                style="Follow.TButton" if on else "Ghost.TButton")
+                                kind="primary" if on else "ghost")
         gui_log("窗口已置顶" if on else "窗口取消置顶", "OK" if on else "INFO")
 
     def _ask_backtest_live(self):
@@ -3379,6 +3632,18 @@ def _write_crash_log(exc_type, exc_value, exc_tb):
         pass
 
 
+def _bring_to_front(root):
+    """macOS: 从 .app 启动时窗口不一定会自动拿到焦点, 这里主动抬到最前。
+    用 -topmost 短暂置顶再放开, 比 focus_force 更可靠, 也不会真的常驻置顶。"""
+    try:
+        root.lift()
+        root.attributes("-topmost", True)
+        root.after(400, lambda: root.attributes("-topmost", False))
+        root.focus_force()
+    except Exception:
+        pass
+
+
 def main():
     if getattr(sys, 'frozen', False):
         _hide_console()
@@ -3418,6 +3683,7 @@ def main():
             root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", _on_close)
+    _bring_to_front(root)
     root.mainloop()
 
 

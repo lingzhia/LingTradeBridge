@@ -1,0 +1,66 @@
+#!/bin/bash
+# ===========================================================================
+# 同花顺跟单器 · macOS 应用启动器 (无终端窗口)
+# ---------------------------------------------------------------------------
+# 双击「启动跟单器.app」即运行本脚本: Finder 交给 LaunchServices 启动,
+# 不会打开终端窗口, 直接显示跟单器界面。
+#
+# 与 启动跟单器.command 的分工:
+#   .app      日常使用 —— 双击即用, 无终端, 输出写进 logs/启动器_日期.log
+#   .command  调试用   —— 保留终端, 能实时看到输出, 且支持 http/redis/both 参数
+#
+# 信号源说明: 双击 .app 无法传参, 因此一律按 网页跟单配置.json 里的
+# signal_source 启动; 需要临时切换请用 .command。
+# ===========================================================================
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"       # .../启动跟单器.app/Contents/MacOS
+PROJECT="$(cd "$HERE/../../.." && pwd)"     # 项目根目录(.app 与主程序同级)
+cd "$PROJECT" || exit 1
+
+# 本 .app 必须和「同花顺跟单器_mac.py」放在同一个目录里(靠相对位置找项目),
+# 单独把它拖到 /Applications 就跑不起来了 —— 这里给出人话提示
+if [ ! -f "$PROJECT/同花顺跟单器_mac.py" ]; then
+    osascript -e 'display alert "同花顺跟单器" message "没找到主程序。「启动跟单器.app」必须和「同花顺跟单器_mac.py」放在同一个目录里（也就是项目根目录），不能单独拖到别处。" as critical'
+    exit 1
+fi
+
+# Finder 启动时 PATH 很干净, 主动补上常见的解释器目录
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+mkdir -p logs
+LOG="logs/启动器_$(date +%F).log"
+
+# 挑一个带 tkinter 的解释器。顺序很关键:
+#   1) 项目自带的 .venv  (里面装好了 redis 依赖)
+#   2) 登录 shell 里的 python3 —— 也就是用户在终端敲 python3 时用的那个
+#      (conda/homebrew 装的解释器靠 .zshrc 里的 init 才进 PATH; Finder 直接
+#       启动的进程读不到, 所以要显式问一次交互式登录 shell; 必须带 -i,
+#       否则 .zshrc 不会被 source, 拿到的会是系统自带的 /usr/bin/python3)
+#   3) PATH 里的 python3 / 常见安装路径 / 系统自带
+LOGIN_PY="$(/bin/zsh -ilc 'command -v python3' 2>/dev/null | tail -n 1)"
+PY=""
+for c in "$PROJECT/.venv/bin/python" "$LOGIN_PY" "$(command -v python3 || true)" \
+         /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+    [ -n "$c" ] && [ -x "$c" ] || continue
+    if "$c" -c 'import tkinter' >/dev/null 2>&1; then
+        PY="$c"
+        break
+    fi
+done
+
+if [ -z "$PY" ]; then
+    echo "[$(date '+%F %T')] 错误: 没找到带 tkinter 的 python3" >> "$LOG"
+    osascript -e 'display alert "同花顺跟单器" message "没找到带 tkinter 的 python3，请先安装后再启动。详见 logs/启动器_日期.log" as critical'
+    exit 1
+fi
+
+echo "[$(date '+%F %T')] 启动: $PY 同花顺跟单器_mac.py" >> "$LOG"
+
+# 只保留最近 5 个启动器日志, 避免长年累积
+ls -1t logs/启动器_*.log 2>/dev/null | tail -n +6 | while read -r old; do rm -f "$old"; done
+
+# 用 exec 让 python 顶替本进程 —— 这样 LaunchServices 认定的那个进程就是
+# python 本身, Dock 里显示的才是本应用的图标与名字, 而不是通用 Python。
+exec "$PY" "同花顺跟单器_mac.py" >> "$LOG" 2>&1

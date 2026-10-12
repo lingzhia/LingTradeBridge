@@ -136,6 +136,12 @@ _AX.AXUIElementPerformAction.restype = ctypes.c_int
 _AX.AXUIElementPerformAction.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 _AX.AXIsProcessTrusted.restype = ctypes.c_bool
 _AX.AXIsProcessTrusted.argtypes = []
+_AX.AXIsProcessTrustedWithOptions.restype = ctypes.c_bool
+_AX.AXIsProcessTrustedWithOptions.argtypes = [ctypes.c_void_p]
+_CF.CFDictionaryCreate.restype = ctypes.c_void_p
+_CF.CFDictionaryCreate.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+                                   ctypes.POINTER(ctypes.c_void_p), ctypes.c_long,
+                                   ctypes.c_void_p, ctypes.c_void_p]
 _AX.AXValueGetValue.restype = ctypes.c_bool
 _AX.AXValueGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
 
@@ -260,6 +266,42 @@ def _ax_trusted():
         return bool(_AX.AXIsProcessTrusted())
     except Exception:
         return False
+
+
+def _ax_request_trust():
+    """申请辅助功能权限: 未授权时弹一次系统对话框(带"打开系统设置"按钮)。
+
+    为什么需要它: macOS 是按"责任进程"记账的 —— 从终端启动时权限记在终端头上,
+    换成「启动跟单器.app」双击启动后, 记账对象变成了这个 .app, 必须重新授权一次,
+    否则读界面表格、模拟下单都会被系统直接拒绝。
+    用 AXIsProcessTrustedWithOptions(prompt=True) 的好处是系统会把本 .app 自动
+    加进「隐私与安全性 -> 辅助功能」列表, 用户不用自己点"+"去找文件。
+    返回当前是否已授权。
+    """
+    try:
+        # kCFBooleanTrue 是个全局常量(不能用 dlsym 当函数调), 取它的指针值即可
+        true_ref = ctypes.c_void_p.in_dll(_CF, "kCFBooleanTrue").value
+        try:
+            # kAXTrustedCheckOptionPrompt 是 ApplicationServices 里的全局 CFString
+            key_ref = ctypes.c_void_p.in_dll(_AX, "kAXTrustedCheckOptionPrompt").value
+        except Exception:
+            # 取不到符号就用同名字符串建一个(CFString 按内容比较, 等价)
+            key_ref = _CF.CFStringCreateWithCString(
+                None, b"AXTrustedCheckOptionPrompt", _UTF8)
+        keys = (ctypes.c_void_p * 1)(key_ref)
+        vals = (ctypes.c_void_p * 1)(true_ref)
+        _CF.CFDictionaryCreate.restype = ctypes.c_void_p
+        _CF.CFDictionaryCreate.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_long,
+            ctypes.c_void_p, ctypes.c_void_p]
+        opts = _CF.CFDictionaryCreate(None, keys, vals, 1, None, None)
+        _AX.AXIsProcessTrustedWithOptions.restype = ctypes.c_bool
+        _AX.AXIsProcessTrustedWithOptions.argtypes = [ctypes.c_void_p]
+        return bool(_AX.AXIsProcessTrustedWithOptions(opts))
+    except Exception:
+        # 申请失败就退回普通检测(已授权时仍能返回 True)
+        return _ax_trusted()
 
 
 def _to_float(txt):
