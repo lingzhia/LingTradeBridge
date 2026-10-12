@@ -1756,6 +1756,40 @@ class ControlPanel:
         gui_log("当前信号源: %s —— 点击[开始跟单]启动对应通道" % _src_desc, "INFO")
         # 辅助功能权限自查(后台线程, 避免和系统对话框抢主线程)
         threading.Thread(target=self._check_ax_permission, daemon=True).start()
+        # ---- 未保存改动跟踪: 任一配置项一改, [保存配置]按钮立刻变蓝提醒 ----
+        # (various 输入框/下拉框/勾选框 都是写进 self.vars 的, 在这一层统一盯住最省事)
+        self._config_dirty = False
+        self._suppress_dirty = False
+        for _name, _var in list(self.vars.items()):
+            try:
+                _var.trace_add("write", self._on_cfg_var_changed)
+            except Exception:
+                pass
+
+    # ---- 未保存改动提示 ----
+
+    def _on_cfg_var_changed(self, *_args):
+        """某个配置项被改动 → 标记未保存(已是脏状态就不用重复处理)。"""
+        if getattr(self, "_suppress_dirty", False) or self._config_dirty:
+            return
+        self._set_config_dirty(True)
+
+    def _set_config_dirty(self, dirty):
+        """翻转"未保存"标记: 脏时保存按钮变主蓝并加圆点, 一眼能看出要保存。"""
+        self._config_dirty = bool(dirty)
+        try:
+            self.btn_save.config(text="保存配置 ●" if dirty else "保存配置",
+                                 kind="primary" if dirty else "bar")
+        except Exception:
+            pass
+
+    def _set_var_quiet(self, name, value):
+        """程序化改配置(如盘前安全复位/脱敏): 改值但不触发"未保存"提示。"""
+        try:
+            self._suppress_dirty = True
+            self.vars[name].set(value)
+        finally:
+            self._suppress_dirty = False
 
     def _check_ax_permission(self):
         """启动后自查「辅助功能」权限; 未授权就弹一次系统授权对话框。
@@ -1974,9 +2008,9 @@ class ControlPanel:
         _vsep()
 
         # ② 工具组: 保存配置 / 窗口置顶
-        RoundButton(header, text="保存配置", kind="bar", font=self._font_medium,
-                    parent_bg=UI.HEADER, height=32, command=self.on_save
-                    ).pack(side="left", padx=2, pady=7)
+        self.btn_save = RoundButton(header, text="保存配置", kind="bar", font=self._font_medium,
+                                    parent_bg=UI.HEADER, height=32, command=self.on_save)
+        self.btn_save.pack(side="left", padx=2, pady=7)
         self._topmost_var = tk.BooleanVar(value=False)
         self.btn_topmost = RoundButton(header, text="窗口置顶", kind="ghost",
                                        font=self._font_medium, parent_bg=UI.HEADER,
@@ -2709,15 +2743,15 @@ class ControlPanel:
                 self._redis_real_host = self.vars["redis_host"].get()
                 self._redis_real_port = self.vars["redis_port"].get()
                 self._redis_hidden = True
-                self.vars["redis_host"].set("●●●●●●●●●●")
-                self.vars["redis_port"].set("●●●●")
+                self._set_var_quiet("redis_host", "●●●●●●●●●●")
+                self._set_var_quiet("redis_port", "●●●●")
                 for e in (self._redis_host_entry, self._redis_port_entry):
                     e.config(state="disabled")
                 self.btn_redis_eye.config(text="🙈")
             else:
                 # —— 切回显示: 把真实值填回去并解锁 ——
-                self.vars["redis_host"].set(getattr(self, "_redis_real_host", ""))
-                self.vars["redis_port"].set(getattr(self, "_redis_real_port", ""))
+                self._set_var_quiet("redis_host", getattr(self, "_redis_real_host", ""))
+                self._set_var_quiet("redis_port", getattr(self, "_redis_real_port", ""))
                 self._redis_hidden = False
                 for e in (self._redis_host_entry, self._redis_port_entry):
                     e.config(state="normal")
@@ -2729,7 +2763,7 @@ class ControlPanel:
         def _startup_reset_backtest_live():
             try:
                 old = bool(self.cfg.get("redis_allow_backtest_live", False))
-                self.vars["redis_allow_backtest_live"].set(False)
+                self._set_var_quiet("redis_allow_backtest_live", False)
                 self.cfg["redis_allow_backtest_live"] = False
                 if self.engine:
                     self.engine.config["redis_allow_backtest_live"] = False
@@ -3240,8 +3274,24 @@ class ControlPanel:
             self.cfg = cfg
             self.order_executor.config = cfg
             save_config(cfg)
+            self._set_config_dirty(False)
             self.engine = FollowerEngine(cfg, self.order_executor)
             self.engine.app = self
+
+    def _sync_config_to_engine(self):
+        """把界面上的最新配置同步给引擎(引擎已建好时也必须走这一步)。
+
+        不做这件事的话: 引擎一旦建好, 再点[开始跟单]就不走 _ensure_engine 了,
+        界面里的改动(比例/信号源/端口…)根本传不进引擎, 会一直用旧配置跑。
+        """
+        cfg = self._collect_config()
+        self.cfg = cfg
+        self.order_executor.config = cfg
+        self.engine.config = cfg
+        if self._config_dirty:
+            save_config(cfg)
+            self._set_config_dirty(False)
+            gui_log("开始跟单: 界面上的配置改动已自动保存并生效", "OK")
 
     def on_toggle_follow(self):
         """「开始↔停止跟单」单钮切换: 跟单中则停止, 否则开始。"""
@@ -3325,8 +3375,14 @@ class ControlPanel:
             self._stop_status_pill_blink()
 
     def on_start_follow(self):
-        if self.engine is None:
-            self._ensure_engine()
+        try:
+            if self.engine is None:
+                self._ensure_engine()
+            else:
+                self._sync_config_to_engine()
+        except Exception as e:
+            messagebox.showerror("参数错误", "配置有误, 请检查后再开始跟单:\n%s" % e)
+            return
         try:
             self.engine.start_following()
         except Exception as e:
@@ -3363,7 +3419,7 @@ class ControlPanel:
                 "二次确认",
                 "开启「允许回测信号实盘下单」后,\n盘内(09:00-15:30)也会放行回测信号,\n可能触发真实下单!\n\n确认开启?")
             if not ok:
-                self.vars["redis_allow_backtest_live"].set(False)
+                self._set_var_quiet("redis_allow_backtest_live", False)
 
     def on_save(self):
         try:
@@ -3373,6 +3429,7 @@ class ControlPanel:
             if self.engine:
                 self.engine.config = cfg
             save_config(cfg)
+            self._set_config_dirty(False)
             gui_log("配置已保存 (信号源=%s)" % cfg.get("signal_source", "http"), "OK")
         except Exception as e:
             messagebox.showerror("错误", "参数有误:\n%s" % e)
@@ -3618,7 +3675,7 @@ class ControlPanel:
             _today = _now.strftime("%Y-%m-%d")
             if getattr(self, "_reset_date", "") != _today and _now.weekday() < 5 \
                     and _now.hour * 60 + _now.minute >= 8 * 60 + 55:
-                self.vars["redis_allow_backtest_live"].set(False)
+                self._set_var_quiet("redis_allow_backtest_live", False)
                 self.cfg["redis_allow_backtest_live"] = False
                 if self.engine:
                     self.engine.config["redis_allow_backtest_live"] = False
@@ -3731,15 +3788,17 @@ def main():
         return
 
     def _on_close():
-        if app.engine and app.engine.state in ("browser_open", "following"):
-            if messagebox.askokcancel("确认", "跟单器正在运行, 确定退出吗?"):
-                if app.engine:
-                    app.engine.stop()
-                root.destroy()
-        else:
-            if app.engine:
-                app.engine.stop()
-            root.destroy()
+        running = app.engine and app.engine.state in ("browser_open", "following")
+        if running:
+            if not messagebox.askokcancel("确认", "跟单器正在运行, 确定退出吗?"):
+                return
+        elif getattr(app, "_config_dirty", False):
+            # 直接关掉会丢掉改动, 这里明确问一句, 避免"改了没保存"白改
+            if not messagebox.askokcancel("确认", "有配置改动还没保存, 直接退出会丢失。\n\n确定退出吗?"):
+                return
+        if app.engine:
+            app.engine.stop()
+        root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", _on_close)
     _bring_to_front(root)
