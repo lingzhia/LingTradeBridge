@@ -90,6 +90,11 @@ DEFAULT_CONFIG = {
     "mac_auto_confirm": True,           # 点确定后若出现二次确认弹窗, 是否自动点"确认"
     "mac_dialog_wait": 3.0,             # 点确定后最多等几秒读结果弹窗
     "mac_activate_app": False,          # 下单时是否把同花顺切到最前面(默认不抢焦点, 后台即可下单)
+    # 预热/下单时, 如果同花顺没停在交易下单面板上, 就自己按左侧导航栏切过去
+    # (只在左侧那一列里按, 纯切界面, 碰不到任何下单/撤单按钮)。关掉就只提示、不动界面。
+    "auto_goto_panel": True,
+    # 程序自己试出来的"左侧导航从上往下第几个是交易"(0 开始); None = 还没试出来, 下次从头试
+    "ths_rail_index": None,
     "rdp_keepalive_enabled": False,     # [Windows 专用, mac 上无效] 远程周期保活开关
     "rdp_keepalive_interval": 5,        # [Windows 专用, mac 上无效] 周期保活间隔(分钟)
     "ignore_buy": False,
@@ -2281,10 +2286,10 @@ class ControlPanel:
     # ---- 窗口激活(预热/手动) ----
 
     def _do_activate_window(self, reason):
-        """执行"预热/激活": 查找下单面板并让它就绪。下单进行中则跳过。
-        macOS 版不需要抢焦点, 这里主要是提前确认面板还在、并把控件路径缓存好,
-        这样真收到信号时可以立刻下单。
-        被 Redis 预热信号(action=preheat)和第一页[预热激活]按钮共用。"""
+        """执行"预热/激活": 确保同花顺已经在交易下单面板上待命。下单进行中则跳过。
+        macOS 版不需要抢焦点, 这里做的是"确认面板还在, 不在就自己切过去",
+        并且顺带把定位路径摸热, 这样真收到信号时可以立刻下单。
+        被 Redis 预热信号(action=preheat)、第一页[预热]按钮、定时激活三处共用。"""
         try:
             if not self.order_executor._lock.acquire(blocking=False):
                 gui_log("激活(%s): 当前有下单进行中, 跳过本次触发" % reason, "INFO")
@@ -2292,7 +2297,7 @@ class ControlPanel:
             try:
                 windows = self.order_executor.find_ths_windows()
                 if not windows:
-                    gui_log("激活(%s): 未找到同花顺下单面板" % reason, "WARN")
+                    gui_log("激活(%s): 同花顺交易面板不可用(同花顺没开, 或没能自动切过去)" % reason, "WARN")
                     self._act_last = (time.strftime("%H:%M"), False)
                     return
                 hwnd, title = windows[0]
@@ -2848,6 +2853,13 @@ class ControlPanel:
         except Exception:
             cfg["http_port"] = 8765
         cfg["http_api_token"] = self.vars["http_api_token"].get().strip()
+        # --- 这两个键界面里没有, 但必须原样带过去, 否则一保存就被抹掉 ---
+        #   auto_goto_panel : 预热/下单时, 同花顺不在交易界面就自己切过去(默认开)
+        #   ths_rail_index  : 程序自己学出来的"左侧导航第几个是交易", 下次直接用
+        _prev = self.cfg if isinstance(getattr(self, "cfg", None), dict) else {}
+        cfg["auto_goto_panel"] = _prev.get(
+            "auto_goto_panel", DEFAULT_CONFIG.get("auto_goto_panel", True))
+        cfg["ths_rail_index"] = _prev.get("ths_rail_index")
         return cfg
 
     def on_open_ths(self):

@@ -56,6 +56,13 @@ _BTN_BUY = "买入"
 _BTN_SELL = "卖出"
 _BTN_RESET = "重填"
 
+# 同花顺左侧那竖排导航按钮的识别特征 —— 详见 _rail_buttons() 的说明
+_RAIL_EDGE_TOL = 8      # 按钮左边缘与窗口左边缘最多差这么多像素
+_RAIL_MIN_SIZE = 40     # 按钮是正方形, 边长落在这个区间里
+_RAIL_MAX_SIZE = 72
+_RAIL_SETTLE = 0.5      # 按完一个之后, 最多等这么久让界面切过去(秒)
+_RAIL_SETTLE_LAST = 1.5 # 整圈都没找到时, 再耐心等一次(防止某次切换特别慢)
+
 # 弹窗文字关键词: 用来判断下单结果
 _OSA_OK_WORDS = ("已成功提交", "委托已提交", "已提交", "合同编号", "委托编号", "已受理")
 # 二次确认弹窗的判断词(实测同花顺的确认框里只有一行「买入委托」)
@@ -123,6 +130,8 @@ _CF.CFGetTypeID.restype = ctypes.c_ulong
 _CF.CFGetTypeID.argtypes = [ctypes.c_void_p]
 _CF.CFStringGetTypeID.restype = ctypes.c_ulong
 _CF.CFStringGetTypeID.argtypes = []
+_CF.CFArrayGetTypeID.restype = ctypes.c_ulong
+_CF.CFArrayGetTypeID.argtypes = []
 
 # ---- 辅助功能(Accessibility)的函数声明 ----
 _AX.AXUIElementCreateApplication.restype = ctypes.c_void_p
@@ -211,12 +220,19 @@ def _ax_elements(el, attr="AXChildren"):
     """
     取某个容器控件的直接子元素列表。
     返回值里的每个元素都已经"加锁"(retain), 用完请调用 _ax_free_all() 统一释放。
+
+    ⚠️ 必须先验类型: 有些属性(如 AXMenuBar / AXFocusedWindow)返回的是**单个元素**
+       而不是数组, 直接 CFArrayGetCount 会让系统抛 ObjC 异常、整个进程当场死掉
+       (不是 Python 异常, try/except 拦不住)。所以非数组时按"只有一个孩子"处理。
     """
     ref, err = _ax_get(el, attr)
     if err or not ref:
         return []
     out = []
     try:
+        if _CF.CFGetTypeID(ref) != _CF.CFArrayGetTypeID():
+            _CF.CFRetain(ref)
+            return [ref]
         for i in range(_CF.CFArrayGetCount(ref)):
             c = _CF.CFArrayGetValueAtIndex(ref, i)
             _CF.CFRetain(c)
@@ -464,6 +480,131 @@ def _locate_panel(pid):
             return panel, win, None
     _ax_free_all(wins)
     return None, None, "没找到交易面板(面板上应该有「代码 / 价格 / 数量」三行)"
+
+
+def _rail_buttons(win):
+    """
+    取同花顺主窗口左侧那竖排导航按钮(按从上到下排序)。
+
+    为什么只能靠"位置"来认:
+      这排按钮在辅助功能接口里**没有名字** —— 标题统一是「按钮」, AXHelp /
+      AXIdentifier / AXDescription 全空, 也没有"选中"标记(AXSelected/AXValue 都没有),
+      9 个按钮属性一模一样。唯一稳定的特征就是几何位置: 贴着窗口最左边缘、
+      正方形(实测 56x56)、竖直等距排列。
+
+    所以这里只按几何特征筛, 而且**只取贴着窗口左边缘的那一列** ——
+    真正的下单按钮(买入/卖出/确定)都在面板中部, 几何上不可能被选中。
+    万一同花顺以后改了布局导致一个都认不出, 就直接放弃(宁可不动, 也不能乱点)。
+
+    返回的引用是 retain 过的, 用完请 _ax_free_all()。
+    """
+    wx = _ax_pos(win)[0]
+    found = []
+    for ch in _ax_elements(win):
+        p = _ax_pos(ch)
+        ok = (_ax_text(ch, "AXRole") == "AXButton"
+              and _RAIL_MIN_SIZE <= p[2] <= _RAIL_MAX_SIZE
+              and _RAIL_MIN_SIZE <= p[3] <= _RAIL_MAX_SIZE
+              and (p[0] - wx) <= _RAIL_EDGE_TOL)
+        if ok:
+            found.append((p[1], ch))
+        else:
+            _ax_free(ch)
+    found.sort(key=lambda t: t[0])
+    return [el for _, el in found]
+
+
+def _press_rail_button(win, index):
+    """按左侧导航栏的第 index 个按钮(从 0 开始, 自上而下)。成功返回 True。"""
+    btns = _rail_buttons(win)
+    try:
+        if index < 0 or index >= len(btns):
+            return False
+        return _ax_press(btns[index]) == 0
+    finally:
+        _ax_free_all(btns)
+
+
+def _wait_panel(pid, timeout=_RAIL_SETTLE, step=0.1):
+    """在 timeout 秒内反复找交易面板, 找到返回 (panel, win), 超时返回 (None, None)"""
+    deadline = time.time() + timeout
+    while True:
+        panel, win, _ = _locate_panel(pid)
+        if panel:
+            return panel, win
+        if time.time() >= deadline:
+            return None, None
+        time.sleep(step)
+
+
+def navigate_to_order_panel(pid=None, config=None):
+    """
+    让同花顺切到「交易下单面板」那一屏, 成功返回 (面板, 窗口, None)。
+
+    背景: 同花顺整个界面是靠左侧那竖排图标切的, 而这些图标在辅助功能里没有名字
+    (见 _rail_buttons), 没法直接认出哪一个才是「交易」。所以做法是:
+      从上往下挨个按一下 → 每按完就回头找一次下单面板 → 找到就停。
+    只在左侧那一列里按, 纯粹切界面, 碰不到任何下单/撤单按钮。
+
+    config 里如果记过上次成功的是第几个(ths_rail_index), 就先试那一个, 通常一次命中。
+    失败返回 (None, None, 原因文字)。
+    """
+    if pid is None:
+        pid = _find_ths_pid()
+    if pid is None:
+        return None, None, "没找到正在运行的「%s」" % _APP_NAME
+
+    # 先直接找一次: 说不定本来就已经在交易面板上(这是绝大多数情况, 0.01 秒)
+    panel, win, why = _locate_panel(pid)
+    if panel:
+        return panel, win, None
+
+    app = _AX.AXUIElementCreateApplication(pid)
+    if not app:
+        return None, None, "找不到同花顺进程"
+    wins = _ax_elements(app, "AXWindows")
+    _ax_free(app)
+    if not wins:
+        return None, None, "同花顺没有打开的窗口(可能被最小化了)"
+    target = wins[0]
+    for w in wins[1:]:
+        _ax_free(w)
+
+    try:
+        btns = _rail_buttons(target)
+        count = len(btns)
+        _ax_free_all(btns)
+        if count == 0:
+            return None, None, "没认出同花顺的左侧导航栏, 不敢乱点, 无法自动切换"
+
+        order = list(range(count))
+        cached = None
+        if isinstance(config, dict):
+            try:
+                cached = int(config.get("ths_rail_index"))
+            except (TypeError, ValueError):
+                cached = None
+        if cached is not None and 0 <= cached < count:
+            order.remove(cached)
+            order.insert(0, cached)     # 上次成功过的先试
+
+        for idx in order:
+            if not _press_rail_button(target, idx):
+                continue
+            panel, pwin = _wait_panel(pid)
+            if panel:
+                if isinstance(config, dict) and config.get("ths_rail_index") != idx:
+                    config["ths_rail_index"] = idx
+                _log("同花顺当时不在交易面板, 已自动切过去(左侧导航第 %d 个)" % (idx + 1), "OK")
+                return panel, pwin, None
+        # 整圈都试过了还没有: 可能某一次切换特别慢, 最后再耐心等一次
+        panel, pwin = _wait_panel(pid, timeout=_RAIL_SETTLE_LAST)
+        if panel:
+            _log("同花顺已切到交易面板(这次切得比较慢)", "OK")
+            return panel, pwin, None
+        return None, None, "同花顺不在交易面板, 自动切换也失败(左侧导航 %d 个都试过了)" % count
+    finally:
+        _ax_free(target)
 
 
 def _find_sheet(win):
@@ -776,6 +917,7 @@ class KeyOrderExecutor:
         """
         找到同花顺的交易下单面板。
         返回 [(进程号, 窗口名)], 找不到就返回空列表并打印提示。
+        如果同花顺当前不在交易界面, 会先尝试自己切过去(见 _goto_panel)。
         """
         if not _ax_trusted():
             _log("没有辅助功能权限: 请到「系统设置 -> 隐私与安全性 -> 辅助功能」"
@@ -786,13 +928,25 @@ class KeyOrderExecutor:
             _log("没找到正在运行的「%s」, 请先打开同花顺 Mac 版" % self._app_name(), "ERROR")
             return []
         self.ths_hwnd = pid
-        panel, win, why = _locate_panel(pid)
+        panel, win, why = self._goto_panel(pid)
         if panel is None:
             _log("没找到同花顺交易下单面板: %s" % why, "ERROR")
-            _log("请在同花顺里打开「下单」面板(能看到 代码/价格/数量 三个输入框那一屏)", "INFO")
+            _log("请在左侧导航栏里点开「交易」那一屏(能看到 代码/价格/数量 三个输入框)", "INFO")
             return []
         self._panel = panel
         return [(pid, panel["title"])]
+
+    def _goto_panel(self, pid):
+        """
+        拿到交易面板; 不在交易界面就让同花顺自己切过去。
+        返回 (面板, 窗口, 失败原因)。auto_goto_panel=false 时只找、不切。
+        """
+        panel, win, why = _locate_panel(pid)
+        if panel is not None:
+            return panel, win, None
+        if not bool(self.config.get("auto_goto_panel", True)):
+            return None, None, why
+        return navigate_to_order_panel(pid, self.config)
 
     def _activate(self, path=None):
         """
@@ -823,6 +977,9 @@ class KeyOrderExecutor:
         拿到达交易面板的信息。
         因为定位一次只要 0.01 秒, 这里就不再搞缓存了 —— 每次都现查最可靠
         (窗口序号、控件位置变了也不会受影响)。
+
+        同花顺要是被人切到别的界面(自选股/行情...)了, 这里会先让它自己切回来,
+        再取值 —— 这样无论是[预热]还是真下单, 都不会因为"跑偏一屏"就失败。
         """
         if not _ax_trusted():
             return None, ("没有辅助功能权限: 请到「系统设置 -> 隐私与安全性 -> 辅助功能」"
@@ -831,7 +988,7 @@ class KeyOrderExecutor:
         if pid is None:
             return None, "没找到正在运行的「%s」" % self._app_name()
         self.ths_hwnd = pid
-        panel, win, why = _locate_panel(pid)
+        panel, win, why = self._goto_panel(pid)
         if panel is None:
             return None, why
         # 上一次那套控件引用没用了, 先还回去
@@ -1250,8 +1407,21 @@ class KeyOrderExecutor:
             _log("没有发现交易下单面板, 请在同花顺里打开下单界面后再点[列出窗口]", "WARN")
         return found
 
+    def ensure_order_panel(self):
+        """
+        [预热]/定时激活 调这个: 确保同花顺已经在交易面板上待命。
+        不在就自己切过去, 并把之后要用的控件先摸一遍(顺便把路径摸热)。
+        返回 True 表示已经就绪。
+        """
+        panel, why = self._ensure_panel()
+        if panel is None:
+            _log("激活失败: %s" % why, "WARN")
+            return False
+        return True
+
     def test_order(self):
-        """[测试连接]: 检查同花顺是否在运行、交易面板能否被识别(不会真下单)"""
+        """[测试连接]: 检查同花顺是否在运行、交易面板能否被识别(不会真下单)。
+        当前不在交易界面时会先尝试自动切过去, 所以这个按钮也是"一键就绪"。"""
         t0 = time.time()
         if not _ax_trusted():
             _log("检测失败: 没有辅助功能权限", "ERROR")
@@ -1261,10 +1431,10 @@ class KeyOrderExecutor:
         if pid is None:
             _log("没找到正在运行的「%s」, 请先打开同花顺 Mac 版" % self._app_name(), "ERROR")
             return False
-        panel, win, why = _locate_panel(pid)
+        panel, win, why = self._goto_panel(pid)
         if panel is None:
             _log("检测失败: %s" % why, "ERROR")
-            _log("请打开同花顺的下单面板(能看到 代码/价格/数量 三行)后重试", "INFO")
+            _log("请在左侧导航栏里点开「交易」那一屏(能看到 代码/价格/数量 三个输入框)后重试", "INFO")
             return False
         self.ths_hwnd = pid
         if self._win:
