@@ -1113,6 +1113,12 @@ class FollowerEngine:
         """接收任一信号源的 JSON，并复用统一跟单管线。"""
         if not isinstance(data, dict):
             raise ValueError("信号必须是 JSON 对象")
+        # 兜底闸门: 停止跟单时 HTTP 服务会被关掉, 理论上收不到请求; 但已经在处理中的
+        # 请求(发出 stop 的瞬间正好在途)仍会走到这里, 这时绝不能再下单。
+        if self.state != "following":
+            gui_log("忽略信号: 当前未处于跟单状态(state=%s), 不下单 %s" % (
+                self.state, data.get("security", "")), "WARN")
+            return {"status": "not_following"}
         with self._order_lock:
             order = self._signal_to_order(data)
             if not order:
@@ -1161,10 +1167,22 @@ class FollowerEngine:
             self.app.root.after(0, self.app._on_follow_started)
 
     def stop_following(self):
+        """停止跟单: 必须把 HTTP 信号服务也一起关掉。
+
+        之前这里只改了 state 和 _stop_event, HTTP 服务留在原地继续监听 ——
+        结果点完[停止跟单], 端口还开着, 外部推过来的信号照样会被执行下单。
+        真正会关服务的是 stop(), 而它只在关窗口时才被调用, 所以"停止"是假的。
+        """
         self.state = "idle"
         if self._stop_event:
             self._stop_event.set()
-        gui_log("<<< 已发送停止信号, 自动跟单将在当前信号处理后暂停", "INFO")
+        _had_http = self._http_server is not None
+        self._stop_http_server()          # 释放端口, 外部再也推不进来
+        if _had_http:
+            _port = self.config.get("http_port", 8765)
+            gui_log("<<< 已停止跟单: HTTP 信号服务已关闭, 端口 %s 已释放" % _port, "INFO")
+        else:
+            gui_log("<<< 已发送停止信号, 自动跟单将在当前信号处理后暂停", "INFO")
 
     # ==================== Redis 实时信号源 (与 tools_ths_redis.py 对接) ====================
     def _signal_to_order(self, data):
