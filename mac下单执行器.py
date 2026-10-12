@@ -502,7 +502,16 @@ def _collect_tables(el, depth=0, acc=None):
 
 
 def _cell_text(cell, depth=2):
-    """读一个单元格里的文字(格子内部可能还有一层容器)"""
+    """读一个单元格里的文字。
+
+    同花顺有两种画法, 两种都要认:
+      - 格子本身就是 AXStaticText, 文字直接在 AXValue 上
+        (实盘的持仓/委托/成交表就是这样, 实测格子=AXStaticText, AXValue="159892")
+      - 格子是 AXCell 容器, 文字在里层的 AXStaticText 上
+        (资金明细、买卖五档是这样)
+    """
+    if _ax_text(cell, "AXRole") == "AXStaticText":
+        return (_ax_text(cell, "AXValue") or "").strip()
     parts = []
 
     def rec(el, d):
@@ -557,7 +566,9 @@ def _table_rows(table):
             ck = _ax_elements(c)
             try:
                 for cell in ck:
-                    if _ax_text(cell, "AXRole") != "AXCell":
+                    # 格子可能是 AXCell(容器), 也可能直接就是 AXStaticText。
+                    # 空字符串也要照收 —— 否则某个空格子会让后面所有列错位。
+                    if _ax_text(cell, "AXRole") not in ("AXCell", "AXStaticText"):
                         continue
                     cells.append(_cell_text(cell))
             finally:
