@@ -1096,6 +1096,16 @@ class FollowerEngine:
                 },
             )
             self._http_server.start()
+            _host = str(self.config.get("http_host", "127.0.0.1")).strip()
+            if _host not in ("127.0.0.1", "localhost", "::1"):
+                # 绑到 0.0.0.0 / 局域网 IP: 同一个网络里别的机器也能访问, 提醒一次
+                _tok = str(self.config.get("http_api_token", ""))
+                if _tok == DEFAULT_CONFIG.get("http_api_token"):
+                    gui_log("注意: HTTP 服务已绑定 %s, 局域网内可访问; 且 Token 仍是内置默认值, "
+                            "建议到[信号源 → HTTP Token]改成自己的随机串" % _host, "WARN")
+                else:
+                    gui_log("注意: HTTP 服务已绑定 %s, 局域网内可访问(已使用自定义 Token)" % _host,
+                            "WARN")
         except Exception as exc:
             self._http_server = None
             gui_log("HTTP 信号服务启动失败: %s" % exc, "ERROR")
@@ -1804,8 +1814,9 @@ class ControlPanel:
             if _mac_order._ax_request_trust():
                 gui_log("辅助功能权限已就绪", "OK")
             else:
+                # 实测: 在系统设置里勾上之后是立即生效的, 不用重启程序
                 gui_log("还没拿到辅助功能权限: 请在弹窗里点「打开系统设置」, "
-                        "把「同花顺跟单器」勾上后重启本程序", "WARN")
+                        "把「同花顺跟单器」勾上, 然后回来点[测试]验证(不用重启程序)", "WARN")
         except Exception as e:
             gui_log("辅助功能权限自查失败: %s" % e, "WARN")
 
