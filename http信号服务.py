@@ -3,11 +3,20 @@
 """本地 HTTP 交易信号接收服务。
 
 只负责 HTTP 鉴权、JSON 解析和格式校验；下单规则由 FollowerEngine 统一处理。
+
+鉴权: 必须配置 http_api_token, 请求需带 `Authorization: Bearer <token>`。
+
+接口:
+    GET  /health      健康检查(免鉴权)
+    GET  /            端点列表(免鉴权, 机器可读)
+    POST /signal      接收交易信号 -> 交给 callback
+    GET  /<query>     查询接口, 由构造时的 queries 决定(如 /positions /orders)
 """
 
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit, parse_qsl
 
 
 class _SignalHTTPServer(ThreadingHTTPServer):
@@ -16,14 +25,19 @@ class _SignalHTTPServer(ThreadingHTTPServer):
 
 
 class HTTPSignalServer:
-    """将 POST /signal 请求转换为标准信号并交给 callback。"""
+    """将 POST /signal 请求转换为标准信号并交给 callback。
 
-    def __init__(self, host, port, token, callback, log=None):
+    queries: {"/positions": fn(params)->dict, ...} 形式的查询路由。
+             这些路由同样要求 Bearer 鉴权, 返回值会并入 {"ok": true, ...}。
+    """
+
+    def __init__(self, host, port, token, callback, log=None, queries=None):
         self.host = str(host or "127.0.0.1")
         self.port = int(port)
         self.token = str(token or "")
         self.callback = callback
         self.log = log or (lambda message, level="INFO": None)
+        self.queries = dict(queries or {})
         self._server = None
         self._thread = None
 
@@ -41,6 +55,7 @@ class HTTPSignalServer:
         callback = self.callback
         token = self.token
         log = self.log
+        queries = self.queries
 
         class Handler(BaseHTTPRequestHandler):
             server_version = "THSOrderHTTP/1.0"
@@ -57,19 +72,49 @@ class HTTPSignalServer:
                 self.wfile.write(raw)
                 self.wfile.flush()
 
+            def _authed(self):
+                """校验 Bearer Token; 没通过就直接回 401 并返回 False"""
+                if self.headers.get("Authorization", "") != "Bearer " + token:
+                    self._send_json(401, {"ok": False, "error": "unauthorized"})
+                    return False
+                return True
+
             def do_GET(self):
-                if self.path == "/health":
+                parsed = urlsplit(self.path)
+                path = parsed.path
+                # 免鉴权的两个端点: 只暴露"活着"和"有哪些接口", 不含任何账户数据
+                if path == "/health":
                     self._send_json(200, {"ok": True, "service": "ths-order-http"})
-                else:
+                    return
+                if path == "/":
+                    self._send_json(200, {"ok": True, "service": "ths-order-http",
+                                          "endpoints": ["GET /health", "POST /signal"]
+                                          + ["GET " + p for p in sorted(queries)]})
+                    return
+                fn = queries.get(path)
+                if fn is None:
                     self._send_json(404, {"ok": False, "error": "not_found"})
+                    return
+                if not self._authed():
+                    return
+                try:
+                    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+                    result = fn(params) or {}
+                    self._send_json(200, {"ok": True, **result})
+                except ValueError as exc:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
+                except RuntimeError as exc:
+                    # 业务上"暂时拿不到"(比如同花顺没开/权限没给) 用 503 更贴切
+                    self._send_json(503, {"ok": False, "error": str(exc)})
+                except Exception as exc:
+                    log("HTTP 查询处理异常: %s" % exc, "ERROR")
+                    self._send_json(500, {"ok": False, "error": "internal_error"})
 
             def do_POST(self):
                 if self.path != "/signal":
                     self._send_json(404, {"ok": False, "error": "not_found"})
                     return
-                auth = self.headers.get("Authorization", "")
-                if auth != "Bearer " + token:
-                    self._send_json(401, {"ok": False, "error": "unauthorized"})
+                if not self._authed():
                     return
                 try:
                     length = int(self.headers.get("Content-Length", "0"))

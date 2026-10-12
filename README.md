@@ -44,12 +44,27 @@ LingTradeBridge 是 LingQuant 的**交易信号跟单桥**：接收外部策略�
 
 ## 信号来源
 
-当前项目代码包含两种信号接收方式：
+当前项目代码包含两种信号接收方式，由配置项 `signal_source` 统一控制：
 
-- Redis：跟单器从配置的 Redis 通道接收实时信号。
-- HTTP：本地 HTTP 服务通过 `POST /signal` 接收信号。
+- `http`（默认）：只启用本地 HTTP 信号服务，通过 `POST /signal` 接收信号，无需 Redis。
+- `redis`：只从配置的 Redis 通道接收实时信号。
+- `both`：两者同时启用。
 
-HTTP 服务提供 `GET /health` 健康检查接口。具体信号字段、配置项和执行规则以当前代码及配置文件为准。
+HTTP 服务提供以下接口，除 `/health` 和 `/` 外都需要 Token 鉴权（请求带 `Authorization: Bearer <token>`），且默认只绑定 `127.0.0.1`。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/health` | 健康检查（免鉴权） |
+| GET | `/` | 端点列表（免鉴权，机器可读） |
+| POST | `/signal` | 接收交易信号 |
+| GET | `/account` | 资金明细（总资产/可用金额/可取金额…） |
+| GET | `/positions` | 持仓（读同花顺界面表格） |
+| GET | `/orders` | 委托 |
+| GET | `/deals` | 成交 |
+
+四个查询接口都是**读同花顺客户端界面上正在显示的表格**（走 macOS 辅助功能），不是查跟单器自己的台账，因此需要同花顺处于运行且停在交易界面的状态；读不到时返回 `503`。`/positions`、`/orders`、`/deals` 共用同一个表格控件，查询时会自动切换页签，所以它们返回的内容与界面上当前显示的页签会互相影响。
+
+Token 取自配置项 `http_api_token`，项目内置了一个默认值，开箱即可使用；建议在 `网页跟单配置.json` 或界面「HTTP Token」里改成自己的值，并同步给发送信号的一方。具体信号字段、配置项和执行规则以当前代码及配置文件为准。
 
 ## 启动
 
@@ -59,14 +74,17 @@ macOS 下可在访达中双击：
 open 启动跟单器.command
 ```
 
-也可以在终端运行：
+也可以在终端运行，并可选地指定本次运行的信号源：
 
 ```bash
 cd LingTradeBridge
-./启动跟单器.command
+./启动跟单器.command          # 用配置文件里的信号源（默认 http）
+./启动跟单器.command http     # 本次只用 HTTP
+./启动跟单器.command redis    # 本次只用 Redis
+./启动跟单器.command both     # 本次 HTTP + Redis
 ```
 
-启动脚本会优先使用项目目录下的 `.venv/bin/python`，否则使用 `python3`。
+启动脚本会优先使用项目目录下的 `.venv/bin/python`，否则使用 `python3`。命令行参数只影响本次运行，不会改写 `网页跟单配置.json`；想永久切换请在界面「信号源」下拉框里选好后点[保存配置]。
 
 使用同花顺客户端操作能力时，需要按 macOS 的要求授予终端或 Python 辅助功能权限。Redis 跟单还需要准备对应的 Python 依赖和 Redis 服务。
 

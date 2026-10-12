@@ -458,7 +458,162 @@ def _sheet_texts_and_buttons(sheet):
 
 
 # ===========================================================================
-# 三、下单执行器
+# 三、读同花顺界面表格 (资金明细 / 持仓 / 委托 / 成交)
+# ---------------------------------------------------------------------------
+# 同花顺把这几个页签放在**同一个 AXTable** 里, 点不同页签时表格原地重绘成不同列头。
+# 所以不能靠控件位置或编号认表, 只能靠列头文字认:
+#     列头含「证券代码 + 股票余额」 -> 持仓表
+#     列头含「委托日期 + 委托数量」 -> 委托表
+#     列头含「成交日期 + 成交数量」 -> 成交表
+#     (资金明细没有列头, 是 键/值 两列, 靠行首文字「总资产/可用金额」认)
+# 认到表后按 AXRow -> AXCell -> AXStaticText 逐格读文字。
+#
+# 内存注意事项: _ax_elements() 返回的引用都是"加锁(retain)"过的, 用完必须
+# _ax_free_all() 还回去。要带走某个子元素(比如找到的表格), 得先额外 CFRetain
+# 一份, 否则会跟着那一批子元素一起被释放, 后面再用就崩。
+# ===========================================================================
+MAX_TREE_DEPTH = 9
+
+# kind -> (页签按钮标题, 列头关键字)
+TABLE_KINDS = {
+    "account":   {"tab": "资金明细", "cols": ()},
+    "positions": {"tab": "持仓",     "cols": ("证券代码", "股票余额", "成本价")},
+    "orders":    {"tab": "委托",     "cols": ("委托日期", "委托时间", "委托数量")},
+    "deals":     {"tab": "成交",     "cols": ("成交日期", "成交时间", "成交数量")},
+}
+
+
+def _collect_tables(el, depth=0, acc=None):
+    """把容器里所有 AXTable 收集出来(带一份额外引用, 调用方负责 _ax_free)。"""
+    acc = [] if acc is None else acc
+    if depth > MAX_TREE_DEPTH:
+        return acc
+    kids = _ax_elements(el)
+    try:
+        for c in kids:
+            if _ax_text(c, "AXRole") == "AXTable":
+                _CF.CFRetain(c)          # 多留一份, 免得随 kids 一起被释放
+                acc.append(c)
+            else:
+                _collect_tables(c, depth + 1, acc)
+    finally:
+        _ax_free_all(kids)
+    return acc
+
+
+def _cell_text(cell, depth=2):
+    """读一个单元格里的文字(格子内部可能还有一层容器)"""
+    parts = []
+
+    def rec(el, d):
+        if d <= 0:
+            return
+        kids = _ax_elements(el)
+        try:
+            for k in kids:
+                if _ax_text(k, "AXRole") == "AXStaticText":
+                    v = _ax_text(k, "AXValue")
+                    if v:
+                        parts.append(v.strip())
+                else:
+                    rec(k, d - 1)
+        finally:
+            _ax_free_all(kids)
+
+    rec(cell, depth)
+    return " ".join(parts)
+
+
+def _table_headers(table):
+    """表格列头: 同花顺把列头放在 AXGroup 里的 AXButton 标题上。没有列头返回 []。"""
+    kids = _ax_elements(table)
+    try:
+        for c in kids:
+            if _ax_text(c, "AXRole") != "AXGroup":
+                continue
+            subs = _ax_elements(c)
+            try:
+                heads = [_ax_text(b, "AXTitle") for b in subs
+                         if _ax_text(b, "AXRole") == "AXButton"]
+                heads = [h for h in heads if h]
+                if heads:
+                    return heads
+            finally:
+                _ax_free_all(subs)
+    finally:
+        _ax_free_all(kids)
+    return []
+
+
+def _table_rows(table):
+    """按行读表格内容。返回 [[单元格文字, ...], ...], 全空的行会被丢掉。"""
+    rows = []
+    kids = _ax_elements(table)
+    try:
+        for c in kids:
+            if _ax_text(c, "AXRole") != "AXRow":
+                continue
+            cells = []
+            ck = _ax_elements(c)
+            try:
+                for cell in ck:
+                    if _ax_text(cell, "AXRole") != "AXCell":
+                        continue
+                    cells.append(_cell_text(cell))
+            finally:
+                _ax_free_all(ck)
+            if any(cells):
+                rows.append(cells)
+    finally:
+        _ax_free_all(kids)
+    return rows
+
+
+def _find_table_by_cols(win, cols):
+    """找列头里包含 cols 全部文字的表格; 找不到返回 None。返回的引用由调用方释放。"""
+    for t in _collect_tables(win):
+        heads = _table_headers(t)
+        if heads and all(c in heads for c in cols):
+            return t
+        _ax_free(t)
+    return None
+
+
+def _find_account_table(win):
+    """资金明细表: 没有列头, 靠行首文字认。返回 (表格, 已读好的行) 或 (None, [])。"""
+    for t in _collect_tables(win):
+        if _table_headers(t):
+            _ax_free(t)              # 有列头的是网格表, 跳过(顺带避开几百行的行情列表)
+            continue
+        rows = _table_rows(t)
+        keys = [r[0] for r in rows if r]
+        if "总资产" in keys and "可用金额" in keys:
+            return t, rows
+        _ax_free(t)
+    return None, []
+
+
+def _find_button(el, title, depth=0):
+    """深度优先找标题完全等于 title 的按钮; 返回的引用由调用方释放。"""
+    if depth > MAX_TREE_DEPTH:
+        return None
+    kids = _ax_elements(el)
+    try:
+        for c in kids:
+            if _ax_text(c, "AXRole") == "AXButton" and _ax_text(c, "AXTitle") == title:
+                _CF.CFRetain(c)
+                return c
+        for c in kids:
+            r = _find_button(c, title, depth + 1)
+            if r is not None:
+                return r
+    finally:
+        _ax_free_all(kids)
+    return None
+
+
+# ===========================================================================
+# 四、下单执行器
 # ===========================================================================
 class KeyOrderExecutor:
     """
@@ -472,6 +627,7 @@ class KeyOrderExecutor:
         self.order_count = 0
         self.processed_display_base = 0   # 清空统计时的已处理基线
         self._lock = threading.Lock()
+        self._query_lock = threading.Lock()   # 界面查询串行化: 同一时刻只允许一个查询在切页签
         self._panel = None                # 上一次定位到的面板(仅用于自检显示)
         self._win = None                  # 上一次用到的窗口元素
 
@@ -825,6 +981,112 @@ class KeyOrderExecutor:
             return "confirmed", extra
         except Exception as e:
             return "submit-unknown", str(e)
+
+    # ------------------------------------------------------------------
+    # 查询: 读同花顺界面上的表格
+    # ------------------------------------------------------------------
+    def query_table(self, kind, timeout=3.0, settle=0.05, settle_grace=0.5):
+        """
+        读同花顺界面上的表格, 供 HTTP 查询接口使用。
+
+        kind: account(资金明细) / positions(持仓) / orders(委托) / deals(成交)
+        返回 dict, 形如:
+            {"kind":..., "tab":..., "switched":bool, "headers":[...], "rows":[{列头: 值}, ...]}
+          资金明细没有列头, 改为 {"account": {项目: 数值}, "rows": [[键, 值], ...]}
+
+        说明:
+          - 这几个页签共用同一个表格, 所以要按列头认表;
+          - 当前显示的不是目标表时, 会点一下对应页签再读(会改变同花顺界面显示);
+          - 查询之间用 _query_lock 串行, 避免两个请求同时切页签互相打架。
+        """
+        if kind not in TABLE_KINDS:
+            raise ValueError("不支持的查询类型: %s (可选 %s)"
+                             % (kind, "/".join(sorted(TABLE_KINDS))))
+        if not _ax_trusted():
+            raise RuntimeError("没有辅助功能权限: 请到「系统设置 -> 隐私与安全性 -> 辅助功能」"
+                               "把运行本程序的 App(终端/Python)勾上")
+        pid = self.ths_hwnd or _find_ths_pid(self._app_name())
+        if pid is None:
+            raise RuntimeError("没找到正在运行的「%s」, 请先打开同花顺 Mac 版" % self._app_name())
+        self.ths_hwnd = pid
+        spec = TABLE_KINDS[kind]
+
+        with self._query_lock:
+            panel, win, why = _locate_panel(pid)
+            if win is None:
+                raise RuntimeError("没找到同花顺交易窗口: %s" % why)
+            try:
+                switched = False
+                if kind == "account":
+                    table, rows = _find_account_table(win)
+                else:
+                    table, rows = _find_table_by_cols(win, spec["cols"]), None
+
+                if table is None:
+                    btn = _find_button(win, spec["tab"])
+                    if btn is None:
+                        raise RuntimeError("界面上找不到「%s」页签, 请确认同花顺停在交易界面"
+                                           % spec["tab"])
+                    try:
+                        _ax_press(btn)
+                    finally:
+                        _ax_free(btn)
+                    switched = True
+                    # 点完页签表格是异步重绘的, 轮询等它变成目标表
+                    deadline = time.time() + max(0.1, float(timeout))
+                    while time.time() < deadline:
+                        time.sleep(max(0.01, float(settle)))
+                        if kind == "account":
+                            table, rows = _find_account_table(win)
+                        else:
+                            table = _find_table_by_cols(win, spec["cols"])
+                        if table is not None:
+                            break
+
+                if table is None:
+                    raise RuntimeError("已切到「%s」页签, 但没读到对应表格(可能还在加载)"
+                                       % spec["tab"])
+                try:
+                    if kind == "account":
+                        if rows is None:
+                            rows = _table_rows(table)
+                        account = {}
+                        for r in rows:
+                            if len(r) >= 2:
+                                account[r[0]] = r[1]
+                        return {"kind": kind, "tab": spec["tab"], "switched": switched,
+                                "account": account,
+                                "rows": [r[:2] for r in rows]}
+                    headers = _table_headers(table)
+                    rows = _table_rows(table)
+                    # 列头是随表格一起静态渲染的, 行数据可能稍后才从服务器回来。
+                    # 刚切过页签且读到空表时, 给一小段宽限期再读一次, 避免把"还没加载完"
+                    # 当成"真的没有委托"。
+                    if switched and not rows:
+                        grace = time.time() + max(0.0, float(settle_grace))
+                        while time.time() < grace and not rows:
+                            time.sleep(max(0.01, float(settle)))
+                            rows = _table_rows(table)
+                    return {"kind": kind, "tab": spec["tab"], "switched": switched,
+                            "headers": headers,
+                            "rows": [dict(zip(headers, r)) for r in rows]}
+                finally:
+                    _ax_free(table)
+            finally:
+                _release_panel(panel)
+                _ax_free(win)
+
+    def query_account(self):
+        return self.query_table("account")
+
+    def query_positions(self):
+        return self.query_table("positions")
+
+    def query_orders(self):
+        return self.query_table("orders")
+
+    def query_deals(self):
+        return self.query_table("deals")
 
     # ------------------------------------------------------------------
     # 自检

@@ -96,7 +96,7 @@ DEFAULT_CONFIG = {
     "ignore_sell": False,
     "allow_reorder": False,             # 允许当天重复下单(跳过去重检查)
     # --- Redis 实时信号源 ---
-    "signal_source": "redis",          # redis / http / both
+    "signal_source": "http",           # 信号源: redis / http / both (默认只开 HTTP, 不启用 Redis)
     "redis_host": "",                   # 默认留空: 防止误连未知服务器
     "redis_port": 1552,
     "redis_password": "",
@@ -106,12 +106,33 @@ DEFAULT_CONFIG = {
     "redis_backtest_skip_hours": 2,
     "redis_allow_backtest_live": False,
     # --- HTTP 信号源 ---
-    "http_enabled": False,
+    "http_enabled": True,
     "http_host": "127.0.0.1",
     "http_port": 8765,
-    "http_api_token": "",
+    # 默认 Token: 开箱即用, 可在 网页跟单配置.json 或界面「HTTP Token」里改成自己的
+    "http_api_token": "GsUhRvLqJqpplCtzkKeJjQCB",
     "strategy_ratios": "",
 }
+
+# ===========================================================================
+# 信号源: 统一的可配置开关
+# ---------------------------------------------------------------------------
+#   redis  = 只监听 Redis 通道(需要 Redis 服务)
+#   http   = 只开本地 HTTP 接收服务(默认)
+#   both   = 两者同时启用
+# 优先级: 启动脚本传入的环境变量 > 配置文件 > DEFAULT_CONFIG(默认 http)
+# ===========================================================================
+SIGNAL_SOURCES = ("redis", "http", "both")
+DEFAULT_SIGNAL_SOURCE = "http"
+ENV_SIGNAL_SOURCE = "LINGTRADE_SIGNAL_SOURCE"
+
+
+def normalize_signal_source(value, default=DEFAULT_SIGNAL_SOURCE):
+    """把任意来源的值规整成 redis / http / both 之一, 非法值回退到 default。"""
+    v = str(value or "").strip().lower()
+    if v in SIGNAL_SOURCES:
+        return v
+    return default
 
 
 def _autodetect_ths_path():
@@ -152,6 +173,17 @@ def load_config():
             cfg["ths_exe_path"] = _autodetect_ths_path()
     except Exception:
         cfg["ths_exe_path"] = _autodetect_ths_path()
+
+    # --- 信号源: 启动脚本(环境变量) > 配置文件 > 默认值 ---
+    # 启动脚本 `启动跟单器.command redis` 之类会注入 LINGTRADE_SIGNAL_SOURCE,
+    # 只在显式传参时生效; 不传参时以配置文件为准(默认 http)。
+    _env_src = str(os.environ.get(ENV_SIGNAL_SOURCE, "") or "").strip().lower()
+    if _env_src in SIGNAL_SOURCES:
+        cfg["signal_source"] = _env_src
+    else:
+        cfg["signal_source"] = normalize_signal_source(cfg.get("signal_source"))
+    # http_enabled 作为派生值同步, 兼容仍读取它的旧代码
+    cfg["http_enabled"] = cfg["signal_source"] in ("http", "both")
     return cfg
 
 
@@ -1040,8 +1072,14 @@ class FollowerEngine:
         self.processed_orders, self.order_records = load_processed_orders()
         self.order_count = 0
 
+    def _signal_source(self):
+        return normalize_signal_source(self.config.get("signal_source"))
+
     def _start_http_server(self):
-        if not self.config.get("http_enabled", False):
+        if self._signal_source() not in ("http", "both"):
+            return
+        if not str(self.config.get("http_api_token", "") or "").strip():
+            gui_log("HTTP 信号源已启用但未配置 Token, HTTP 服务未启动 (请填写 HTTP Token)", "ERROR")
             return
         try:
             self._http_server = HTTPSignalServer(
@@ -1050,6 +1088,12 @@ class FollowerEngine:
                 self.config.get("http_api_token", ""),
                 self.submit_signal,
                 gui_log,
+                queries={
+                    "/account":   lambda p: self.query_ths_table("account"),
+                    "/positions": lambda p: self.query_ths_table("positions"),
+                    "/orders":    lambda p: self.query_ths_table("orders"),
+                    "/deals":     lambda p: self.query_ths_table("deals"),
+                },
             )
             self._http_server.start()
         except Exception as exc:
@@ -1074,20 +1118,36 @@ class FollowerEngine:
             self._http_server.stop()
             self._http_server = None
 
+    def query_ths_table(self, kind):
+        """读同花顺界面上的表格(account/positions/orders/deals), 供 HTTP 查询接口调用。
+
+        注意: 这是「读界面」而不是查你们自己的台账, 所以反映的是同花顺客户端**当前**
+        显示的内容 —— 需要同花顺开着、停在交易界面。
+        """
+        executor = self.order_executor
+        if executor is None or not hasattr(executor, "query_table"):
+            raise RuntimeError("当前下单执行器不支持界面查询")
+        return executor.query_table(kind)
+
     def stop(self):
         self._stop_http_server()
         if self._stop_event:
             self._stop_event.set()
 
     def start_following(self):
-        # Redis 和 HTTP 共用同一个跟单引擎。
+        # Redis 和 HTTP 共用同一个跟单引擎, 按「信号源」只启动对应通道。
+        source = self._signal_source()
         self._stop_event = threading.Event()
         self.state = "following"
+        self.config["http_enabled"] = source in ("http", "both")
         self._start_http_server()
-        self._follow_thread = threading.Thread(target=self._redis_follow_loop, daemon=True)
-        self._follow_thread.start()
-        gui_log(">>> Redis 跟单已启动 (通道 %s): blpop 实时接收 -> 键盘跟单" %
-                self.config.get("redis_channel", "jq_signals_ths"), "OK")
+        if source in ("redis", "both"):
+            self._follow_thread = threading.Thread(target=self._redis_follow_loop, daemon=True)
+            self._follow_thread.start()
+            gui_log(">>> Redis 跟单已启动 (通道 %s): blpop 实时接收 -> 键盘跟单" %
+                    self.config.get("redis_channel", "jq_signals_ths"), "OK")
+        else:
+            gui_log(">>> 信号源=%s, 未启动 Redis 监听" % source, "INFO")
         if self.app:
             self.app.root.after(0, self.app._on_follow_started)
 
@@ -1515,7 +1575,12 @@ class ControlPanel:
         threading.Thread(target=self._rdp_keepalive_loop, daemon=True).start()
         gui_log("=== 聚宽转同花顺跟单器已启动 ===", "OK")
         gui_log("请先点击[打开同花顺]启动下单客户端并登录, 然后点击[测试连接]", "INFO")
-        gui_log("Redis 跟单: 点击[开始跟单]启动实时信号监听", "INFO")
+        _src = normalize_signal_source(self.cfg.get("signal_source"))
+        _src_desc = {"http": "HTTP (http://%s:%s/signal)" % (
+                         self.cfg.get("http_host", "127.0.0.1"), self.cfg.get("http_port", 8765)),
+                     "redis": "Redis (通道 %s)" % self.cfg.get("redis_channel", ""),
+                     "both": "HTTP + Redis"}.get(_src, _src)
+        gui_log("当前信号源: %s —— 点击[开始跟单]启动对应通道" % _src_desc, "INFO")
 
     def _build_ui(self):
         self.root.title("👺同花顺跟单器20261010   @冰山大火")
@@ -2247,7 +2312,7 @@ class ControlPanel:
         # 会露出主题默认的白色, 让这一行和周围的灰底不一致
         caption_row = tk.Frame(parent, bg=UI.BG)
         caption_row.pack(fill="x", padx=6, pady=(2, 1))
-        tk.Label(caption_row, text="② 信号源 · Redis", fg=UI.TEXT_MUTED, bg=UI.BG,
+        tk.Label(caption_row, text="② 信号源 (Redis / HTTP)", fg=UI.TEXT_MUTED, bg=UI.BG,
                  font=self._font_medium).pack(side="left")
         self._redis_hidden = False
         # 用 tk.Button 并指定与标题完全一致的底纹/文字色(UI.BG + UI.TEXT_MUTED),
@@ -2309,9 +2374,18 @@ class ControlPanel:
                   font=(self._FONT_NAME, 7)).pack(side="left", padx=4)
 
         self._card_hairline(g)
+        # 信号源选择: HTTP / Redis / 两者 (默认 HTTP, 不启用 Redis)
+        src_row = ttk.Frame(g); src_row.pack(fill="x", pady=2)
+        ttk.Label(src_row, text="信号源:", width=_LBL_W, anchor="w").pack(side="left")
+        self._src_labels = {"redis": "Redis", "http": "HTTP", "both": "HTTP + Redis"}
+        self._src_label_by_key = {v: k for k, v in self._src_labels.items()}
+        src_now = normalize_signal_source(self.cfg.get("signal_source"))
+        self.vars["signal_source_display"] = tk.StringVar(value=self._src_labels[src_now])
+        ttk.Combobox(src_row, textvariable=self.vars["signal_source_display"], width=12,
+                     state="readonly", values=tuple(self._src_labels.values())).pack(side="right", padx=(4, 2))
         http_row = ttk.Frame(g); http_row.pack(fill="x", pady=2)
-        self.vars["http_enabled"] = tk.BooleanVar(value=self.cfg.get("http_enabled", False))
-        ttk.Checkbutton(http_row, text="启用 HTTP 信号", variable=self.vars["http_enabled"]).pack(side="left")
+        ttk.Label(http_row, text="(HTTP 需 Token 鉴权; Redis 需填地址/通道)", foreground=UI.TEXT_MUTED,
+                  font=(self._FONT_NAME, 7)).pack(side="left")
         http_host = ttk.Frame(g); http_host.pack(fill="x", pady=2)
         ttk.Label(http_host, text="HTTP地址:", width=_LBL_W, anchor="w").pack(side="left")
         self.vars["http_host"] = tk.StringVar(value=self.cfg.get("http_host", "127.0.0.1"))
@@ -2781,8 +2855,10 @@ class ControlPanel:
         cfg["ignore_buy"] = self.vars["ignore_buy"].get()
         cfg["ignore_sell"] = self.vars["ignore_sell"].get()
         cfg["allow_reorder"] = self.vars["allow_reorder"].get()
-        # Redis 与 HTTP 可同时启用；兼容旧配置时默认保持 Redis。
-        cfg["signal_source"] = "both" if bool(self.vars["http_enabled"].get()) else "redis"
+        # 信号源: 由「信号源」下拉框决定 (redis / http / both), 默认 http
+        cfg["signal_source"] = self._src_label_by_key.get(
+            self.vars["signal_source_display"].get(), DEFAULT_SIGNAL_SOURCE)
+        cfg["http_enabled"] = cfg["signal_source"] in ("http", "both")
         # 眼睛处于隐藏状态时, 界面上显示的是掩码(●●●●), 保存必须用真实值,
         # 否则会把掩码写进配置, 导致 Redis 连不上(这就是之前 redis_host 变掩码的原因)
         if getattr(self, "_redis_hidden", False) and getattr(self, "_redis_real_host", ""):
@@ -2810,7 +2886,6 @@ class ControlPanel:
         # --- 定时激活(测试版新增) ---
         cfg["activation_times"] = self._collect_activation_times()
         cfg["activate_enabled"] = bool(self.vars["activate_enabled"].get())
-        cfg["http_enabled"] = bool(self.vars["http_enabled"].get())
         cfg["http_host"] = self.vars["http_host"].get().strip() or "127.0.0.1"
         try:
             cfg["http_port"] = int(self.vars["http_port"].get().strip())
@@ -2943,7 +3018,7 @@ class ControlPanel:
         try:
             self.engine.start_following()
         except Exception as e:
-            messagebox.showerror("跟单启动失败", "启动 Redis 跟单失败。\n\n详细错误:\n%s" % str(e)[:500])
+            messagebox.showerror("跟单启动失败", "启动跟单失败。\n\n详细错误:\n%s" % str(e)[:500])
 
     def _on_follow_started(self):
         self._set_follow_btn(True)
@@ -2986,7 +3061,7 @@ class ControlPanel:
             if self.engine:
                 self.engine.config = cfg
             save_config(cfg)
-            gui_log("配置已保存", "OK")
+            gui_log("配置已保存 (信号源=%s)" % cfg.get("signal_source", "http"), "OK")
         except Exception as e:
             messagebox.showerror("错误", "参数有误:\n%s" % e)
 

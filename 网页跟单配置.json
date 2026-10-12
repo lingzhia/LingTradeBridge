@@ -4,16 +4,17 @@
   "window_title_keyword": "同花顺",
   "follow_ratio_buy": 1.0,
   "follow_ratio_sell": 1.0,
-  "strategy_ratios": "",
-  "redis_strategy_filter": "",
+  "strategy_ratios": "ths测试:1.00/1.00",
+  "redis_strategy_filter": "ths测试",
   "min_amount": 100,
-  "buy_price_max": 0,
+  "buy_price_max": 0.0,
   "test_buy_mode": "一次下三单",
   "enable_market_price": true,
   "ignore_buy": false,
   "ignore_sell": false,
   "allow_reorder": false,
-  "signal_source": "redis",
+  "signal_source": "http",
+  "http_enabled": true,
   "redis_host": "",
   "redis_port": 6379,
   "redis_password": "",
@@ -27,5 +28,8 @@
       "note": ""
     }
   ],
-  "activate_enabled": true
+  "activate_enabled": true,
+  "http_host": "127.0.0.1",
+  "http_port": 8765,
+  "http_api_token": "GsUhRvLqJqpplCtzkKeJjQCB"
 }
