@@ -7,7 +7,7 @@
 
 自动跟单流程(本软件的核心):
   1. 点击[打开同花顺]启动同花顺下单客户端, 并登录账户
-  2. 点击[测试连接]确认软件能找到下单窗口
+  2. 点击[预热]确认软件能找到下单窗口(顺带就是一次体检, 不会下单)
   3. 在[Redis配置]中填写 Redis 地址/端口/通道(与 tools/tools_ths_redis.py 的 CHANNELS 保持一致)
   4. 点击[开始跟单] -> 软件通过 blpop 实时消费信号通道:
        收到信号 -> 解析 代码/方向/数量 -> 按比例计算跟单股数 -> 模拟键盘在同花顺下单
@@ -1198,7 +1198,7 @@ class FollowerEngine:
             gui_log(">>> [预热] 收到预热信号, 提前激活下单窗口(不下单)", "INFO")
             app = self.app
             if app is not None and hasattr(app, "_do_activate_window"):
-                threading.Thread(target=app._do_activate_window, args=("预热",), daemon=True).start()
+                threading.Thread(target=app._do_activate_window, args=("信号",), daemon=True).start()
             return None
 
         # 1. 回测信号过滤 (复刻 recv: 信号时间早于 N 小时视为回测, 跳过)
@@ -1755,7 +1755,7 @@ class ControlPanel:
         self._refresh_log_loop()
         threading.Thread(target=self._rdp_keepalive_loop, daemon=True).start()
         gui_log("=== 聚宽转同花顺跟单器已启动 ===", "OK")
-        gui_log("请先点击[打开同花顺]启动下单客户端并登录, 然后点击[测试连接]", "INFO")
+        gui_log("请先点击[打开同花顺]启动下单客户端并登录, 然后点击[预热]确认能识别到下单面板", "INFO")
         _src = normalize_signal_source(self.cfg.get("signal_source"))
         _src_desc = {"http": "HTTP (http://%s:%s/signal)" % (
                          self.cfg.get("http_host", "127.0.0.1"), self.cfg.get("http_port", 8765)),
@@ -1804,7 +1804,7 @@ class ControlPanel:
 
         为什么要主动弹: macOS 按"责任进程"记账, 从终端启动时权限记在终端头上,
         换成双击「启动跟单器.app」后记账对象变成这个 .app —— 不重新授权的话,
-        读持仓/委托和下单都会被系统拒绝, 而且要到点[测试连接]时才发现。"""
+        读持仓/委托和下单都会被系统拒绝, 而且要到点[预热]时才发现。"""
         try:
             if _mac_order._ax_trusted():
                 return
@@ -1814,7 +1814,7 @@ class ControlPanel:
             else:
                 # 实测: 在系统设置里勾上之后是立即生效的, 不用重启程序
                 gui_log("还没拿到辅助功能权限: 请在弹窗里点「打开系统设置」, "
-                        "把「同花顺跟单器」勾上, 然后回来点[测试]验证(不用重启程序)", "WARN")
+                        "把「同花顺跟单器」勾上, 然后回来点[预热]验证(不用重启程序)", "WARN")
         except Exception as e:
             gui_log("辅助功能权限自查失败: %s" % e, "WARN")
 
@@ -2286,32 +2286,36 @@ class ControlPanel:
     # ---- 窗口激活(预热/手动) ----
 
     def _do_activate_window(self, reason):
-        """执行"预热/激活": 确保同花顺已经在交易下单面板上待命。下单进行中则跳过。
-        macOS 版不需要抢焦点, 这里做的是"确认面板还在, 不在就自己切过去",
-        并且顺带把定位路径摸热, 这样真收到信号时可以立刻下单。
-        被 Redis 预热信号(action=preheat)、第一页[预热]按钮、定时激活三处共用。"""
+        """执行"预热": 确保同花顺已经在交易下单面板上待命, 不在就自己切过去。
+        下单进行中(拿不到锁)就跳过本次。
+
+        被三处共用: Redis 预热信号(action=preheat)、①[预热]按钮、定时激活。
+        原来还有个单独的[测试连接]按钮做的是同一件事, 已经并到这里 ——
+        所以这里把当时的体检信息(定位耗时、面板里现在装着什么)一并打出来。
+        """
+        t0 = time.time()
         try:
             if not self.order_executor._lock.acquire(blocking=False):
-                gui_log("激活(%s): 当前有下单进行中, 跳过本次触发" % reason, "INFO")
+                gui_log("预热(%s): 当前有下单进行中, 跳过本次触发" % reason, "INFO")
                 return
             try:
                 windows = self.order_executor.find_ths_windows()
                 if not windows:
-                    gui_log("激活(%s): 同花顺交易面板不可用(同花顺没开, 或没能自动切过去)" % reason, "WARN")
+                    gui_log("预热(%s) 失败: 同花顺交易面板不可用(原因见上一行)" % reason, "WARN")
                     self._act_last = (time.strftime("%H:%M"), False)
                     return
                 hwnd, title = windows[0]
                 self.order_executor.ths_hwnd = hwnd
                 ok = self.order_executor._activate(hwnd)
                 self._act_last = (time.strftime("%H:%M"), bool(ok))
-                gui_log("激活(%s) %s: %s (窗口=%s)" % (
-                    reason, "成功" if ok else "失败", title, hwnd),
+                gui_log("预热(%s) %s: %s (进程=%s, 耗时 %.3f 秒)" % (
+                    reason, "成功" if ok else "失败", title, hwnd, time.time() - t0),
                     "OK" if ok else "WARN")
             finally:
                 self.order_executor._lock.release()
         except Exception as e:
             self._act_last = (time.strftime("%H:%M"), False)
-            gui_log("激活(%s) 异常: %s" % (reason, e), "WARN")
+            gui_log("预热(%s) 异常: %s" % (reason, e), "WARN")
 
     def _rdp_keepalive_loop(self):
         """【Windows 专用】原来是为了防止远程桌面(RDP)会话空闲断开而定时模拟输入。
@@ -2354,14 +2358,13 @@ class ControlPanel:
 
         self._card_hairline(g)
         rowb = ttk.Frame(g); rowb.pack(fill="x", pady=2)
-        # 按钮文字尽量短(打开/预热/测试连接/列出), 好让这一行收窄 ——
-        # 之前 4 个长按钮把卡片撑到 400px, 连带把后面的卡片全拉宽、空位变大。
-        # 但「测试」太容易被当成"下个测试单", 和顶栏的[买入测试]/[卖出测试]混淆,
-        # 所以这个必须写清楚是「测试连接」; 多出来的宽度用 padx 11->8 找回来。
+        # [预热] 就是"体检 + 一键就绪": 查权限、找同花顺、面板不在就自己切过去,
+        # 并打印定位耗时和面板里现有的内容。原来的 [测试连接] 做的是完全同一件事,
+        # 两条代码路径重复且都漏 AX 引用, 已合并 —— 所以这里只剩三个按钮。
         for _txt, _cmd in (("打开", self.on_open_ths), ("预热", self.on_preheat_activate),
-                           ("测试连接", self.on_test_order), ("列出", self.on_list_windows)):
+                           ("列出", self.on_list_windows)):
             RoundButton(rowb, text=_txt, kind="ghost", font=(self._FONT_NAME, 9),
-                        height=26, radius=7, padx=8, parent_bg=UI.SURFACE,
+                        height=26, radius=7, padx=11, parent_bg=UI.SURFACE,
                         command=_cmd).pack(side="left", padx=(0, 6))
 
     def _browse_ths(self):
@@ -2881,16 +2884,19 @@ class ControlPanel:
             messagebox.showerror("错误", "启动同花顺失败:\n%s" % e)
 
     def on_preheat_activate(self):
-        """手动触发一次窗口预热激活(与 Redis 预热信号走同一逻辑)。"""
-        threading.Thread(target=self._do_activate_window, args=("手动预热",), daemon=True).start()
+        """[预热]: 让同花顺回到交易下单面板待命(与 Redis 预热信号、定时激活同一逻辑)。
 
-    def on_test_order(self):
+        先把界面上的配置收一遍再测 —— 这样刚改过「同花顺程序」路径或应用名,
+        点一下[预热]就能立刻验证, 不用先保存配置。
+        (这是原来 [测试连接] 唯一真正有价值的地方, 已并进来。)
+        """
         try:
             cfg = self._collect_config()
             self.order_executor.config = cfg
-        except Exception:
-            pass
-        self.order_executor.test_order()
+        except Exception as e:
+            # 配置暂时不合法(比如比例填了字母)也不该挡着预热, 用旧配置继续
+            gui_log("预热前收集配置失败(用上一次的配置继续): %s" % e, "WARN")
+        threading.Thread(target=self._do_activate_window, args=("手动",), daemon=True).start()
 
     def _ensure_engine(self):
         if self.engine is None:
@@ -3367,7 +3373,7 @@ class ControlPanel:
                     if _t == _cur_t and _key not in self._preheat_fired:
                         self._preheat_fired.add(_key)
                         threading.Thread(target=self._do_activate_window,
-                                         args=("定时预热 %s" % _t,), daemon=True).start()
+                                         args=("定时 %s" % _t,), daemon=True).start()
         except Exception:
             pass
 

@@ -915,26 +915,34 @@ class KeyOrderExecutor:
     # ------------------------------------------------------------------
     def find_ths_windows(self):
         """
-        找到同花顺的交易下单面板。
-        返回 [(进程号, 窗口名)], 找不到就返回空列表并打印提示。
-        如果同花顺当前不在交易界面, 会先尝试自己切过去(见 _goto_panel)。
+        找到同花顺的交易下单面板, 返回 [(进程号, 面板名)]; 找不到返回 [] 并打印原因。
+        同花顺当前不在交易界面时, 会先自己切过去。
+
+        [预热]/定时激活 用的就是这一个。这里直接复用 _ensure_panel, 不再单独走一遍
+        定位 —— 以前还有一条几乎一样的「测试连接」路径, 两条路干的事完全重复,
+        而且各自都把旧的控件引用漏掉不还, 现在已经合并掉。
         """
-        if not _ax_trusted():
-            _log("没有辅助功能权限: 请到「系统设置 -> 隐私与安全性 -> 辅助功能」"
-                 "把运行本程序的 App(终端/Python)勾上", "ERROR")
-            return []
-        pid = _find_ths_pid(self._app_name())
-        if pid is None:
-            _log("没找到正在运行的「%s」, 请先打开同花顺 Mac 版" % self._app_name(), "ERROR")
-            return []
-        self.ths_hwnd = pid
-        panel, win, why = self._goto_panel(pid)
+        panel, why = self._ensure_panel()
         if panel is None:
             _log("没找到同花顺交易下单面板: %s" % why, "ERROR")
-            _log("请在左侧导航栏里点开「交易」那一屏(能看到 代码/价格/数量 三个输入框)", "INFO")
+            if "辅助功能权限" not in why:
+                _log("请在左侧导航栏里点开「交易」那一屏(能看到 代码/价格/数量 三个输入框)", "INFO")
             return []
-        self._panel = panel
-        return [(pid, panel["title"])]
+        _log("  当前面板内容: 代码=「%s」 价格=「%s」 数量=「%s」" % self.current_panel_values(), "INFO")
+        return [(self.ths_hwnd, panel["title"])]
+
+    def current_panel_values(self):
+        """
+        读一下面板上 代码/价格/数量 三个框现在装着什么(只读, 不动它们)。
+        预热时打出来看一眼: 上次下单要是留了残值, 这里能发现。
+        返回 (代码, 价格, 数量), 没有面板时给三个空串。
+        """
+        p = self._panel
+        if not p:
+            return "", "", ""
+        return (_ax_text(p.get("code"), "AXValue"),
+                _ax_text(p["price"], "AXValue") if p.get("price") else "",
+                _ax_text(p.get("qty"), "AXValue"))
 
     def _goto_panel(self, pid):
         """
@@ -1406,52 +1414,3 @@ class KeyOrderExecutor:
         if not found:
             _log("没有发现交易下单面板, 请在同花顺里打开下单界面后再点[列出窗口]", "WARN")
         return found
-
-    def ensure_order_panel(self):
-        """
-        [预热]/定时激活 调这个: 确保同花顺已经在交易面板上待命。
-        不在就自己切过去, 并把之后要用的控件先摸一遍(顺便把路径摸热)。
-        返回 True 表示已经就绪。
-        """
-        panel, why = self._ensure_panel()
-        if panel is None:
-            _log("激活失败: %s" % why, "WARN")
-            return False
-        return True
-
-    def test_order(self):
-        """[测试连接]: 检查同花顺是否在运行、交易面板能否被识别。
-
-        ⚠️ 这里**不会下任何单**, 纯粹是体检 —— 名字容易和 [买入测试]/[卖出测试]
-           混淆, 所以每条日志都写明"未下单", 免得用户点完在这儿等委托。
-        当前不在交易界面时会先尝试自动切过去, 所以这个按钮也是"一键就绪"。"""
-        t0 = time.time()
-        if not _ax_trusted():
-            _log("测试连接失败: 没有辅助功能权限", "ERROR")
-            _log("请到「系统设置 -> 隐私与安全性 -> 辅助功能」把运行本程序的 App 勾上", "INFO")
-            return False
-        pid = _find_ths_pid(self._app_name())
-        if pid is None:
-            _log("没找到正在运行的「%s」, 请先打开同花顺 Mac 版" % self._app_name(), "ERROR")
-            return False
-        panel, win, why = self._goto_panel(pid)
-        if panel is None:
-            _log("测试连接失败: %s" % why, "ERROR")
-            _log("请在左侧导航栏里点开「交易」那一屏(能看到 代码/价格/数量 三个输入框)后重试", "INFO")
-            return False
-        self.ths_hwnd = pid
-        if self._win:
-            _ax_free(self._win)
-        self._panel = panel
-        self._win = win
-
-        code_now = _ax_text(panel["code"], "AXValue")
-        price_now = _ax_text(panel["price"], "AXValue") if panel["price"] else ""
-        qty_now = _ax_text(panel["qty"], "AXValue")
-        _log("测试连接成功: 已识别到同花顺交易面板 (进程 %d), 定位耗时 %.3f 秒" % (
-            pid, time.time() - t0), "OK")
-        _log("  当前面板内容: 代码=「%s」 价格=「%s」 数量=「%s」" % (
-            code_now, price_now, qty_now), "INFO")
-        _log("  ★ 本次只做体检, 没有下任何单 —— 要下测试单请点[买入测试]/[卖出测试]", "INFO")
-        _log("  macOS 不需要抢焦点, 真下单会在后台完成", "INFO")
-        return True
