@@ -14,3 +14,6 @@ logs/
 # macOS
 .DS_Store
 __MACOSX/
+
+# 本地工具目录(会话/记忆等), 不参与版本管理
+.workbuddy/

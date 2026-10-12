@@ -64,7 +64,6 @@ class PositionManager:
                 "available_capital": initial_capital if initial_capital is not None else 0,
                 "ratio_buy": 1.0,
                 "ratio_sell": 1.0,
-                "whitelisted": True,
                 "jq_total_asset": 0.0,
                 "follow_total_asset": 0.0,
                 "follow_asset_manual": False,
@@ -135,7 +134,7 @@ class PositionManager:
         order.insert(new_index, name)
         self.save()
 
-    # ==================== 跟单比例 & 白名单 ====================
+    # ==================== 跟单比例 ====================
 
     def get_strategy_ratio_buy(self, name):
         """返回指定策略的买入跟单比例，不存在返回 None"""
@@ -169,19 +168,6 @@ class PositionManager:
         self.data[name]["ratio_sell"] = float(ratio)
         self.save()
 
-    def is_strategy_whitelisted(self, name):
-        """返回策略是否在白名单中，不存在返回 True（向后兼容）"""
-        info = self.data.get(name)
-        if info is None:
-            return True
-        return info.get("whitelisted", True)
-
-    def set_strategy_whitelisted(self, name, whitelisted):
-        """设置策略的白名单状态"""
-        self.ensure_strategy(name)
-        self.data[name]["whitelisted"] = bool(whitelisted)
-        self.save()
-
     def generate_strategy_ratios_config(self):
         """从所有策略的买入/卖出比例生成配置字符串: 策略A:1.0/0.5, 策略B:1.0/1.0 (格式为 买入/卖出)"""
         parts = []
@@ -192,12 +178,6 @@ class PositionManager:
             r_sell = _s if _s is not None else 1.0
             parts.append("%s:%.2f/%.2f" % (name, r_buy, r_sell))
         return ", ".join(parts)
-
-    def generate_whitelist_config(self):
-        """从所有策略的 whitelisted 生成白名单字符串: 策略A, 策略B"""
-        names = [name for name in sorted(self.get_strategies())
-                 if self.data[name].get("whitelisted", True)]
-        return ", ".join(names)
 
     # ==================== 资金计算 ====================
 
@@ -340,7 +320,6 @@ class PositionManager:
                 "name": name,
                 "ratio_buy": _b if _b is not None else 1.0,
                 "ratio_sell": _s if _s is not None else 1.0,
-                "whitelisted": info.get("whitelisted", True),
                 "used_capital": used,
                 "available_capital": available,
                 "market_value": market_value,

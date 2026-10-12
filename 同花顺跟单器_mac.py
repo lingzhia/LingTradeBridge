@@ -102,7 +102,6 @@ DEFAULT_CONFIG = {
     "redis_password": "",
     "redis_db": 0,
     "redis_channel": "jq_signals_ths_mac",
-    "redis_strategy_filter": "",
     "redis_backtest_skip_hours": 2,
     "redis_allow_backtest_live": False,
     # --- HTTP 信号源 ---
@@ -166,7 +165,7 @@ def load_config():
     # 老的配置文件(Windows 版存下来的)里 ths_exe_path 是 D:/.../xiadan.exe 这种
     # Windows 路径, 在 Mac 上根本不存在, 会导致[打开同花顺]报错。
     # 所以这里检查一下: 如果路径不存在(说明是 Windows 路径或已被删掉), 就换成 Mac 上
-    # 自动探测到的 同花顺.app。其它所有配置(策略比例/白名单/市价模式等)原样保留。
+    # 自动探测到的 同花顺.app。其它所有配置(策略比例/市价模式等)原样保留。
     try:
         cur_path = str(cfg.get("ths_exe_path", "") or "")
         if not cur_path or not os.path.exists(cur_path):
@@ -1200,15 +1199,14 @@ class FollowerEngine:
             except Exception:
                 pass
 
-        # 2. 策略名白名单 (Redis 通道会混入多策略信号, 必须过滤)
-        #    注意: 这里挡掉的信号一定要打日志 —— 否则你在界面上只会看到"信号没反应",
-        #    却根本不知道是被白名单挡了, 排查起来毫无头绪。
+        # 2. 策略名: 仅作日志/记账标识, 不做过滤
+        #    历史上这里有一道「策略名白名单」闸门, 已移除。原因:
+        #      a) 名字由策略侧自报(Redis 靠 g._strategy_name / STRATEGY_NAME 猜,
+        #         HTTP 靠 body 里的纯文本字段), 报错/漏报都会落到"未知策略";
+        #      b) 而未知策略默认放行(fail-open), 等于默认不拦 —— 白名单表达不了
+        #         "只跟这几个"的语义, 只剩误导。
+        #    真要按策略隔离, 应该给每个策略发独立 Token/队列, 由服务端做身份校验。
         strategy = data.get("strategy_name", "")
-        pos_mgr = getattr(self.app, "pos_mgr", None) if self.app else None
-        if pos_mgr and not pos_mgr.is_strategy_whitelisted(strategy):
-            gui_log("跳过信号: 策略[%s]不在白名单(或已被取消勾选), 未跟单 %s" % (
-                strategy, data.get("security", "")), "WARN")
-            return None
 
         # 3. 仅处理 buy/sell, 忽略 cancel 等其它动作 (键盘无法可靠撤单)
         action = data.get("action", "")
@@ -2829,13 +2827,13 @@ class ControlPanel:
         strategy_frame.columnconfigure(0, weight=1)
         strategy_frame.rowconfigure(0, weight=1)
 
-        s_columns = ("策略名称", "买入比例", "卖出比例", "白名单",
+        s_columns = ("策略名称", "买入比例", "卖出比例",
                      "聚宽策略总资产", "按比例买入可用资金")
         # 金融数据: 数值列右对齐
         s_widths = {"策略名称": 150, "买入比例": 75, "卖出比例": 75,
-                    "白名单": 60, "聚宽策略总资产": 150, "按比例买入可用资金": 150}
+                    "聚宽策略总资产": 150, "按比例买入可用资金": 150}
         s_anchors = {"策略名称": "w", "买入比例": "e", "卖出比例": "e",
-                     "白名单": "center", "聚宽策略总资产": "e", "按比例买入可用资金": "e"}
+                     "聚宽策略总资产": "e", "按比例买入可用资金": "e"}
 
         # 数据表(超高可滚动)
         tree_holder = tk.Frame(strategy_frame, bg=UI.SURFACE)
@@ -2853,11 +2851,10 @@ class ControlPanel:
         self._s_scroll.grid(row=0, column=1, rowspan=3, sticky="ns")
         self.s_tree.configure(yscrollcommand=self._s_scroll.set)
         self.s_tree.tag_configure("empty", foreground=UI.TEXT_FAINT)
-        self.s_tree.tag_configure("whitelisted", foreground="#2E7D32")
         self.s_tree.tag_configure("evenrow", background=UI.SURFACE)
         self.s_tree.tag_configure("oddrow", background="#F2F2F7")
         self.s_tree.bind("<<TreeviewSelect>>", self._on_strategy_select)
-        self._make_tree_editable(self.s_tree, (0, 1, 2, 3, 4, 5), self._on_strategy_cell_edit)
+        self._make_tree_editable(self.s_tree, (0, 1, 2, 3, 4), self._on_strategy_cell_edit)
         self._enable_strategy_tree_drag(self.s_tree)
 
         # 数据行与合计行之间的分隔线
@@ -2870,12 +2867,10 @@ class ControlPanel:
         self.s_tree_footer.grid(row=2, column=0, sticky="nsew")
         for col in s_columns:
             self.s_tree_footer.column(col, width=s_widths[col], anchor=s_anchors[col])
-        self._whitelist_only_var = tk.BooleanVar(value=False)
         self.s_tree_footer.tag_configure("total", background=UI.BRAND_SOFT,
                                          font=self._font_medium)
         self.s_tree_footer.insert("", "end", tags=("total",),
-            values=("合计  ☐仅统计白名单", "", "", "", "", ""))
-        self.s_tree_footer.bind("<Button-1>", self._on_footer_click)
+            values=("合计", "", "", "", ""))
 
         s_btn = tk.Frame(strategy_frame, bg=UI.SURFACE_MUTED)
         s_btn.grid(row=2, column=0, sticky="ew", padx=2, pady=(0, 2))
@@ -2937,9 +2932,6 @@ class ControlPanel:
             if not strategies:
                 strategies = self.pos_mgr.get_strategies()
             widget = ttk.Combobox(tree, values=strategies, font=(self._FONT_MONO, 9), state="readonly")
-            widget.set(val)
-        elif col_name == "白名单":
-            widget = ttk.Combobox(tree, values=["是", "否"], font=(self._FONT_MONO, 9), state="readonly")
             widget.set(val)
         else:
             widget = ttk.Entry(tree, font=(self._FONT_MONO, 9))
@@ -3021,18 +3013,14 @@ class ControlPanel:
                 gui_log("策略[%s]卖出比例已设为: %.2f" % (old_name, ratio), "OK")
             except ValueError:
                 gui_log("卖出比例格式错误: %s" % new_val, "WARN")
-        elif col_idx == 3:  # 白名单
-            whitelisted = (new_val == "是")
-            self.pos_mgr.set_strategy_whitelisted(old_name, whitelisted)
-            gui_log("策略[%s]白名单已设为: %s" % (old_name, new_val), "OK")
-        elif col_idx == 4:  # 聚宽策略总资产
+        elif col_idx == 3:  # 聚宽策略总资产
             try:
                 asset = float(str(new_val).replace(",", ""))
                 self.pos_mgr.set_jq_total_asset(old_name, asset)
                 gui_log("策略[%s]聚宽策略总资产已设为: %.2f" % (old_name, asset), "OK")
             except ValueError:
                 gui_log("聚宽策略总资产格式错误: %s" % new_val, "WARN")
-        elif col_idx == 5:  # 按比例买入可用资金(手动覆盖)
+        elif col_idx == 4:  # 按比例买入可用资金(手动覆盖)
             try:
                 asset = float(str(new_val).replace(",", ""))
                 self.pos_mgr.set_follow_total_asset(old_name, asset)
@@ -3063,48 +3051,28 @@ class ControlPanel:
         if not rows:
             # 空状态占位: 引导用户添加策略
             self.s_tree.insert("", "end", values=(
-                "暂无策略数据，点击 [+ 添加策略] 开始配置", "", "", "", "", ""),
+                "暂无策略数据，点击 [+ 添加策略] 开始配置", "", "", "", ""),
                 tags=("empty",))
         else:
             for i, row in enumerate(rows):
                 tags = ["evenrow" if i % 2 == 0 else "oddrow"]
-                if row["whitelisted"]:
-                    tags.append("whitelisted")
                 self.s_tree.insert("", "end", values=(
                     row["name"],
                     "%.2f" % row["ratio_buy"],
                     "%.2f" % row["ratio_sell"],
-                    "是" if row["whitelisted"] else "否",
                     "{:,.2f}".format(row["jq_total_asset"]),
                     "{:,.2f}".format(row["follow_total_asset"]),
                 ), tags=tuple(tags))
-        # 冻结合计行: 根据白名单过滤开关汇总
-        whitelist_only = self._whitelist_only_var.get()
-        if whitelist_only:
-            sum_jq = sum(r["jq_total_asset"] for r in rows if r["whitelisted"])
-            sum_follow = sum(r["follow_total_asset"] for r in rows if r["whitelisted"])
-        else:
-            sum_jq = sum(r["jq_total_asset"] for r in rows)
-            sum_follow = sum(r["follow_total_asset"] for r in rows)
+        # 冻结合计行
+        sum_jq = sum(r["jq_total_asset"] for r in rows)
+        sum_follow = sum(r["follow_total_asset"] for r in rows)
         for item in self.s_tree_footer.get_children():
             self.s_tree_footer.delete(item)
-        checked = "☑" if self._whitelist_only_var.get() else "☐"
         self.s_tree_footer.insert("", "end", values=(
-            "合计  %s仅统计白名单" % checked, "", "", "",
+            "合计", "", "",
             "{:,.2f}".format(sum_jq),
             "{:,.2f}".format(sum_follow),
         ), tags=("total",))
-
-    def _on_whitelist_toggle(self):
-        """白名单过滤开关切换, 刷新合计行"""
-        self._refresh_strategy_tree()
-
-    def _on_footer_click(self, event):
-        """点击合计行第一列切换白名单过滤"""
-        col = self.s_tree_footer.identify_column(event.x)
-        if col == "#1":
-            self._whitelist_only_var.set(not self._whitelist_only_var.get())
-            self._on_whitelist_toggle()
 
     # ---------- 策略按钮操作 ----------
 
@@ -3215,9 +3183,8 @@ class ControlPanel:
         cfg["window_title_keyword"] = self.vars["window_title_keyword"].get().strip()
         cfg["follow_ratio_buy"] = float(self.vars["follow_ratio_buy"].get().strip())
         cfg["follow_ratio_sell"] = float(self.vars["follow_ratio_sell"].get().strip())
-        # 从仓位管理器自动生成策略比例和白名单配置
+        # 从仓位管理器自动生成策略比例配置
         cfg["strategy_ratios"] = self.pos_mgr.generate_strategy_ratios_config()
-        cfg["redis_strategy_filter"] = self.pos_mgr.generate_whitelist_config()
         cfg["min_amount"] = int(self.vars["min_amount"].get().strip())
         # 买入价格上限(从「买入限价版」移植): 不能为负数
         _bpm = float(self.vars["buy_price_max"].get().strip())
