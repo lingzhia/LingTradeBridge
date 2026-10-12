@@ -482,6 +482,51 @@ TABLE_KINDS = {
     "deals":     {"tab": "成交",     "cols": ("成交日期", "成交时间", "成交数量")},
 }
 
+# ---------------------------------------------------------------------------
+# 数值规范化
+# ---------------------------------------------------------------------------
+# 同花顺界面上所有数字都是带格式的文字("91700.000" / "1,234.50"), 直接丢给调用方
+# 很别扭。这里按**字段名语义**归一到合适精度:
+#     数量 -> 整数   价格 -> 3 位小数   金额 -> 2 位小数   比例(%) -> 3 位小数
+# 代码 / 名称 / 编号 / 日期时间 / 备注 等一律保持原样(证券代码必须留字符串,
+# 否则 "000001" 会变成 1)。认不出来的字段原样返回, 不瞎猜。
+PLACEHOLDER_VALUES = {"", "-", "--", "- -", "－", "—"}
+FIELDS_INT = {"实际数量", "股票余额", "可用余额", "冻结数量",
+              "成交数量", "委托数量", "撤销数量"}
+FIELDS_PRICE3 = {"市价", "成本价", "成交均价", "委托价格", "成交价格"}
+FIELDS_MONEY2 = {"市值", "成交金额", "盈亏", "当日盈亏", "总资产", "总市值", "总盈亏",
+                 "资金余额", "可取金额", "可用金额"}
+FIELDS_RATIO3 = {"浮动盈亏比(%)", "仓位占比(%)"}
+
+
+def _round_or_text(txt, digits):
+    """能当数字就四舍五入到指定位数, 否则原样返回。"""
+    try:
+        return round(float(str(txt).replace(",", "").strip()), digits)
+    except Exception:
+        return txt
+
+
+def normalize_value(field, raw):
+    """把一个格子的文字按字段语义规范化; 空值和 "-" 之类占位符归成 None。"""
+    t = str(raw if raw is not None else "").strip()
+    if t in PLACEHOLDER_VALUES:
+        return None
+    if field in FIELDS_INT:
+        try:
+            f = float(t.replace(",", ""))
+        except Exception:
+            return t
+        # 数量理论上都是整数; 真遇到小数(某些场外份额)就保留 4 位
+        return int(round(f)) if abs(f - round(f)) < 1e-6 else round(f, 4)
+    if field in FIELDS_PRICE3:
+        return _round_or_text(t, 3)
+    if field in FIELDS_MONEY2:
+        return _round_or_text(t, 2)
+    if field in FIELDS_RATIO3:
+        return _round_or_text(t, 3)
+    return t
+
 
 def _collect_tables(el, depth=0, acc=None):
     """把容器里所有 AXTable 收集出来(带一份额外引用, 调用方负责 _ax_free)。"""
@@ -996,14 +1041,16 @@ class KeyOrderExecutor:
     # ------------------------------------------------------------------
     # 查询: 读同花顺界面上的表格
     # ------------------------------------------------------------------
-    def query_table(self, kind, timeout=3.0, settle=0.05, settle_grace=0.5):
+    def query_table(self, kind, timeout=3.0, settle=0.05, settle_grace=0.5, normalize=True):
         """
         读同花顺界面上的表格, 供 HTTP 查询接口使用。
 
         kind: account(资金明细) / positions(持仓) / orders(委托) / deals(成交)
         返回 dict, 形如:
             {"kind":..., "tab":..., "switched":bool, "headers":[...], "rows":[{列头: 值}, ...]}
-          资金明细没有列头, 改为 {"account": {项目: 数值}, "rows": [[键, 值], ...]}
+          资金明细没有列头, 改为 {"account": {项目: 数值}} (值为空的按钮行会被丢弃)。
+          normalize=True 时按字段语义归一数字精度(数量整数/价格3位/金额2位/比例3位),
+          空值统一成 None; 设 False 可拿到界面上的原始文字。
 
         说明:
           - 这几个页签共用同一个表格, 所以要按列头认表;
@@ -1063,11 +1110,18 @@ class KeyOrderExecutor:
                             rows = _table_rows(table)
                         account = {}
                         for r in rows:
-                            if len(r) >= 2:
-                                account[r[0]] = r[1]
+                            if len(r) < 2:
+                                continue
+                            key = r[0].strip()
+                            if not key:
+                                continue
+                            val = normalize_value(key, r[1]) if normalize else r[1]
+                            # 值为空的都是界面上的按钮行(风险测评/银证转账/账户设置), 丢掉
+                            if val is None:
+                                continue
+                            account[key] = val
                         return {"kind": kind, "tab": spec["tab"], "switched": switched,
-                                "account": account,
-                                "rows": [r[:2] for r in rows]}
+                                "account": account}
                     headers = _table_headers(table)
                     rows = _table_rows(table)
                     # 列头是随表格一起静态渲染的, 行数据可能稍后才从服务器回来。
@@ -1078,9 +1132,13 @@ class KeyOrderExecutor:
                         while time.time() < grace and not rows:
                             time.sleep(max(0.01, float(settle)))
                             rows = _table_rows(table)
+                    if normalize:
+                        data = [{h: normalize_value(h, v) for h, v in zip(headers, r)}
+                                for r in rows]
+                    else:
+                        data = [dict(zip(headers, r)) for r in rows]
                     return {"kind": kind, "tab": spec["tab"], "switched": switched,
-                            "headers": headers,
-                            "rows": [dict(zip(headers, r)) for r in rows]}
+                            "headers": headers, "rows": data}
                 finally:
                     _ax_free(table)
             finally:
