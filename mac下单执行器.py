@@ -1368,7 +1368,13 @@ class KeyOrderExecutor:
     # 自检
     # ------------------------------------------------------------------
     def list_ths_windows(self):
-        """[列出窗口]: 把同花顺当前所有窗口里的关键信息打印出来, 方便排查"""
+        """
+        [列出]: 把同花顺当前所有窗口里的关键信息打印出来, 方便排查。
+
+        ⚠️ 只读诊断 —— **不切换同花顺界面, 也不下单**。
+           面板不在时这里不会自己切过去(那是 [预热] 的活), 只把现状倒出来;
+           所以下面会特意提示一句"点[预热]可以自动切", 免得白折腾去找。
+        """
         if not _ax_trusted():
             _log("没有辅助功能权限: 请到「系统设置 -> 隐私与安全性 -> 辅助功能」"
                  "把运行本程序的 App(终端/Python)勾上", "ERROR")
@@ -1382,6 +1388,16 @@ class KeyOrderExecutor:
         wins = _ax_elements(app, "AXWindows")
         _ax_free(app)
         _log("=== 共 %d 个窗口 ===" % len(wins))
+        if wins:
+            # 顺带报一下左侧导航栏认出几个 —— 面板不在时, [预热] 就靠它切过去。
+            # 这里认不出来, 等于告诉用户"自动切换也指望不上, 得手动点"。
+            _btns = _rail_buttons(wins[0])
+            if _btns:
+                _log("=== 左侧导航栏识别到 %d 个按钮(面板不在时[预热]靠它自动切过去) ==="
+                     % len(_btns))
+            else:
+                _log("=== 左侧导航栏一个按钮都没认出来 —— [预热]将无法自动切界面 ===", "WARN")
+            _ax_free_all(_btns)
         found = []
         for wi, win in enumerate(wins):
             els = _ax_elements(win)
@@ -1412,5 +1428,6 @@ class KeyOrderExecutor:
                     wi + 1, len(els), " / ".join(texts[:12]) or "(无)"))
         _ax_free_all(wins)
         if not found:
-            _log("没有发现交易下单面板, 请在同花顺里打开下单界面后再点[列出窗口]", "WARN")
+            _log("没有发现交易下单面板: 同花顺当时不在「交易」那一屏", "WARN")
+            _log("不用手动去找 —— 点[预热] 会自动切过去(就是上面那排导航按钮)", "INFO")
         return found
