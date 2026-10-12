@@ -3,12 +3,12 @@
 """
 聚宽转同花顺跟单器 (单文件, Redis 实时信号版)
 ========================
-通过 Redis 实时接收聚宽策略(tools/tools_ths.py)推送的交易信号, 通过模拟键盘在同花顺进行跟单。
+通过 Redis 实时接收聚宽策略(tools/tools_ths_redis.py)推送的交易信号, 通过模拟键盘在同花顺进行跟单。
 
 自动跟单流程(本软件的核心):
   1. 点击[打开同花顺]启动同花顺下单客户端, 并登录账户
   2. 点击[测试连接]确认软件能找到下单窗口
-  3. 在[Redis配置]中填写 Redis 地址/端口/通道(与 tools/tools_ths.py 的 CHANNELS 保持一致)
+  3. 在[Redis配置]中填写 Redis 地址/端口/通道(与 tools/tools_ths_redis.py 的 CHANNELS 保持一致)
   4. 点击[开始跟单] -> 软件通过 blpop 实时消费信号通道:
        收到信号 -> 解析 代码/方向/数量 -> 按比例计算跟单股数 -> 模拟键盘在同花顺下单
   5. 点击[停止跟单] 暂停监听(当前信号处理完后停止)。
@@ -41,7 +41,7 @@ from http信号服务 import HTTPSignalServer
 # ---------------------------------------------------------------------------
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
-# Redis: 用于接收 tools_ths.py 发出的实时信号 (必需, 未安装时跟单无法启动)
+# Redis: 用于接收 tools_ths_redis.py 发出的实时信号 (必需, 未安装时跟单无法启动)
 try:
     import redis as _redis_mod
 except ImportError:
@@ -1055,10 +1055,10 @@ KeyOrderExecutor = _mac_order.KeyOrderExecutor
 
 
 # ===========================================================================
-# 自动跟单引擎: Redis 实时接收 tools_ths.py 信号 -> 模拟键盘在同花顺下单
+# 自动跟单引擎: Redis 实时接收 tools_ths_redis.py 信号 -> 模拟键盘在同花顺下单
 # ===========================================================================
 class FollowerEngine:
-    """Redis 实时跟单引擎: blpop 消费 tools_ths.py 推送的信号通道,
+    """Redis 实时跟单引擎: blpop 消费 tools_ths_redis.py 推送的信号通道,
     对新增委托调用模拟键盘在同花顺下单。不依赖浏览器。"""
 
     def __init__(self, config, order_executor=None):
@@ -1157,9 +1157,9 @@ class FollowerEngine:
             self._stop_event.set()
         gui_log("<<< 已发送停止信号, 自动跟单将在当前信号处理后暂停", "INFO")
 
-    # ==================== Redis 实时信号源 (与 tools_ths.py 对接) ====================
+    # ==================== Redis 实时信号源 (与 tools_ths_redis.py 对接) ====================
     def _signal_to_order(self, data):
-        """把 tools_ths.py 发出的信号 JSON 转成跟单器内部 order dict。
+        """把 tools_ths_redis.py 发出的信号 JSON 转成跟单器内部 order dict。
         字段映射与 recv6.5.4_YUN.py 的 _dispatch_signal 保持一致, 保证兼容。
         特殊 action=preheat: 不产生订单, 只在后台触发一次窗口激活(开盘前预热)。"""
         # 0. 预热信号: 只激活窗口(含RDP切换), 不下单

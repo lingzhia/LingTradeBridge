@@ -36,7 +36,7 @@ LingTradeBridge 是 LingQuant 的**交易信号跟单桥**：接收外部策略�
 | `同花顺跟单器_mac.py` | macOS 跟单器主程序和运行界面 |
 | `http信号服务.py` | 本地 HTTP 信号接收服务 |
 | `mac下单执行器.py` | macOS 交易客户端操作执行器 |
-| `tools/tools_ths.py` | 策略侧信号发送工具（附加内容，见下） |
+| `tools/tools_ths_redis.py` | 策略侧信号发送工具，通过 Redis 推送信号（附加内容，见下） |
 | `仓位管理器.py` | 跟单仓位相关的本地管理能力 |
 | `启动跟单器.command` | macOS 启动入口 |
 | `网页跟单配置.json` | 跟单器配置文件 |

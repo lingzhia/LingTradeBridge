@@ -1,5 +1,5 @@
 # =============================================================
-# >>> 同花顺跟单专用·精简版 tools_ths.py <<<
+# >>> 同花顺跟单专用·精简版 tools_ths_redis.py <<<
 #   - 由 tools_v6.3.py 精简而来
 #   - 原创：🐷猪头战法  From https://www.joinquant.com/view/community/detail/75424
 #   - 仅保留 Redis 信号推送(直连模式)
@@ -9,9 +9,9 @@
 # =============================================================
 # 使用方法（3 步）:
 #   1. 修改下方配置区的 Redis 连接信息（与跟单器「信号源 · Redis」一致）
-#   2. 把本文件上传到聚宽研究环境，策略里 import tools_ths
+#   2. 把本文件上传到聚宽研究环境，策略里 import tools_ths_redis
 #      （或直接把本文件内容复制到策略代码最前面）
-#   3. 在策略 initialize 里加一行: tools_ths.setup(context, '策略名')
+#   3. 在策略 initialize 里加一行: tools_ths_redis.setup(context, '策略名')
 #   之后 order / order_target 等下单会自动推送信号，策略代码无需任何改动
 # =============================================================
 import json, time, datetime, sys, redis
