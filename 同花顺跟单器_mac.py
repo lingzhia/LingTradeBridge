@@ -1706,6 +1706,17 @@ class RoundButton(tk.Canvas):
         self.invoke()
 
     # ---------- 对外接口(兼容 ttk.Button 的常用调用) ----------
+    def set_enabled(self, enabled):
+        """禁用/启用: 禁用后不响应点击并画成灰色(跟单运行中锁定配置用)。"""
+        self._enabled = bool(enabled)
+        self._hover = False
+        self._pressed = False
+        try:
+            super().config(cursor="pointinghand" if self._enabled else "arrow")
+        except Exception:
+            pass
+        self._redraw()
+
     def invoke(self):
         if self._enabled and self._command:
             try:
@@ -2106,6 +2117,14 @@ class ControlPanel:
         left = tk.Frame(content, bg=UI.BG)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
         self._page_left = left   # 供默认窗口高度贴合首页左栏内容
+
+        # 跟单运行中的锁定提示条: 常驻容器(空时高度 0), 只在锁定期间塞进文字。
+        # 用固定容器是因为 pack 只能追加到末尾, 直接 pack_forget/pack 会让提示跑到卡片下面。
+        self._lock_bar = tk.Frame(left, bg=UI.BG)
+        self._lock_bar.pack(fill="x")
+        self._lock_hint = tk.Label(self._lock_bar, fg=UI.WARNING, bg=UI.BG,
+                                   font=(self._FONT_NAME, 9), anchor="w",
+                                   text="🔒 跟单运行中，左侧配置已锁定（点[停止跟单]后可修改）")
 
         self._build_group_ths(left)     # ① 同花顺客户端
         self._build_group_redis(left)   # ② 信号源 · Redis
@@ -3327,6 +3346,47 @@ class ControlPanel:
             self._toggle_dot.config(fg=bg, bg=bg)  # 与背景同色, 不可见
             self._toggle_text.config(text="▶ 开始跟单", bg=bg)
             self._toggle_btn_frame.config(bg=bg)
+        # 跟单运行中锁住左侧配置(防止跑着的时候被误改), 停止后自动解锁
+        self._lock_left_config(running)
+
+    # ---- 跟单运行中锁定左侧配置 ----
+
+    def _lock_left_config(self, locked):
+        """跟单运行中把「左侧配置区」整体设为不可编辑。
+
+        为什么锁: 跟单跑起来后再改这些值, 有的要重启通道才生效、有的会立刻改变
+        下单行为, 都是容易出错的地方; 锁上之后想改就先[停止跟单]。
+        注意只锁配置控件, 脱敏小眼睛(纯显示切换)和右侧日志/顶栏操作不受影响。
+        """
+        try:
+            self._set_editable_enabled(self._page_left, not locked)
+        except Exception as e:
+            gui_log("锁定配置区失败: %s" % e, "WARN")
+        try:
+            if locked:
+                self._lock_hint.pack(fill="x", padx=6, pady=(4, 0))
+            else:
+                self._lock_hint.pack_forget()
+            self._refresh_scroll_region()
+        except Exception:
+            pass
+
+    def _set_editable_enabled(self, widget, enabled):
+        """递归把一棵子树里的"能改配置"的控件设为启用/禁用。"""
+        eye = getattr(self, "btn_redis_eye", None)
+        for child in widget.winfo_children():
+            try:
+                if child is eye:
+                    pass          # 脱敏显示切换, 跟单中仍允许点
+                elif isinstance(child, RoundButton):
+                    child.set_enabled(enabled)
+                elif isinstance(child, tk.Button):
+                    child.config(state="normal" if enabled else "disabled")
+                elif isinstance(child, (ttk.Entry, ttk.Combobox, ttk.Checkbutton, ttk.Button)):
+                    child.state(["!disabled"] if enabled else ["disabled"])
+            except Exception:
+                pass
+            self._set_editable_enabled(child, enabled)
 
     # ---- 状态胶囊圆点呼吸 (未开始=红点警示, 跟单中=绿点脉动) ----
     def _start_status_pill_blink(self, pill, mode="red"):
