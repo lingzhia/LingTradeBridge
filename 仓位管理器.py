@@ -168,17 +168,6 @@ class PositionManager:
         self.data[name]["ratio_sell"] = float(ratio)
         self.save()
 
-    def generate_strategy_ratios_config(self):
-        """从所有策略的买入/卖出比例生成配置字符串: 策略A:1.0/0.5, 策略B:1.0/1.0 (格式为 买入/卖出)"""
-        parts = []
-        for name in sorted(self.get_strategies()):
-            _b = self.get_strategy_ratio_buy(name)
-            _s = self.get_strategy_ratio_sell(name)
-            r_buy = _b if _b is not None else 1.0
-            r_sell = _s if _s is not None else 1.0
-            parts.append("%s:%.2f/%.2f" % (name, r_buy, r_sell))
-        return ", ".join(parts)
-
     # ==================== 资金计算 ====================
 
     def get_used_capital(self, strategy):

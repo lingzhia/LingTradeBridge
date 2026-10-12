@@ -110,7 +110,6 @@ DEFAULT_CONFIG = {
     "http_port": 8765,
     # 默认 Token: 开箱即用, 可在 网页跟单配置.json 或界面「HTTP Token」里改成自己的
     "http_api_token": "GsUhRvLqJqpplCtzkKeJjQCB",
-    "strategy_ratios": "",
 }
 
 # ===========================================================================
@@ -1389,16 +1388,13 @@ class FollowerEngine:
                 return
 
         self.processed_orders.add(uid)
-        # 按方向选比例: 买入用买入比例, 卖出用卖出比例(策略级优先, 无则用全局)
+        # 按方向选比例: 买入用买入比例, 卖出用卖出比例
+        # (统一取 ③ 跟单规则 里的全局配置 —— 原「资金管理」页的策略级比例已随该页删除)
         pos_mgr = getattr(self.app, "pos_mgr", None) if self.app else None
         if direction == 1:
-            ratio = self._get_strategy_ratio_buy(strategy)
-            if ratio is None:
-                ratio = float(self.config.get("follow_ratio_buy", 1.0))
+            ratio = float(self.config.get("follow_ratio_buy", 1.0))
         else:
-            ratio = self._get_strategy_ratio_sell(strategy)
-            if ratio is None:
-                ratio = float(self.config.get("follow_ratio_sell", 1.0))
+            ratio = float(self.config.get("follow_ratio_sell", 1.0))
         actual_amount = int(amount * ratio)
         raw_amount = actual_amount  # 取整前保留原始值, 用于兜底判断
         # A股需按100股取整(向下取整)
@@ -1410,22 +1406,8 @@ class FollowerEngine:
             gui_log("实际跟单%d股, 不足最小下单量%d股, 兜底至%d股" % (raw_amount, min_amt, min_amt), "INFO")
             actual_amount = min_amt
 
-        # ---- 自动降仓: 买入时检查资金余额 ----
+        # 信号的成交价 (买入价格上限过滤和记账都要用)
         price = order.get("price", 0) or 0
-        if price > 0 and direction == 1 and strategy and pos_mgr:
-            strategy_info = pos_mgr.get_strategy_info(strategy)
-            if strategy_info.get("initial_capital", 0) > 0:  # 仅当策略有初始资金时检查
-                available = pos_mgr.get_available_capital(strategy)
-                max_shares = int(available / price / 100) * 100
-                if max_shares < actual_amount:
-                    orig_amount = actual_amount
-                    actual_amount = max_shares
-                    if actual_amount < min_amt:
-                        gui_log("策略[%s]资金不足, 降仓后不足%d股, 跳过: 需%d股, 可用%.2f元 (价格%.3f)" %
-                                (strategy, min_amt, orig_amount, available, price), "WARN")
-                        return
-                    gui_log("策略[%s]资金不足, 自动降仓: %d股 → %d股 (可用%.2f元, 价格%.3f)" %
-                            (strategy, orig_amount, actual_amount, available, price), "WARN")
 
         if actual_amount < min_amt:
             strategy_tag = " [%s]" % strategy if strategy else ""
@@ -1455,8 +1437,6 @@ class FollowerEngine:
                     pos_mgr.buy(strategy, stock_code, stock_name, actual_amount, price if price > 0 else 0)
                 elif direction == -1:
                     pos_mgr.sell(strategy, stock_code, actual_amount)
-                if self.app:
-                    self.app._fund_dirty = True
             except Exception as e:
                 gui_log("更新仓位失败: %s" % e, "WARN")
 
@@ -1492,20 +1472,6 @@ class FollowerEngine:
             else:
                 gui_log("下单失败: %s %s %d股 [已记录, 不再重试]" % (
                     stock_code, operate, actual_amount), "ERROR")
-
-    def _get_strategy_ratio_buy(self, strategy_name):
-        """从仓位管理器获取指定策略的买入跟单比例; 无匹配返回 None。"""
-        pos_mgr = getattr(self.app, "pos_mgr", None) if self.app else None
-        if pos_mgr and strategy_name:
-            return pos_mgr.get_strategy_ratio_buy(strategy_name)
-        return None
-
-    def _get_strategy_ratio_sell(self, strategy_name):
-        """从仓位管理器获取指定策略的卖出跟单比例; 无匹配返回 None。"""
-        pos_mgr = getattr(self.app, "pos_mgr", None) if self.app else None
-        if pos_mgr and strategy_name:
-            return pos_mgr.get_strategy_ratio_sell(strategy_name)
-        return None
 
 
 # ===========================================================================
@@ -2089,7 +2055,7 @@ class ControlPanel:
         tk.Frame(self.root, bg=UI.BORDER, height=1).pack(fill="x")
 
         # =============================================
-        # Notebook: 跟单控制(合并) | 资金管理
+        # Notebook: 跟单控制(合并) | 定时激活
         # 外层套垂直滚动容器: 小屏/远程桌面时窗口高度不足也能滚动看到底部
         # =============================================
         scroll_body = tk.Frame(self.root)
@@ -2234,12 +2200,7 @@ class ControlPanel:
         self.log_text.tag_config("ERROR", foreground=UI.LOG_ERROR)
         self.log_text.tag_config("OK", foreground=UI.LOG_OK)
 
-        # --- Tab 2: 资金管理 ---
-        tab_fund = tk.Frame(notebook, bg=UI.BG)
-        notebook.add(tab_fund, text=" 资金管理 ")
-        self._build_fund_management(tab_fund)
-
-        # --- Tab 3: 定时激活 (测试版新增) ---
+        # --- Tab 2: 定时激活 (测试版新增) ---
         tab_activate = tk.Frame(notebook, bg=UI.BG)
         notebook.add(tab_activate, text=" 定时激活 ")
         self._build_group_activate(tab_activate)
@@ -2389,7 +2350,7 @@ class ControlPanel:
         self._card_hairline(g)
         rowb = ttk.Frame(g); rowb.pack(fill="x", pady=2)
         # 按钮文字改短(打开/预热/测试/列出), 好让这一行收窄 ——
-        # 之前 4 个长按钮把卡片撑到 400px, 连带把 ⑤⑥⑦ 全拉宽、空位变大
+        # 之前 4 个长按钮把卡片撑到 400px, 连带把后面的卡片全拉宽、空位变大
         for _txt, _cmd in (("打开", self.on_open_ths), ("预热", self.on_preheat_activate),
                            ("测试", self.on_test_order), ("列出", self.on_list_windows)):
             RoundButton(rowb, text=_txt, kind="ghost", font=(self._FONT_NAME, 9),
@@ -2436,6 +2397,17 @@ class ControlPanel:
         ttk.Entry(row_b, textvariable=self.vars["buy_price_max"], width=6).pack(side="right", padx=(4, 2))
         ttk.Label(row_b, text="0=不过滤", foreground=UI.TEXT_MUTED,
                   font=(self._FONT_NAME, 8)).pack(side="right")
+
+        # 跟单比例: 实际跟单股数 = 信号股数 × 比例 (原来放在「资金管理」页, 该页已删除)
+        row_rb = ttk.Frame(g); row_rb.pack(fill="x", pady=2)
+        ttk.Label(row_rb, text="买入跟单比例:", width=_LBL_W, anchor="w").pack(side="left")
+        self.vars["follow_ratio_buy"] = tk.StringVar(value=str(self.cfg.get("follow_ratio_buy", 1.0)))
+        ttk.Entry(row_rb, textvariable=self.vars["follow_ratio_buy"], width=6).pack(side="right", padx=(4, 2))
+
+        row_rs = ttk.Frame(g); row_rs.pack(fill="x", pady=2)
+        ttk.Label(row_rs, text="卖出跟单比例:", width=_LBL_W, anchor="w").pack(side="left")
+        self.vars["follow_ratio_sell"] = tk.StringVar(value=str(self.cfg.get("follow_ratio_sell", 1.0)))
+        ttk.Entry(row_rs, textvariable=self.vars["follow_ratio_sell"], width=6).pack(side="right", padx=(4, 2))
 
         self._card_hairline(g)
         row2 = ttk.Frame(g); row2.pack(fill="x", pady=1)
@@ -2547,8 +2519,8 @@ class ControlPanel:
         return items
 
     def _build_group_activate(self, parent):
-        """⑤ 激活时间列表 + ⑥ 启用与执行: 多时间点自动窗口激活配置页。"""
-        self._card_caption(parent, "⑤ 激活时间列表")
+        """④ 激活时间列表 + ⑤ 启用与执行: 多时间点自动窗口激活配置页。"""
+        self._card_caption(parent, "④ 激活时间列表")
         card = RoundedCard(parent, pad=8)
         card.pack(fill="x", padx=2, pady=(0, 8))
         g = card.body
@@ -2567,7 +2539,7 @@ class ControlPanel:
                     height=26, radius=7, parent_bg=UI.SURFACE,
                     command=self._on_add_act_row).pack(fill="x", pady=(4, 0))
 
-        self._card_caption(parent, "⑥ 启用与执行")
+        self._card_caption(parent, "⑤ 启用与执行")
         card2 = RoundedCard(parent, pad=8)
         card2.pack(fill="x", padx=2, pady=(0, 8))
         g2 = card2.body
@@ -2588,7 +2560,7 @@ class ControlPanel:
         hint.pack(fill="x", pady=(2, 0))
 
     def _refresh_act_status(self):
-        """刷新「⑥ 启用与执行」状态行: 上次执行 + 今日待执行(仅文本变化时重设)。"""
+        """刷新「⑤ 启用与执行」状态行: 上次执行 + 今日待执行(仅文本变化时重设)。"""
         try:
             _last_t, _last_ok = self._act_last
             if _last_t == "--:--":
@@ -2819,381 +2791,6 @@ class ControlPanel:
                 pass
         self.root.after(1200, _startup_reset_backtest_live)
 
-    # ==================== 资金管理 ====================
-
-    def _build_fund_management(self, parent):
-        """构建资金管理页面"""
-        _font_small = (self._FONT_NAME, 8)
-
-        # 全局买入/卖出跟单比例（简洁一行, 标签对齐便于预览）
-        global_row = ttk.Frame(parent)
-        global_row.pack(fill="x", padx=8, pady=(8, 2))
-        ttk.Label(global_row, text="全局买入比例:", width=14, anchor="e", font=_font_small).pack(side="left")
-        self.vars["follow_ratio_buy"] = tk.StringVar(value=str(self.cfg.get("follow_ratio_buy", 1.0)))
-        ttk.Entry(global_row, textvariable=self.vars["follow_ratio_buy"], width=6).pack(side="left", padx=(4, 8))
-        ttk.Label(global_row, text="全局卖出比例:", width=14, anchor="e", font=_font_small).pack(side="left")
-        self.vars["follow_ratio_sell"] = tk.StringVar(value=str(self.cfg.get("follow_ratio_sell", 1.0)))
-        ttk.Entry(global_row, textvariable=self.vars["follow_ratio_sell"], width=6).pack(side="left", padx=(4, 8))
-        ttk.Label(global_row, text="未单独配置的策略默认使用此比例", foreground=UI.TEXT_MUTED,
-                  font=_font_small).pack(side="left", padx=4)
-
-        # 策略总览区域 (弹性填充: 表格吸收页面剩余高度)
-        self._card_caption(parent, "④ 策略资金总览")
-        _fund_card = RoundedCard(parent, pad=8, radius=12)
-        _fund_card.pack(fill="both", expand=True, padx=2, pady=(0, 8))
-        strategy_frame = _fund_card.body
-        strategy_frame.columnconfigure(0, weight=1)
-        strategy_frame.rowconfigure(0, weight=1)
-
-        s_columns = ("策略名称", "买入比例", "卖出比例",
-                     "聚宽策略总资产", "按比例买入可用资金")
-        # 金融数据: 数值列右对齐
-        s_widths = {"策略名称": 150, "买入比例": 75, "卖出比例": 75,
-                    "聚宽策略总资产": 150, "按比例买入可用资金": 150}
-        s_anchors = {"策略名称": "w", "买入比例": "e", "卖出比例": "e",
-                     "聚宽策略总资产": "e", "按比例买入可用资金": "e"}
-
-        # 数据表(超高可滚动)
-        tree_holder = tk.Frame(strategy_frame, bg=UI.SURFACE)
-        tree_holder.grid(row=0, column=0, sticky="nsew")
-        tree_holder.columnconfigure(0, weight=1)
-        tree_holder.rowconfigure(0, weight=1)
-        self.s_tree = ttk.Treeview(tree_holder, columns=s_columns,
-                                    show="headings", height=8, selectmode="browse")
-        for col in s_columns:
-            self.s_tree.heading(col, text=col)
-            self.s_tree.column(col, width=s_widths[col], anchor=s_anchors[col])
-        self.s_tree.grid(row=0, column=0, sticky="nsew")
-        self._s_scroll = ttk.Scrollbar(tree_holder, orient="vertical",
-                                       command=self.s_tree.yview)
-        self._s_scroll.grid(row=0, column=1, rowspan=3, sticky="ns")
-        self.s_tree.configure(yscrollcommand=self._s_scroll.set)
-        self.s_tree.tag_configure("empty", foreground=UI.TEXT_FAINT)
-        self.s_tree.tag_configure("evenrow", background=UI.SURFACE)
-        self.s_tree.tag_configure("oddrow", background="#F2F2F7")
-        self.s_tree.bind("<<TreeviewSelect>>", self._on_strategy_select)
-        self._make_tree_editable(self.s_tree, (0, 1, 2, 3, 4), self._on_strategy_cell_edit)
-        self._enable_strategy_tree_drag(self.s_tree)
-
-        # 数据行与合计行之间的分隔线
-        self._s_separator = tk.Frame(tree_holder, bg=UI.BORDER, height=2)
-        self._s_separator.grid(row=1, column=0, sticky="ew")
-
-        # 合计行(与数据行同容器, 共享列宽, 像素级对齐)
-        self.s_tree_footer = ttk.Treeview(tree_holder, columns=s_columns,
-                                          show="", height=1, selectmode="none")
-        self.s_tree_footer.grid(row=2, column=0, sticky="nsew")
-        for col in s_columns:
-            self.s_tree_footer.column(col, width=s_widths[col], anchor=s_anchors[col])
-        self.s_tree_footer.tag_configure("total", background=UI.BRAND_SOFT,
-                                         font=self._font_medium)
-        self.s_tree_footer.insert("", "end", tags=("total",),
-            values=("合计", "", "", "", ""))
-
-        s_btn = tk.Frame(strategy_frame, bg=UI.SURFACE_MUTED)
-        s_btn.grid(row=2, column=0, sticky="ew", padx=2, pady=(0, 2))
-        RoundButton(s_btn, text="+ 添加策略", kind="soft", font=(self._FONT_NAME, 9),
-                    height=26, radius=7, parent_bg=UI.SURFACE_MUTED,
-                    command=self._on_add_strategy).pack(side="left", padx=2, pady=2)
-        RoundButton(s_btn, text="删除策略", kind="soft", font=(self._FONT_NAME, 9),
-                    height=26, radius=7, parent_bg=UI.SURFACE_MUTED,
-                    command=self._on_delete_strategy).pack(side="left", padx=2, pady=2)
-        RoundButton(s_btn, text="刷新", kind="soft", font=(self._FONT_NAME, 9),
-                    height=26, radius=7, parent_bg=UI.SURFACE_MUTED,
-                    command=self._on_refresh_fund).pack(side="right", padx=2, pady=2)
-        tk.Label(s_btn, text="双击单元格可编辑", fg=UI.TEXT_MUTED, bg=UI.SURFACE_MUTED,
-                 font=_font_small).pack(side="right", padx=8)
-
-        self._selected_strategy = None
-        self._fund_dirty = False
-        self._on_refresh_fund()
-
-    # ---------- 可编辑 Treeview 通用组件 ----------
-
-    def _make_tree_editable(self, tree, editable_cols, on_edit_callback):
-        """为 Treeview 的指定列绑定双击编辑功能"""
-        tree._editable_cols = editable_cols
-        tree._on_edit_callback = on_edit_callback
-        tree._edit_entry = None
-        tree._edit_item = None
-        tree._edit_col = None
-        tree.bind("<Double-1>", lambda e: self._tree_edit_start(e, tree))
-
-    def _tree_edit_start(self, event, tree):
-        """双击单元格: 创建 Entry / Combobox 编辑框"""
-        if tree._edit_entry:
-            self._tree_edit_finish(tree)
-        region = tree.identify_region(event.x, event.y)
-        if region != "cell":
-            return
-        col_ident = tree.identify_column(event.x)  # 如 "#1", "#2" ...
-        col_idx = int(col_ident[1:]) - 1
-        if col_idx not in tree._editable_cols:
-            return
-        item = tree.identify_row(event.y)
-        if not item:
-            return
-        # 自动计算的列不可编辑
-        col_name = tree["columns"][col_idx]
-        if col_name in ("已用资金", "占用资金", "估算市值", "浮动盈亏", "差值"):
-            return
-
-        # 使用列标识符获取 bbox, 避免索引偏移
-        x, y, w, h = tree.bbox(item, column=col_ident)
-        val = tree.set(item, col_idx)
-
-        if col_name == "策略名称":
-            # 从策略总览表获取所有策略名
-            strategies = []
-            for s_item in self.s_tree.get_children():
-                strategies.append(self.s_tree.set(s_item, 0))
-            if not strategies:
-                strategies = self.pos_mgr.get_strategies()
-            widget = ttk.Combobox(tree, values=strategies, font=(self._FONT_MONO, 9), state="readonly")
-            widget.set(val)
-        else:
-            widget = ttk.Entry(tree, font=(self._FONT_MONO, 9))
-            widget.insert(0, val)
-            widget.select_range(0, "end")
-
-        widget.place(x=x, y=y, width=w, height=h)
-        widget.focus()
-
-        tree._edit_entry = widget
-        tree._edit_item = item
-        tree._edit_col = col_idx
-        tree._edit_old_val = val  # 保存旧值, 供回调使用
-
-        def _finish(e=None):
-            self._tree_edit_finish(tree)
-        widget.bind("<Return>", _finish)
-        # Combobox 选择后自动完成编辑
-        if isinstance(widget, ttk.Combobox):
-            widget.bind("<<ComboboxSelected>>", lambda e: tree.after(50, _finish))
-        widget.bind("<FocusOut>", lambda e: tree.after(100, _finish) if tree._edit_entry else None)
-        widget.bind("<Escape>", lambda e: self._tree_edit_cancel(tree))
-
-    def _tree_edit_finish(self, tree):
-        """完成编辑: 保存值并回调"""
-        entry = tree._edit_entry
-        item = tree._edit_item
-        col_idx = tree._edit_col
-        old_val = getattr(tree, "_edit_old_val", "")
-        if entry and item and col_idx is not None:
-            new_val = entry.get().strip()
-            tree._edit_entry = None
-            tree._edit_item = None
-            tree._edit_col = None
-            tree._edit_old_val = None
-            entry.destroy()
-            if new_val and new_val != old_val:
-                tree.set(item, col_idx, new_val)
-                if tree._on_edit_callback:
-                    try:
-                        tree._on_edit_callback(item, col_idx, new_val, old_val)
-                    except Exception as e:
-                        gui_log("编辑回调异常: %s" % e, "ERROR")
-        else:
-            tree._edit_entry = None
-            tree._edit_item = None
-            tree._edit_col = None
-            tree._edit_old_val = None
-
-    def _tree_edit_cancel(self, tree):
-        """取消编辑"""
-        if tree._edit_entry:
-            tree._edit_entry.destroy()
-            tree._edit_entry = None
-            tree._edit_item = None
-            tree._edit_col = None
-
-    # ---------- 策略编辑回调 ----------
-
-    def _on_strategy_cell_edit(self, item, col_idx, new_val, old_val):
-        """策略表单元格编辑完成"""
-        col_name = self.s_tree["columns"][col_idx]
-        old_name = self.s_tree.set(item, 0)
-        if col_idx == 0:  # 策略名称
-            if new_val and new_val != old_name:
-                if self.pos_mgr.rename_strategy(old_name, new_val):
-                    gui_log("策略已重命名: %s → %s" % (old_name, new_val), "OK")
-        elif col_idx == 1:  # 买入比例
-            try:
-                ratio = float(new_val)
-                self.pos_mgr.set_strategy_ratio_buy(old_name, ratio)
-                gui_log("策略[%s]买入比例已设为: %.2f" % (old_name, ratio), "OK")
-            except ValueError:
-                gui_log("买入比例格式错误: %s" % new_val, "WARN")
-        elif col_idx == 2:  # 卖出比例
-            try:
-                ratio = float(new_val)
-                self.pos_mgr.set_strategy_ratio_sell(old_name, ratio)
-                gui_log("策略[%s]卖出比例已设为: %.2f" % (old_name, ratio), "OK")
-            except ValueError:
-                gui_log("卖出比例格式错误: %s" % new_val, "WARN")
-        elif col_idx == 3:  # 聚宽策略总资产
-            try:
-                asset = float(str(new_val).replace(",", ""))
-                self.pos_mgr.set_jq_total_asset(old_name, asset)
-                gui_log("策略[%s]聚宽策略总资产已设为: %.2f" % (old_name, asset), "OK")
-            except ValueError:
-                gui_log("聚宽策略总资产格式错误: %s" % new_val, "WARN")
-        elif col_idx == 4:  # 按比例买入可用资金(手动覆盖)
-            try:
-                asset = float(str(new_val).replace(",", ""))
-                self.pos_mgr.set_follow_total_asset(old_name, asset)
-                gui_log("策略[%s]按比例买入可用资金已手动设为: %.2f" % (old_name, asset), "OK")
-            except ValueError:
-                gui_log("按比例买入可用资金格式错误: %s" % new_val, "WARN")
-        self._on_refresh_fund()
-
-    # ---------- 策略总览刷新 ----------
-
-    def _on_strategy_select(self, event):
-        """选择策略行(仅记录当前选中, 不再联动持仓表)"""
-        sel = self.s_tree.selection()
-        if sel:
-            self._selected_strategy = self.s_tree.set(sel[0], 0)
-        else:
-            self._selected_strategy = None
-
-    def _on_refresh_fund(self):
-        """刷新资金管理页面"""
-        self._refresh_strategy_tree()
-
-    def _refresh_strategy_tree(self):
-        """刷新策略总览表(含冻结合计行)"""
-        for item in self.s_tree.get_children():
-            self.s_tree.delete(item)
-        rows = self.pos_mgr.get_summary() if self.pos_mgr else []
-        if not rows:
-            # 空状态占位: 引导用户添加策略
-            self.s_tree.insert("", "end", values=(
-                "暂无策略数据，点击 [+ 添加策略] 开始配置", "", "", "", ""),
-                tags=("empty",))
-        else:
-            for i, row in enumerate(rows):
-                tags = ["evenrow" if i % 2 == 0 else "oddrow"]
-                self.s_tree.insert("", "end", values=(
-                    row["name"],
-                    "%.2f" % row["ratio_buy"],
-                    "%.2f" % row["ratio_sell"],
-                    "{:,.2f}".format(row["jq_total_asset"]),
-                    "{:,.2f}".format(row["follow_total_asset"]),
-                ), tags=tuple(tags))
-        # 冻结合计行
-        sum_jq = sum(r["jq_total_asset"] for r in rows)
-        sum_follow = sum(r["follow_total_asset"] for r in rows)
-        for item in self.s_tree_footer.get_children():
-            self.s_tree_footer.delete(item)
-        self.s_tree_footer.insert("", "end", values=(
-            "合计", "", "",
-            "{:,.2f}".format(sum_jq),
-            "{:,.2f}".format(sum_follow),
-        ), tags=("total",))
-
-    # ---------- 策略按钮操作 ----------
-
-    def _on_add_strategy(self):
-        """添加策略"""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("添加策略")
-        dialog.geometry("320x180")
-        dialog.resizable(False, False)
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        tk.Label(dialog, text="策略名称:").pack(pady=(12, 2))
-        name_var = tk.StringVar()
-        name_entry = ttk.Entry(dialog, textvariable=name_var, width=30)
-        name_entry.pack(pady=2)
-        name_entry.focus()
-
-        tk.Label(dialog, text="初始资金:").pack(pady=2)
-        cap_var = tk.StringVar(value="0")
-        cap_entry = ttk.Entry(dialog, textvariable=cap_var, width=30)
-        cap_entry.pack(pady=2)
-
-        def _confirm():
-            name = name_var.get().strip()
-            if not name:
-                return
-            try:
-                cap = float(cap_var.get().strip())
-            except ValueError:
-                cap = 0
-            self.pos_mgr.set_initial_capital(name, cap)
-            gui_log("已添加策略: %s (初始资金: %.2f)" % (name, cap), "OK")
-            dialog.destroy()
-            self._on_refresh_fund()
-
-        btn_frame = tk.Frame(dialog, bg=UI.SURFACE_MUTED)
-        btn_frame.pack(fill="x", pady=8)
-        RoundButton(btn_frame, text="确认添加", kind="primary", font=(self._FONT_NAME, 9),
-                    height=28, radius=7, parent_bg=UI.SURFACE_MUTED,
-                    command=_confirm).pack(side="left", padx=(50, 5), pady=2)
-        RoundButton(btn_frame, text="取消", kind="soft", font=(self._FONT_NAME, 9),
-                    height=28, radius=7, parent_bg=UI.SURFACE_MUTED,
-                    command=dialog.destroy).pack(side="left", padx=(5, 50), pady=2)
-
-    def _on_delete_strategy(self):
-        """删除策略"""
-        sel = self.s_tree.selection()
-        if not sel:
-            messagebox.showinfo("提示", "请先选择要删除的策略")
-            return
-        name = self.s_tree.set(sel[0], 0)
-        if not messagebox.askyesno("确认删除", "确定删除策略 [%s] 吗？" % name):
-            return
-        self.pos_mgr.delete_strategy(name)
-        gui_log("已删除策略: %s" % name, "OK")
-        self._selected_strategy = None
-        self._on_refresh_fund()
-
-    # ---------- 策略拖动排序 ----------
-
-    def _enable_strategy_tree_drag(self, tree):
-        """为策略总览表启用拖拽排序"""
-        # 初始化拖动状态包
-        self._drag_data = {"item": None, "start_y": 0, "dragging": False}
-
-        def _drag_start(event):
-            self._drag_data["item"] = tree.identify_row(event.y)
-            self._drag_data["start_y"] = event.y
-            self._drag_data["dragging"] = False
-
-        def _drag_motion(event):
-            if not self._drag_data["item"]:
-                return
-            if abs(event.y - self._drag_data["start_y"]) > 10:
-                self._drag_data["dragging"] = True
-                target = tree.identify_row(event.y)
-                if target and target != self._drag_data["item"]:
-                    tree.tk.call("tk", "treeview", "see", tree, target)
-                    # 插入线指示器不可用，改用 selection 作为视觉反馈
-                    tree.selection_set(target)
-
-        def _drag_drop(event):
-            if not self._drag_data["dragging"] or not self._drag_data["item"]:
-                self._drag_data["item"] = None
-                return
-            target = tree.identify_row(event.y)
-            if target and target != self._drag_data["item"]:
-                dragged_name = tree.set(self._drag_data["item"], 0)
-                target_name = tree.set(target, 0)
-                order = self.pos_mgr.get_strategy_order()
-                if target_name in order:
-                    target_idx = order.index(target_name)
-                    self.pos_mgr.reorder_strategy(dragged_name, target_idx)
-                    self._refresh_strategy_tree()
-                    gui_log("策略排序已更新: %s → 第%d位" % (dragged_name, target_idx + 1), "OK")
-            self._drag_data["item"] = None
-            self._drag_data["dragging"] = False
-
-        tree.bind("<Button-1>", _drag_start, add="+")
-        tree.bind("<B1-Motion>", _drag_motion, add="+")
-        tree.bind("<ButtonRelease-1>", _drag_drop, add="+")
-
     def _collect_config(self):
         cfg = {}
         cfg["ths_exe_path"] = self.vars["ths_exe_path"].get().strip()
@@ -3201,8 +2798,6 @@ class ControlPanel:
         cfg["window_title_keyword"] = self.vars["window_title_keyword"].get().strip()
         cfg["follow_ratio_buy"] = float(self.vars["follow_ratio_buy"].get().strip())
         cfg["follow_ratio_sell"] = float(self.vars["follow_ratio_sell"].get().strip())
-        # 从仓位管理器自动生成策略比例配置
-        cfg["strategy_ratios"] = self.pos_mgr.generate_strategy_ratios_config()
         cfg["min_amount"] = int(self.vars["min_amount"].get().strip())
         # 买入价格上限(从「买入限价版」移植): 不能为负数
         _bpm = float(self.vars["buy_price_max"].get().strip())
@@ -3769,11 +3364,6 @@ class ControlPanel:
                 # 按钮与胶囊统一由同一 running 值驱动, 保证同步
                 self._set_follow_btn(running)
                 self._update_stat_cards()
-
-            # 刷新资金管理面板
-            if self._fund_dirty:
-                self._fund_dirty = False
-                self._on_refresh_fund()
         except Exception:
             pass
 
