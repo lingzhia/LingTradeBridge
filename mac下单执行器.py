@@ -1420,11 +1420,14 @@ class KeyOrderExecutor:
         return True
 
     def test_order(self):
-        """[测试连接]: 检查同花顺是否在运行、交易面板能否被识别(不会真下单)。
+        """[测试连接]: 检查同花顺是否在运行、交易面板能否被识别。
+
+        ⚠️ 这里**不会下任何单**, 纯粹是体检 —— 名字容易和 [买入测试]/[卖出测试]
+           混淆, 所以每条日志都写明"未下单", 免得用户点完在这儿等委托。
         当前不在交易界面时会先尝试自动切过去, 所以这个按钮也是"一键就绪"。"""
         t0 = time.time()
         if not _ax_trusted():
-            _log("检测失败: 没有辅助功能权限", "ERROR")
+            _log("测试连接失败: 没有辅助功能权限", "ERROR")
             _log("请到「系统设置 -> 隐私与安全性 -> 辅助功能」把运行本程序的 App 勾上", "INFO")
             return False
         pid = _find_ths_pid(self._app_name())
@@ -1433,7 +1436,7 @@ class KeyOrderExecutor:
             return False
         panel, win, why = self._goto_panel(pid)
         if panel is None:
-            _log("检测失败: %s" % why, "ERROR")
+            _log("测试连接失败: %s" % why, "ERROR")
             _log("请在左侧导航栏里点开「交易」那一屏(能看到 代码/价格/数量 三个输入框)后重试", "INFO")
             return False
         self.ths_hwnd = pid
@@ -1445,9 +1448,10 @@ class KeyOrderExecutor:
         code_now = _ax_text(panel["code"], "AXValue")
         price_now = _ax_text(panel["price"], "AXValue") if panel["price"] else ""
         qty_now = _ax_text(panel["qty"], "AXValue")
-        _log("测试成功! 已识别到同花顺交易面板 (进程 %d), 定位耗时 %.3f 秒" % (
+        _log("测试连接成功: 已识别到同花顺交易面板 (进程 %d), 定位耗时 %.3f 秒" % (
             pid, time.time() - t0), "OK")
         _log("  当前面板内容: 代码=「%s」 价格=「%s」 数量=「%s」" % (
             code_now, price_now, qty_now), "INFO")
-        _log("  macOS 不需要抢焦点, 下单会在后台完成", "INFO")
+        _log("  ★ 本次只做体检, 没有下任何单 —— 要下测试单请点[买入测试]/[卖出测试]", "INFO")
+        _log("  macOS 不需要抢焦点, 真下单会在后台完成", "INFO")
         return True

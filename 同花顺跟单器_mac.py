@@ -2354,12 +2354,14 @@ class ControlPanel:
 
         self._card_hairline(g)
         rowb = ttk.Frame(g); rowb.pack(fill="x", pady=2)
-        # 按钮文字改短(打开/预热/测试/列出), 好让这一行收窄 ——
-        # 之前 4 个长按钮把卡片撑到 400px, 连带把后面的卡片全拉宽、空位变大
+        # 按钮文字尽量短(打开/预热/测试连接/列出), 好让这一行收窄 ——
+        # 之前 4 个长按钮把卡片撑到 400px, 连带把后面的卡片全拉宽、空位变大。
+        # 但「测试」太容易被当成"下个测试单", 和顶栏的[买入测试]/[卖出测试]混淆,
+        # 所以这个必须写清楚是「测试连接」; 多出来的宽度用 padx 11->8 找回来。
         for _txt, _cmd in (("打开", self.on_open_ths), ("预热", self.on_preheat_activate),
-                           ("测试", self.on_test_order), ("列出", self.on_list_windows)):
+                           ("测试连接", self.on_test_order), ("列出", self.on_list_windows)):
             RoundButton(rowb, text=_txt, kind="ghost", font=(self._FONT_NAME, 9),
-                        height=26, radius=7, padx=11, parent_bg=UI.SURFACE,
+                        height=26, radius=7, padx=8, parent_bg=UI.SURFACE,
                         command=_cmd).pack(side="left", padx=(0, 6))
 
     def _browse_ths(self):
