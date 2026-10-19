@@ -1056,8 +1056,8 @@ class ControlPanel:
         self.order_executor = KeyOrderExecutor(self.cfg)
         self.pos_mgr = PositionManager(BASE_DIR)
         self.vars = {}
-        # ---- 定时激活状态(测试版新增) ----
-        self._preheat_date = ""              # 上次定时激活触发日期, 用于每日重置去重集合
+        # ---- 定时预热状态(测试版新增) ----
+        self._preheat_date = ""              # 上次定时预热触发日期, 用于每日重置去重集合
         self._preheat_fired = set()          # 当日已触发的 "YYYY-MM-DD HH:MM" 集合
         self._act_last = ("--:--", False)    # 最近一次激活 (时间 HH:MM, 是否成功)
         self._build_ui()
@@ -1370,7 +1370,7 @@ class ControlPanel:
         tk.Frame(self.root, bg=UI.BORDER, height=1).pack(fill="x")
 
         # =============================================
-        # Notebook: 跟单控制(合并) | 定时激活
+        # Notebook: 跟单控制(合并)
         # 外层套垂直滚动容器: 小屏/远程桌面时窗口高度不足也能滚动看到底部
         # =============================================
         scroll_body = tk.Frame(self.root)
@@ -1427,7 +1427,7 @@ class ControlPanel:
         self._build_group_account(left) # ② 券商账户
         self._build_group_redis(left)   # ③ 信号源 · Redis
         self._build_group_params(left)  # ④ 跟单规则
-        self._build_group_activate(left) # ⑤ 定时激活
+        self._build_group_activate(left) # ⑤ 定时预热
 
         # ===== 右列: 日志 400px / 买入 200px / 卖出 200px =====
         right = tk.Frame(content, bg=UI.BG)
@@ -1596,7 +1596,7 @@ class ControlPanel:
         """执行"预热": 确保同花顺已经在交易下单面板上待命, 不在就自己切过去。
         下单进行中(拿不到锁)就跳过本次。
 
-        被三处共用: Redis 预热信号(action=preheat)、①[预热]按钮、定时激活。
+        被三处共用: Redis 预热信号(action=preheat)、①[预热]按钮、定时预热。
         原来还有个单独的[测试连接]按钮做的是同一件事, 已经并到这里 ——
         所以这里把当时的体检信息(定位耗时、面板里现在装着什么)一并打出来。
         """
@@ -1952,9 +1952,9 @@ class ControlPanel:
         ttk.Checkbutton(row3, text="忽略买入", width=14,
                         variable=self.vars["ignore_buy"]).pack(side="left", padx=4)
 
-    # ================= 定时激活页 (测试版新增) =================
+    # ================= 定时预热页 (测试版新增) =================
     def _act_list_from_cfg(self):
-        """读取配置中的激活时间列表, 兼容旧版(无该键时默认 09:29 首行)。"""
+        """读取配置中的预热时间列表, 兼容旧版(无该键时默认 09:29 首行)。"""
         raw = self.cfg.get("activation_times")
         if not raw:
             return [{"time": "09:29", "note": ""}]
@@ -1968,7 +1968,7 @@ class ControlPanel:
         return items
 
     def _append_act_row(self, time_str="", note_str=""):
-        """追加一行激活时间(时间输入框 + 备注 + 删除/上移/下移)。"""
+        """追加一行预热时间(时间输入框 + 备注 + 删除/上移/下移)。"""
         row = ttk.Frame(self._act_list_box)
         row.pack(fill="x", pady=1)
         tv = tk.StringVar(value=time_str)
@@ -1987,7 +1987,7 @@ class ControlPanel:
         self._act_rows.append((row, tv, nv))
 
     def _remove_act_row(self, row):
-        """删除一行激活时间。"""
+        """删除一行预热时间。"""
         for i, (r, tv, nv) in enumerate(self._act_rows):
             if r is row:
                 self._act_rows.pop(i)
@@ -1995,7 +1995,7 @@ class ControlPanel:
                 break
 
     def _move_act_row(self, row, delta):
-        """上移/下移一行激活时间, 保持列表顺序与 pack 顺序一致。"""
+        """上移/下移一行预热时间, 保持列表顺序与 pack 顺序一致。"""
         idx = None
         for i, (r, tv, nv) in enumerate(self._act_rows):
             if r is row:
@@ -2013,11 +2013,11 @@ class ControlPanel:
             r.pack(fill="x", pady=1)
 
     def _on_add_act_row(self):
-        """添加一行空激活时间。"""
+        """添加一行空预热时间。"""
         self._append_act_row("", "")
 
     def _collect_activation_times(self):
-        """收集激活时间列表并校验: 格式 HH:MM、范围合法、去重、按时间排序。
+        """收集预热时间列表并校验: 格式 HH:MM、范围合法、去重、按时间排序。
         空时间行自动忽略; 校验失败抛 ValueError, 由保存流程弹框提示。"""
         items = []
         seen = set()
@@ -2034,7 +2034,7 @@ class ControlPanel:
             except Exception:
                 ok = False
             if not ok:
-                raise ValueError("激活时间格式不正确: %s (需为 HH:MM)" % t)
+                raise ValueError("预热时间格式不正确: %s (需为 HH:MM)" % t)
             t = "%02d:%02d" % (hh, mm)
             if t in seen:
                 continue
@@ -2044,11 +2044,11 @@ class ControlPanel:
         return items
 
     def _build_group_activate(self, parent):
-        """⑤ 定时激活: 多时间点自动窗口激活配置。"""
-        g = self._build_collapsible_card(parent, "⑤ 定时激活", initially_expanded=False)
+        """⑤ 定时预热: 多时间点自动窗口预热配置。"""
+        g = self._build_collapsible_card(parent, "⑤ 定时预热", initially_expanded=False)
         
-        # 激活时间列表
-        self._card_caption(g, "激活时间列表")
+        # 预热时间列表
+        self._card_caption(g, "预热时间列表")
         card = RoundedCard(g, pad=8)
         card.pack(fill="x", padx=2, pady=(0, 8))
         card_body = card.body
@@ -2063,7 +2063,7 @@ class ControlPanel:
         self._act_list_box.pack(fill="x")
         for item in self._act_list_from_cfg():
             self._append_act_row(item["time"], item["note"])
-        RoundButton(card_body, text="+ 添加激活时间", kind="ghost", font=(self._FONT_NAME, 9),
+        RoundButton(card_body, text="+ 添加预热时间", kind="ghost", font=(self._FONT_NAME, 9),
                     height=26, radius=7, parent_bg=UI.SURFACE,
                     command=self._on_add_act_row).pack(fill="x", pady=(4, 0))
 
@@ -2075,7 +2075,7 @@ class ControlPanel:
 
         self.vars["activate_enabled"] = tk.BooleanVar(
             value=self.cfg.get("activate_enabled", True))
-        ttk.Checkbutton(g2, text="启用定时激活（仅交易日，按列表时间依次执行窗口激活）",
+        ttk.Checkbutton(g2, text="启用定时预热（仅交易日，按列表时间依次执行窗口预热）",
                         variable=self.vars["activate_enabled"]).pack(anchor="w", pady=2)
         rowb = ttk.Frame(g2); rowb.pack(fill="x", pady=2)
         RoundButton(rowb, text="立即激活一次", kind="primary", font=(self._FONT_NAME, 9),
@@ -2509,7 +2509,7 @@ class ControlPanel:
         except Exception:
             cfg["redis_backtest_skip_hours"] = 2
         cfg["redis_allow_backtest_live"] = bool(self.vars["redis_allow_backtest_live"].get())
-        # --- 定时激活(测试版新增) ---
+        # --- 定时预热(测试版新增) ---
         cfg["activation_times"] = self._collect_activation_times()
         cfg["activate_enabled"] = bool(self.vars["activate_enabled"].get())
         cfg["http_host"] = self.vars["http_host"].get().strip() or "127.0.0.1"
@@ -2544,7 +2544,7 @@ class ControlPanel:
             messagebox.showerror("错误", "启动同花顺失败:\n%s" % e)
 
     def on_preheat_activate(self):
-        """[预热]: 让同花顺回到交易下单面板待命(与 Redis 预热信号、定时激活同一逻辑)。
+        """[预热]: 让同花顺回到交易下单面板待命(与 Redis 预热信号、定时预热同一逻辑)。
 
         先把界面上的配置收一遍再测 —— 这样刚改过「同花顺程序」路径或应用名,
         点一下[预热]就能立刻验证, 不用先保存配置。
@@ -3015,7 +3015,7 @@ class ControlPanel:
         except Exception:
             pass
 
-        # 定时激活: 每个交易日按激活时间列表依次自动执行窗口激活(切回控制台会话),
+        # 定时预热: 每个交易日按预热时间列表依次自动执行窗口预热(切回控制台会话),
         # 等效于发送端 preheat 信号, 让首单零 RDP 切换延迟。每个时间点每日触发一次,
         # 错过的时间点不补执行(当日已过即跳过)。日期切换时清空当日已触发集合。
         try:
