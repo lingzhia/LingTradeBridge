@@ -42,6 +42,7 @@ macOS 下单执行器 (直接调用 macOS「辅助功能」接口)
 """
 
 import ctypes
+import re
 import subprocess
 import threading
 import time
@@ -459,6 +460,90 @@ def _release_panel(panel):
         return
     for key in ("code", "price", "qty", "buy", "sell", "reset", "submit"):
         _ax_free(panel.get(key))
+
+
+def _detect_panel_state_in_window(win):
+    """识别交易面板当前状态: A 股 / 模拟,以及是否已登录。
+
+    只读, 不切换界面。从窗口根浅两层遍历(页签 / 登录按钮 / 账号文本可能和
+    代码/价格/数量输入框平级, 不在面板 dict 里):
+      - 找标题含 "A股" / "模拟" 的按钮, 按 AXSelected 判断; 读不到选中态时
+        按几何位置推断(更靠左的是主面板, 同花顺实测 A股 x≈53, 模拟 x≈143)
+      - 找标题含 "登录" 的按钮 -> 未登录(覆盖 "登录" / "立即登录" / "账号登录")
+      - 找含连续数字的静态文本(资金账号/客户号)或 "总资产" 文本 -> 已登录
+
+    返回 dict: {panel_type, logged_in, account, broker}
+    """
+    if not win:
+        return {"panel_type": None, "logged_in": None, "account": None, "broker": None}
+
+    res = {"panel_type": None, "logged_in": None, "account": None, "broker": None}
+    panel_type_is_selected = False
+    login_btn_seen = False
+    # 记录两个页签的位置, 选中态都读不到时按"更靠左的是主面板"推断
+    tab_positions = {}  # {"A股": x, "模拟": x}
+
+    def _check(el, role, title, value, pos_x=None):
+        nonlocal panel_type_is_selected, login_btn_seen
+        if role in ("AXButton", "AXRadioButton"):
+            is_selected = (value in ("1", "true", True)
+                           or "selected" in str(value).lower())
+            candidate = None
+            if "A股" in title and "模拟" not in title:
+                candidate = "A股"
+            elif "模拟" in title:
+                candidate = "模拟"
+            if candidate:
+                if pos_x is not None:
+                    tab_positions[candidate] = pos_x
+                if is_selected:
+                    res["panel_type"] = candidate
+                    panel_type_is_selected = True
+                elif not panel_type_is_selected and res["panel_type"] is None:
+                    res["panel_type"] = candidate
+            # 登录按钮: 标题里含 "登录" 都算(覆盖 "登录" / "立即登录" / "账号登录")
+            if "登录" in title:
+                login_btn_seen = True
+        if role == "AXStaticText" and value:
+            m = re.search(r"\d{4,}", str(value))
+            if m and not res["account"] and any(
+                k in title for k in ("资金", "账号", "客户", "卡号", "股东")
+            ):
+                res["account"] = str(value)
+            if "总资产" in str(value):
+                res["logged_in"] = True
+
+    kids = _ax_elements(win)
+    try:
+        for el in kids:
+            role = _ax_text(el, "AXRole")
+            title = _ax_text(el, "AXTitle")
+            value = _ax_text(el, "AXValue")
+            x = _ax_pos(el)[0]
+            _check(el, role, title, value, pos_x=x)
+            if role in ("AXGroup", "AXRadioGroup", "AXTabGroup", "AXScrollArea",
+                        "AXSplitGroup", "AXBox", "AXGenericElement"):
+                sub = _ax_elements(el)
+                for s in sub:
+                    sr = _ax_text(s, "AXRole")
+                    st = _ax_text(s, "AXTitle")
+                    sv = _ax_text(s, "AXValue")
+                    sx = _ax_pos(s)[0]
+                    _check(s, sr, st, sv, pos_x=sx)
+                _ax_free_all(sub)
+    finally:
+        _ax_free_all(kids)
+
+    # 选中态都没读到, 但两个页签都在 -> 按位置推断(更靠左 = 主面板 = A股)
+    if not panel_type_is_selected and len(tab_positions) == 2:
+        if tab_positions["A股"] < tab_positions["模拟"]:
+            res["panel_type"] = "A股"
+        else:
+            res["panel_type"] = "模拟"
+
+    if res["logged_in"] is None:
+        res["logged_in"] = not login_btn_seen
+    return res
 
 
 def _locate_panel(pid):
@@ -1006,6 +1091,28 @@ class KeyOrderExecutor:
         self._panel = panel
         self._win = win
         return panel, None
+
+    def detect_panel_state(self):
+        """识别交易面板当前状态: A 股 / 模拟, 是否已登录。只读, 不切换界面。
+
+        返回 dict: {panel_type, logged_in, account, broker}
+        失败时 panel_type 为 None, logged_in 为 None。
+
+        注意: 页签按钮("A股"/"模拟")和登录按钮不一定在面板 dict 里(它们常和
+        代码/价格/数量输入框平级, 都在窗口根下), 所以这里从窗口根遍历, 覆盖更全。
+        """
+        pid = self.ths_hwnd or _find_ths_pid(self._app_name())
+        if pid is None:
+            return {"panel_type": None, "logged_in": None, "account": None, "broker": None}
+        # 先确认交易面板在(同时把 ths_hwnd 设上); 不在就直接失败
+        panel, _why = self._ensure_panel()
+        if panel is None:
+            return {"panel_type": None, "logged_in": None, "account": None, "broker": None}
+        win = self._win
+        if not win:
+            return {"panel_type": None, "logged_in": None, "account": None, "broker": None}
+        # 从窗口根遍历, 找页签 / 登录按钮 / 账号文本
+        return _detect_panel_state_in_window(win)
 
     # ------------------------------------------------------------------
     # 下单主流程

@@ -1564,6 +1564,22 @@ class ControlPanel:
                 gui_log("预热(%s) %s: %s (进程=%s, 耗时 %.3f 秒)" % (
                     reason, "成功" if ok else "失败", title, hwnd, time.time() - t0),
                     "OK" if ok else "WARN")
+                # 预热成功后, 识别一下当前是 A 股 / 模拟, 以及登录状态
+                try:
+                    st = self.order_executor.detect_panel_state()
+                    ptype = st.get("panel_type")
+                    if ptype:
+                        gui_log("  当前交易面板: %s" % ptype, "INFO")
+                    else:
+                        gui_log("  未能识别当前交易面板类型(A股/模拟)", "WARN")
+                    if ptype == "A股":
+                        if st.get("logged_in"):
+                            acct = st.get("account") or "(未读到账号字段)"
+                            gui_log("  已登录: %s" % acct, "OK")
+                        else:
+                            gui_log("  未登录 A 股账号, 请先在同花顺里登录后再跟单", "WARN")
+                except Exception as e:
+                    gui_log("  面板状态识别失败: %s" % e, "WARN")
             finally:
                 self.order_executor._lock.release()
         except Exception as e:
