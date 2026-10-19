@@ -1644,6 +1644,7 @@ class ControlPanel:
                                 # 没有账户可试, 跳过自动登录流程
                             else:
                                 # 依次尝试每个账户
+                                any_success = False
                                 for idx, acc in enumerate(accounts, 1):
                                     b = (acc.get("broker") or "").strip()
                                     a = (acc.get("account") or "").strip()
@@ -1667,6 +1668,7 @@ class ControlPanel:
                                                     idx, len(accounts), b), "OK")
                                         # 把"当前选中"同步到这个 broker
                                         self.cfg["broker"] = b
+                                        any_success = True
                                         # 表单填完后登录弹窗已打开, 此时扫描可用券商并并入下拉框
                                         try:
                                             avail = self.order_executor._scan_login_brokers()
@@ -1681,9 +1683,76 @@ class ControlPanel:
                                     else:
                                         gui_log("  [%d/%d] %s 表单填入失败" % (
                                             idx, len(accounts), b), "WARN")
-                                else:
-                                    gui_log("  所有配置的账户都填入失败, 请在同花顺里手动登录",
-                                            "WARN")
+                                
+                                # 所有账户都失败(或没有账户): 扫描登录表单, 把券商+账号保存到配置
+                                if not any_success:
+                                    gui_log("  尝试扫描同花顺已记住的券商和账号...", "INFO")
+                                    try:
+                                        # 先点"立即登录"打开弹窗(如果还没打开)
+                                        pid = self.order_executor.ths_hwnd
+                                        if pid:
+                                            panel, win, _ = _mac_order._locate_panel(pid)
+                                            if win:
+                                                try:
+                                                    btn = _mac_order._find_button(win, "立即登录")
+                                                    if btn:
+                                                        try:
+                                                            _mac_order._ax_press(btn)
+                                                        finally:
+                                                            _mac_order._ax_free(btn)
+                                                        import time; time.sleep(0.5)
+                                                    # 扫描弹窗里的券商和账号
+                                                    sheet = _mac_order._find_sheet(win)
+                                                    if sheet:
+                                                        combos = _mac_order._collect_combos_in_sheet(sheet)
+                                                        scanned_broker = scanned_account = ""
+                                                        for label, combo in combos:
+                                                            if "证券" in label or "券商" in label:
+                                                                scanned_broker = _mac_order._ax_text(combo, "AXValue").strip()
+                                                            elif "帐户" in label and ("交易" in label or "资金" in label):
+                                                                scanned_account = _mac_order._ax_text(combo, "AXValue").strip()
+                                                        if scanned_broker and scanned_account:
+                                                            # 检查是否已在 accounts 里
+                                                            exists = any(
+                                                                (a.get("broker") or "").strip() == scanned_broker and
+                                                                (a.get("account") or "").strip() == scanned_account
+                                                                for a in accounts
+                                                            )
+                                                            if not exists:
+                                                                # 添加到 accounts(密码留空, 让用户补)
+                                                                accounts.append({
+                                                                    "broker": scanned_broker,
+                                                                    "account": scanned_account,
+                                                                    "trade_password": ""
+                                                                })
+                                                                self.cfg["accounts"] = accounts
+                                                                # 保存到配置文件
+                                                                try:
+                                                                    import json
+                                                                    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                                                                        json.dump(self.cfg, f, ensure_ascii=False, indent=2)
+                                                                except Exception as _se:
+                                                                    gui_log("  保存配置失败: %s" % _se, "WARN")
+                                                                gui_log("  已记录: %s / %s (请在「券商账户」里补密码)" % (
+                                                                    scanned_broker, scanned_account), "OK")
+                                                                # 并入下拉框
+                                                                self._merge_scanned_brokers([scanned_broker])
+                                                                # 同步 UI 变量
+                                                                self.vars["broker"].set(scanned_broker)
+                                                                self.vars["account"].set(scanned_account)
+                                                            else:
+                                                                gui_log("  %s / %s 已在配置中" % (
+                                                                    scanned_broker, scanned_account), "INFO")
+                                                        else:
+                                                            gui_log("  未能从登录表单读取券商或账号", "WARN")
+                                                    else:
+                                                        gui_log("  找不到登录弹窗", "WARN")
+                                                finally:
+                                                    if panel:
+                                                        _mac_order._release_panel(panel)
+                                                    _mac_order._ax_free(win)
+                                    except Exception as _se:
+                                        gui_log("  扫描失败: %s" % _se, "WARN")
                 except Exception as e:
                     gui_log("  面板状态识别失败: %s" % e, "WARN")
             finally:
