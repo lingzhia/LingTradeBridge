@@ -2253,7 +2253,7 @@ class ControlPanel:
         ttk.Label(_hint, text="下拉列出预热时扫到的券商 + 已配置的券商; 选券商自动带出账号密码",
                   foreground=UI.TEXT_MUTED, font=(self._FONT_NAME, 8)).pack(side="left")
 
-        # ---- 券商下拉: 数据源 = 配置 accounts 里的 broker(去重) + 预热扫到的 ----
+        # ---- 券商下拉: 数据源 = 配置 accounts 里的 broker(去重) + 预热扫到的 + "新建账户..." ----
         self._card_hairline(g)
         a_broker = ttk.Frame(g); a_broker.pack(fill="x", pady=2)
         ttk.Label(a_broker, text="券商:", width=_LBL_W, anchor="w").pack(side="left")
@@ -2268,8 +2268,10 @@ class ControlPanel:
         _init_broker = _saved_broker if _saved_broker in _brokers_in_cfg else (
             _brokers_in_cfg[0] if _brokers_in_cfg else "")
         self.vars["broker"] = tk.StringVar(value=_init_broker)
+        # 下拉框数据源: 已配置的券商 + "新建账户..."选项
+        _broker_values = tuple(_brokers_in_cfg) + ("新建账户...",)
         self._broker_combo = ttk.Combobox(a_broker, textvariable=self.vars["broker"], width=12,
-                                          values=tuple(_brokers_in_cfg))
+                                          values=_broker_values)
         self._broker_combo.pack(side="right", padx=(4, 2))
 
         self._card_hairline(g)
@@ -2298,6 +2300,13 @@ class ControlPanel:
             if "account" not in self.vars or "trade_password" not in self.vars:
                 return  # 初始化期 account/pwd 还没创建
             b = self.vars["broker"].get().strip()
+            # 如果选择了"新建账户...", 清空输入框让用户填写新信息
+            if b == "新建账户...":
+                if self.vars["account"].get() != "":
+                    self.vars["account"].set("")
+                if self.vars["trade_password"].get() != "":
+                    self.vars["trade_password"].set("")
+                return
             info = self._lookup_account(b, self.cfg.get("accounts") or [])
             new_acct = info.get("account", "")
             new_pwd = info.get("trade_password", "")
@@ -2321,6 +2330,7 @@ class ControlPanel:
 
         只在 UI 已经建好(_broker_combo 存在)时生效; 没建好就跳过。
         不修改配置, 只改下拉框的 values; 用户真要保存新券商得手动输一遍或选完填好再保存。
+        始终在末尾保留"新建账户..."选项。
         """
         combo = getattr(self, "_broker_combo", None)
         if combo is None:
@@ -2329,11 +2339,14 @@ class ControlPanel:
             cur = list(combo.cget("values") or [])
         except Exception:
             cur = []
-        merged = list(cur)
+        # 移除旧的"新建账户..."选项(如果有)
+        merged = [b for b in cur if b != "新建账户..."]
         for b in scanned or []:
             b = (b or "").strip()
             if b and b not in merged:
                 merged.append(b)
+        # 始终在末尾添加"新建账户..."选项
+        merged.append("新建账户...")
         try:
             combo.configure(values=tuple(merged))
         except Exception:
@@ -2435,8 +2448,9 @@ class ControlPanel:
             _prev_accts.insert(0, {"broker": _old_b, "account": _old_a,
                                    "trade_password": _old_p})
         # 当前选中的 broker: 在 accounts 里更新/插入一条
+        # 如果选择的是"新建账户...", 则不保存(需要用户先输入券商名称)
         _updated = False
-        if _cur_broker:
+        if _cur_broker and _cur_broker != "新建账户...":
             for a in _prev_accts:
                 if (a.get("broker") or "").strip() == _cur_broker:
                     a["account"] = _cur_acct
@@ -2447,7 +2461,7 @@ class ControlPanel:
                 _prev_accts.append({"broker": _cur_broker, "account": _cur_acct,
                                     "trade_password": _cur_pwd})
         cfg["accounts"] = _prev_accts
-        cfg["broker"] = _cur_broker        # 保留作"上次选中的券商"标记
+        cfg["broker"] = _cur_broker if _cur_broker != "新建账户..." else ""  # 保留作"上次选中的券商"标记
         cfg["account"] = ""                # 旧字段不再使用, 清空
         cfg["trade_password"] = ""
         cfg["key_delay"] = float(self.vars["key_delay"].get().strip())
