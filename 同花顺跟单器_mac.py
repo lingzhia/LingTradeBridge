@@ -1643,16 +1643,6 @@ class ControlPanel:
                                         "(或在同花顺里手动登录)", "WARN")
                                 # 没有账户可试, 跳过自动登录流程
                             else:
-                                # 先扫一下登录表单里有哪些券商可用(占位, 等 dump 后实现)
-                                try:
-                                    avail = self.order_executor._scan_login_brokers()
-                                    if avail:
-                                        gui_log("  登录表单可用券商: %s" % ", ".join(avail), "INFO")
-                                        # 把扫到的券商并入下拉框数据源(去重)
-                                        self._merge_scanned_brokers(avail)
-                                except Exception as _se:
-                                    gui_log("  扫描可用券商失败: %s" % _se, "WARN")
-                                    avail = []
                                 # 依次尝试每个账户
                                 for idx, acc in enumerate(accounts, 1):
                                     b = (acc.get("broker") or "").strip()
@@ -1677,6 +1667,16 @@ class ControlPanel:
                                                     idx, len(accounts), b), "OK")
                                         # 把"当前选中"同步到这个 broker
                                         self.cfg["broker"] = b
+                                        # 表单填完后登录弹窗已打开, 此时扫描可用券商并并入下拉框
+                                        try:
+                                            avail = self.order_executor._scan_login_brokers()
+                                            if avail:
+                                                gui_log("  登录表单可用券商: %s" % ", ".join(avail), "INFO")
+                                                self._merge_scanned_brokers(avail)
+                                        except Exception as _se:
+                                            gui_log("  扫描可用券商失败: %s" % _se, "WARN")
+                                        # 至少把当前 broker 加进去(如果还不在的话)
+                                        self._merge_scanned_brokers([b])
                                         break
                                     else:
                                         gui_log("  [%d/%d] %s 表单填入失败" % (
