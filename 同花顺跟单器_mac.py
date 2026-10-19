@@ -1427,6 +1427,7 @@ class ControlPanel:
         self._build_group_account(left) # ② 券商账户
         self._build_group_redis(left)   # ③ 信号源 · Redis
         self._build_group_params(left)  # ④ 跟单规则
+        self._build_group_activate(left) # ⑤ 定时激活
 
         # ===== 右列: 日志 400px / 买入 200px / 卖出 200px =====
         right = tk.Frame(content, bg=UI.BG)
@@ -1515,11 +1516,6 @@ class ControlPanel:
         self.log_text.tag_config("WARN", foreground=UI.LOG_WARN)
         self.log_text.tag_config("ERROR", foreground=UI.LOG_ERROR)
         self.log_text.tag_config("OK", foreground=UI.LOG_OK)
-
-        # --- Tab 2: 定时激活 (测试版新增) ---
-        tab_activate = tk.Frame(notebook, bg=UI.BG)
-        notebook.add(tab_activate, text=" 定时激活 ")
-        self._build_group_activate(tab_activate)
 
         # ---- 默认窗口高度: 严格贴合首页(跟单控制)实际所需 ----
         try:
@@ -2048,28 +2044,32 @@ class ControlPanel:
         return items
 
     def _build_group_activate(self, parent):
-        """④ 激活时间列表 + ⑤ 启用与执行: 多时间点自动窗口激活配置页。"""
-        self._card_caption(parent, "④ 激活时间列表")
-        card = RoundedCard(parent, pad=8)
+        """⑤ 定时激活: 多时间点自动窗口激活配置。"""
+        g = self._build_collapsible_card(parent, "⑤ 定时激活", initially_expanded=False)
+        
+        # 激活时间列表
+        self._card_caption(g, "激活时间列表")
+        card = RoundedCard(g, pad=8)
         card.pack(fill="x", padx=2, pady=(0, 8))
-        g = card.body
+        card_body = card.body
 
-        head = ttk.Frame(g); head.pack(fill="x", pady=(0, 2))
+        head = ttk.Frame(card_body); head.pack(fill="x", pady=(0, 2))
         ttk.Label(head, text="时间", width=8, anchor="w").pack(side="left", padx=(4, 0))
         ttk.Label(head, text="备注（可选）", width=16, anchor="w").pack(side="left", padx=4)
         ttk.Label(head, text="操作", width=12, anchor="w").pack(side="left", padx=4)
 
         self._act_rows = []
-        self._act_list_box = ttk.Frame(g)
+        self._act_list_box = ttk.Frame(card_body)
         self._act_list_box.pack(fill="x")
         for item in self._act_list_from_cfg():
             self._append_act_row(item["time"], item["note"])
-        RoundButton(g, text="+ 添加激活时间", kind="ghost", font=(self._FONT_NAME, 9),
+        RoundButton(card_body, text="+ 添加激活时间", kind="ghost", font=(self._FONT_NAME, 9),
                     height=26, radius=7, parent_bg=UI.SURFACE,
                     command=self._on_add_act_row).pack(fill="x", pady=(4, 0))
 
-        self._card_caption(parent, "⑤ 启用与执行")
-        card2 = RoundedCard(parent, pad=8)
+        # 启用与执行
+        self._card_caption(g, "启用与执行")
+        card2 = RoundedCard(g, pad=8)
         card2.pack(fill="x", padx=2, pady=(0, 8))
         g2 = card2.body
 
