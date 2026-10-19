@@ -67,15 +67,66 @@ if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "网页跟单配置.json")
-ORDER_RECORD_PATH = os.path.join(BASE_DIR, "已下单委托记录.json")
-LOG_DIR = os.path.join(BASE_DIR, "logs")          # 运行日志保存目录
+
+# 用户数据目录: 配置/运行数据都放在这里, 不污染项目目录
+# macOS: ~/.lingtradebridge/   Linux: ~/.lingtradebridge/   Windows: %USERPROFILE%/.lingtradebridge/
+USER_DATA_DIR = os.path.join(os.path.expanduser("~"), ".lingtradebridge")
+CONFIG_PATH = os.path.join(USER_DATA_DIR, "config.json")
+ORDER_RECORD_PATH = os.path.join(USER_DATA_DIR, "order_records.json")
+LOG_DIR = os.path.join(USER_DATA_DIR, "logs")
+_STATUS_PATH = os.path.join(USER_DATA_DIR, "status.json")
+
+# 旧版配置路径(项目根), 启动时一次性迁移到 USER_DATA_DIR 后不再使用
+_LEGACY_CONFIG_PATH = os.path.join(BASE_DIR, "网页跟单配置.json")
+_LEGACY_ORDER_RECORD_PATH = os.path.join(BASE_DIR, "已下单委托记录.json")
+_LEGACY_STATUS_PATH = os.path.join(BASE_DIR, "status.json")
 _LOG_LOCK = threading.Lock()                      # 日志文件写入锁
 _ORDER_LOCK = threading.Lock()                    # 去重记录写入锁
+
+
+def _migrate_user_data():
+    """把项目根下的旧配置文件一次性搬到 ~/.lingtradebridge/, 搬完保留 .bak 备份。
+
+    只在首次启动(新目录没有 config.json 且旧文件存在)时真正搬; 其它情况直接跳过。
+    失败也不挡启动 —— 最多就是用户得重新填一遍配置, 不会丢数据(旧文件保留)。
+
+    备份位置: ~/.lingtradebridge/legacy-backups/<原文件名>.bak
+    (不留在项目根, 免得污染 git status)
+    """
+    if not os.path.isdir(USER_DATA_DIR):
+        try:
+            os.makedirs(USER_DATA_DIR, exist_ok=True)
+        except Exception:
+            return
+    backup_dir = os.path.join(USER_DATA_DIR, "legacy-backups")
+    pairs = (
+        (_LEGACY_CONFIG_PATH, CONFIG_PATH),
+        (_LEGACY_ORDER_RECORD_PATH, ORDER_RECORD_PATH),
+        (_LEGACY_STATUS_PATH, _STATUS_PATH),
+    )
+    for src, dst in pairs:
+        if os.path.exists(dst) or not os.path.exists(src):
+            continue
+        try:
+            import shutil
+            shutil.copy2(src, dst)
+            # 把旧文件挪到备份目录(不删, 万一用户想回滚)
+            os.makedirs(backup_dir, exist_ok=True)
+            bak = os.path.join(backup_dir, os.path.basename(src) + ".bak")
+            if os.path.exists(bak):
+                os.remove(bak)
+            os.replace(src, bak)
+        except Exception:
+            # 搬不动就放着, 下次再试; 不抛异常挡启动
+            pass
 
 DEFAULT_CONFIG = {
     # macOS 版: 这里填「同花顺.app」的路径(Windows 版原来是 xiadan.exe)
     "ths_exe_path": "/Applications/同花顺.app",
+    # --- 券商账户(预热时若检测到未登录, 自动填入并点登录) ---
+    "broker": "",                       # 券商名(如 "华泰证券" / "中信证券"), 空=不自动登录
+    "account": "",                      # 资金账号
+    "trade_password": "",               # 交易密码(密码框, 界面掩码显示)
     "key_delay": 0.5,
     "window_title_keyword": "",
     "follow_ratio_buy": 1.0,     # 全局买入跟单比例
@@ -157,6 +208,7 @@ def _autodetect_ths_path():
 
 
 def load_config():
+    _migrate_user_data()
     cfg = dict(DEFAULT_CONFIG)
     cfg["ths_exe_path"] = _autodetect_ths_path()
     if os.path.exists(CONFIG_PATH):
@@ -193,6 +245,7 @@ def load_config():
 
 def save_config(cfg):
     try:
+        os.makedirs(USER_DATA_DIR, exist_ok=True)
         tmp = CONFIG_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -1577,7 +1630,28 @@ class ControlPanel:
                             acct = st.get("account") or "(未读到账号字段)"
                             gui_log("  已登录: %s" % acct, "OK")
                         else:
-                            gui_log("  未登录 A 股账号, 请先在同花顺里登录后再跟单", "WARN")
+                            # 未登录: 看配置里有没有填账户, 填了就自动尝试登录
+                            cfg = getattr(self, "cfg", {}) or {}
+                            broker = (cfg.get("broker") or "").strip()
+                            account = (cfg.get("account") or "").strip()
+                            password = cfg.get("trade_password") or ""
+                            if broker and account and password:
+                                gui_log("  未登录, 尝试用配置自动登录(%s / %s)..." % (
+                                    broker, account), "INFO")
+                                try:
+                                    ok_login = self.order_executor.try_auto_login(
+                                        broker=broker, account=account, password=password)
+                                except Exception as _le:
+                                    ok_login = False
+                                    gui_log("  自动登录异常: %s" % _le, "WARN")
+                                if ok_login:
+                                    gui_log("  自动登录成功", "OK")
+                                else:
+                                    gui_log("  自动登录失败(登录表单控件结构尚未识别, "
+                                            "请先在同花顺里手动登录)", "WARN")
+                            else:
+                                gui_log("  未登录 A 股账号, 请在界面「券商账户」里填写"
+                                        "券商/账号/密码, 或在同花顺里手动登录", "WARN")
                 except Exception as e:
                     gui_log("  面板状态识别失败: %s" % e, "WARN")
             finally:
@@ -1917,6 +1991,38 @@ class ControlPanel:
         self._src_combo.pack(side="right", padx=(4, 2))
         self._src_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_signal_source_ui())
 
+        # ================= 券商账户 (预热时若未登录, 自动填入并点登录) =================
+        acct_card = RoundedCard(g, pad=8)
+        acct_card.pack(fill="x", padx=2, pady=(0, 8))
+        acct_body = acct_card.body
+        self._card_hairline(acct_body)
+        _ahint = ttk.Frame(acct_body); _ahint.pack(fill="x", pady=(0, 2))
+        ttk.Label(_ahint, text="预热时若检测到 A 股未登录, 自动填入并点登录(空=不自动登录)",
+                  foreground=UI.TEXT_MUTED, font=(self._FONT_NAME, 8)).pack(side="left")
+
+        a_broker = ttk.Frame(acct_body); a_broker.pack(fill="x", pady=2)
+        ttk.Label(a_broker, text="券商:", width=_LBL_W, anchor="w").pack(side="left")
+        self.vars["broker"] = tk.StringVar(value=self.cfg.get("broker", ""))
+        # 常见券商预置, 但也允许手填(其它券商直接输即可)
+        _BROKERS = (
+            "", "华泰证券", "中信证券", "国泰君安", "招商证券", "广发证券",
+            "海通证券", "申万宏源", "银河证券", "国信证券", "东方证券",
+            "兴业证券", "长江证券", "中泰证券", "平安证券", "安信证券",
+        )
+        ttk.Combobox(a_broker, textvariable=self.vars["broker"], width=12,
+                     values=_BROKERS).pack(side="right", padx=(4, 2))
+
+        a_acct = ttk.Frame(acct_body); a_acct.pack(fill="x", pady=2)
+        ttk.Label(a_acct, text="资金账号:", width=_LBL_W, anchor="w").pack(side="left")
+        self.vars["account"] = tk.StringVar(value=self.cfg.get("account", ""))
+        ttk.Entry(a_acct, textvariable=self.vars["account"], width=12).pack(side="right", padx=(4, 2))
+
+        a_pwd = ttk.Frame(acct_body); a_pwd.pack(fill="x", pady=2)
+        ttk.Label(a_pwd, text="交易密码:", width=_LBL_W, anchor="w").pack(side="left")
+        self.vars["trade_password"] = tk.StringVar(value=self.cfg.get("trade_password", ""))
+        ttk.Entry(a_pwd, textvariable=self.vars["trade_password"], width=12,
+                  show="●").pack(side="right", padx=(4, 2))
+
         # ================= HTTP 配置区 (选 HTTP / HTTP+Redis 时展开) =================
         self._http_box = ttk.Frame(g)
         self._card_hairline(self._http_box)
@@ -2073,6 +2179,11 @@ class ControlPanel:
     def _collect_config(self):
         cfg = {}
         cfg["ths_exe_path"] = self.vars["ths_exe_path"].get().strip()
+        # --- 券商账户(预热自动登录用) ---
+        cfg["broker"] = self.vars["broker"].get().strip()
+        cfg["account"] = self.vars["account"].get().strip()
+        # 密码框用 show="●" 掩码显示, 但 StringVar 里存的仍是真实值, 直接取即可
+        cfg["trade_password"] = self.vars["trade_password"].get()
         cfg["key_delay"] = float(self.vars["key_delay"].get().strip())
         cfg["window_title_keyword"] = self.vars["window_title_keyword"].get().strip()
         cfg["follow_ratio_buy"] = float(self.vars["follow_ratio_buy"].get().strip())
@@ -2690,9 +2801,6 @@ def _cleanup_old_logs(keep_days=30):
             print("已清理 %d 个超过 %d 天的日志文件" % (removed, keep_days))
     except Exception:
         pass
-
-
-_STATUS_PATH = os.path.join(BASE_DIR, "status.json")
 
 
 def _write_status(**kwargs):

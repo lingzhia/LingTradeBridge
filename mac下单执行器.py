@@ -1114,6 +1114,51 @@ class KeyOrderExecutor:
         # 从窗口根遍历, 找页签 / 登录按钮 / 账号文本
         return _detect_panel_state_in_window(win)
 
+    def try_auto_login(self, broker, account, password):
+        """A 股未登录时, 用配置里的账户信息自动登录。
+
+        流程:
+          1. 点"立即登录"按钮(实测同花顺在未登录面板上会显示这个按钮)
+          2. 等待登录表单出现(弹窗或页面切换)
+          3. 识别券商/账号/密码输入框并填入
+          4. 点"登录"按钮提交
+
+        ⚠️ 当前状态: 步骤 1 已实现, 步骤 2-4 需要先 dump 登录表单的真实控件结构
+           才能写识别逻辑(不同券商的登录表单可能不一样)。所以目前填完配置后
+           点预热会提示"自动登录失败, 请手动登录", 等 dump 完再补。
+
+        返回 True 表示登录成功, False 表示失败(调用方应提示用户手动登录)。
+        """
+        if not (broker and account and password):
+            _log("自动登录: 账户信息不全, 跳过", "WARN")
+            return False
+        pid = self.ths_hwnd or _find_ths_pid(self._app_name())
+        if pid is None:
+            _log("自动登录: 找不到同花顺进程", "ERROR")
+            return False
+        # 第一步: 点"立即登录"按钮(实测在窗口根下, AXButton, title='立即登录')
+        panel, win, why = _locate_panel(pid)
+        if win is None:
+            _log("自动登录: 找不到同花顺窗口 - %s" % why, "ERROR")
+            return False
+        try:
+            login_btn = _find_button(win, "立即登录")
+            if login_btn is None:
+                # 可能已经在登录页了, 或者按钮标题不一样
+                _log("自动登录: 找不到「立即登录」按钮(可能已在登录页或标题不同)", "WARN")
+                return False
+            try:
+                _ax_press(login_btn)
+            finally:
+                _ax_free(login_btn)
+            # 第二步-第四步: 等登录表单出现并填入 —— 占位, 等 dump 后实现
+            _log("自动登录: 已点击「立即登录」, 等待登录表单识别逻辑补全", "WARN")
+            return False
+        finally:
+            if panel:
+                _release_panel(panel)
+            _ax_free(win)
+
     # ------------------------------------------------------------------
     # 下单主流程
     # ------------------------------------------------------------------
