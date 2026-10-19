@@ -1207,10 +1207,11 @@ class KeyOrderExecutor:
         流程:
           1. 若面板上还有「立即登录」按钮, 先点一下进入登录页
           2. 等登录表单(AXSheet 弹窗)出现
-          3. 调用 _fill_login_form() 填入券商/账号/密码
-          4. 提示用户手输验证码并点登录(验证码无法自动识别)
+          3. 调用 _fill_login_form() 填入券商/账号/密码/验证码
+          4. 点「登录」按钮提交
+          5. 等待登录结果
 
-        返回 True 表示表单已填好(等用户补验证码+点登录), False 表示失败。
+        返回 True 表示登录成功, False 表示失败。
         """
         if not (broker and account and password):
             _log("自动登录: 账户信息不全, 跳过", "WARN")
@@ -1233,12 +1234,29 @@ class KeyOrderExecutor:
                     _ax_free(login_entry_btn)
                 # 等登录表单弹窗出现
                 time.sleep(0.5)
-            # 第二步: 填入表单(券商/账号/密码, 验证码留空)
+            # 第二步: 填入表单(券商/账号/密码/验证码)
             if not self._fill_login_form(win, broker, account, password):
-                _log("自动登录: 表单填入失败, 请手动登录", "WARN")
+                _log("自动登录: 表单填入失败(验证码识别失败或控件未找到), 请手动登录", "WARN")
                 return False
-            _log("自动登录: 已填入券商/账号/密码, 请在同花顺弹窗里手输验证码并点「登录」", "INFO")
-            return True
+            # 第三步: 点「登录」按钮提交
+            time.sleep(0.3)
+            submit_btn = _find_button(win, "登录")
+            if submit_btn is None:
+                _log("自动登录: 找不到「登录」提交按钮", "WARN")
+                return False
+            try:
+                _ax_press(submit_btn)
+            finally:
+                _ax_free(submit_btn)
+            # 第四步: 等待登录结果
+            time.sleep(1.5)
+            st = _detect_panel_state_in_window(win)
+            if st.get("logged_in"):
+                _log("自动登录: 登录成功", "OK")
+                return True
+            else:
+                _log("自动登录: 登录失败(验证码错误或账号密码错误), 请手动登录", "WARN")
+                return False
         finally:
             if panel:
                 _release_panel(panel)
@@ -1323,8 +1341,45 @@ class KeyOrderExecutor:
         if not ok_pwd:
             _log("登录表单: 找不到「交易密码」输入框", "WARN")
             return False
-        _log("登录表单: 已填入券商=%s 账号=%s 密码=*** (验证码请手输)" % (
-            broker, account), "OK")
+        # 4. 验证码: 找到验证码数字(多个 StaticText)→ 拼接 → 填入
+        ok_captcha = False
+        captcha_text = ""
+        # 找验证码输入框和数字
+        captcha_tf = None
+        captcha_digits = []
+        for el in _ax_elements(sheet):
+            role = _ax_text(el, "AXRole")
+            val = _ax_text(el, "AXValue")
+            x, y, w, h = _ax_pos(el)
+            # 验证码输入框(同行有"验证码"标签, y 坐标在 560-570 之间)
+            if role == "AXTextField" and 560 <= y <= 570 and w < 100:
+                _CF.CFRetain(el)
+                captcha_tf = el
+            # 验证码数字(StaticText, 值为单个数字, y 坐标在 560-570 之间, x>1100)
+            elif role == "AXStaticText" and 560 <= y <= 570 and x > 1100 and val and len(val) == 1 and val.isdigit():
+                captcha_digits.append((x, val))
+        
+        if captcha_tf and captcha_digits:
+            try:
+                # 按 x 坐标排序, 拼接数字
+                captcha_digits.sort(key=lambda p: p[0])
+                captcha_text = "".join(d[1] for d in captcha_digits)
+                _log("验证码识别结果: %s" % captcha_text, "INFO")
+                ok_captcha = _set_textfield(captcha_tf, captcha_text)
+            finally:
+                _ax_free(captcha_tf)
+        else:
+            if captcha_tf:
+                _ax_free(captcha_tf)
+            _log("找不到验证码输入框或数字", "WARN")
+        
+        if not ok_captcha:
+            _log("验证码填入失败, 请手输验证码后点登录", "WARN")
+            _log("登录表单: 已填入券商=%s 账号=%s 密码=***" % (broker, account), "OK")
+            return False
+        
+        _log("登录表单: 已填入券商=%s 账号=%s 密码=*** 验证码=%s" % (
+            broker, account, captcha_text), "OK")
         return True
 
     # ------------------------------------------------------------------
