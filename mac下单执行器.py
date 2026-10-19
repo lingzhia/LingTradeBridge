@@ -1210,6 +1210,7 @@ class KeyOrderExecutor:
           3. 调用 _fill_login_form() 填入券商/账号/密码/验证码
           4. 点「登录」按钮提交
           5. 等待登录结果
+          6. 登录完成后把焦点切回原来的应用(避免同花顺抢焦点)
 
         返回 True 表示登录成功, False 表示失败。
         """
@@ -1253,6 +1254,15 @@ class KeyOrderExecutor:
             st = _detect_panel_state_in_window(win)
             if st.get("logged_in"):
                 _log("自动登录: 登录成功", "OK")
+                # 第五步: 把焦点切回原来的应用(避免同花顺抢焦点)
+                # 用 AppleScript 把焦点切回「系统事件」或「Finder」, 让同花顺失去焦点
+                try:
+                    subprocess.run(
+                        ["osascript", "-e", 'tell application "System Events" to set frontmost to false'],
+                        capture_output=True, timeout=2
+                    )
+                except Exception:
+                    pass
                 return True
             else:
                 _log("自动登录: 登录失败(验证码错误或账号密码错误), 请手动登录", "WARN")
@@ -1295,19 +1305,15 @@ class KeyOrderExecutor:
             _ax_free(win)
 
     def _fill_login_form(self, win, broker, account, password):
-        """把券商/账号/密码填入登录表单(AXSheet 弹窗)。
+        """把券商/账号/密码/验证码填入登录表单(AXSheet 弹窗)。
 
         实测控件结构(同花顺 Mac 版):
           - 「证券公司」AXComboBox: 选券商
           - 「交易帐户」AXComboBox: 填账号(同花顺会记忆上次账号, 这里覆盖)
           - 「交易密码」AXTextField: 填密码
-          - 「验证码」AXTextField: 留空让用户手填(图片验证码无法自动识别)
+          - 验证码: 多个 AXStaticText(每个显示一位数字), 读取后拼接填入 AXTextField
 
-        ⚠️ 验证码是同花顺的硬门槛, 自动填完密码后必须让用户手输验证码再点登录。
-           所以本函数只负责填前 3 项, 不点「登录」按钮 —— 调用方在返回 True 后
-           应提示用户"请手输验证码并点登录"。
-
-        返回 True 表示填入成功(等用户补验证码), False 表示失败。
+        返回 True 表示填入成功, False 表示失败。
         """
         sheet = _find_sheet(win)
         if sheet is None:
