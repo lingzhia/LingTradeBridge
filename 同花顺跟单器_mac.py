@@ -221,8 +221,10 @@ def load_processed_orders():
                     seen.add(uid)
                 deduped.append(r)
             if len(deduped) < len(records):
-                with open(ORDER_RECORD_PATH, "w", encoding="utf-8") as f:
+                tmp = ORDER_RECORD_PATH + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(deduped, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, ORDER_RECORD_PATH)
             uids = {r.get("uid") for r in deduped if r.get("uid")}
             return uids, deduped
     except Exception as e:
@@ -238,8 +240,10 @@ def append_processed_order(record):
         if new_uid and any(r.get("uid") == new_uid for r in records):
             return
         records.append(record)
-        with open(ORDER_RECORD_PATH, "w", encoding="utf-8") as f:
+        tmp = ORDER_RECORD_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(records, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, ORDER_RECORD_PATH)
     except Exception as e:
         print("保存已下单记录失败: %s" % e)
 

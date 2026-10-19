@@ -49,8 +49,10 @@ class PositionManager:
     
     def save(self):
         try:
-            with open(self.path, "w", encoding="utf-8") as f:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.path)
         except Exception as e:
             print("保存仓位数据失败: %s" % e)
 
