@@ -1238,12 +1238,28 @@ class KeyOrderExecutor:
             # 第二步: 填入表单(券商/账号/密码/验证码)
             if not self._fill_login_form(win, broker, account, password):
                 _log("自动登录: 表单填入失败(验证码识别失败或控件未找到), 请手动登录", "WARN")
+                # 填入失败后也关闭登录弹窗
+                cancel_btn = _find_button(win, "取消")
+                if cancel_btn is not None:
+                    try:
+                        _ax_press(cancel_btn)
+                        time.sleep(0.3)
+                    finally:
+                        _ax_free(cancel_btn)
                 return False
             # 第三步: 点「登录」按钮提交
             time.sleep(0.3)
             submit_btn = _find_button(win, "登录")
             if submit_btn is None:
                 _log("自动登录: 找不到「登录」提交按钮", "WARN")
+                # 找不到登录按钮也关闭弹窗
+                cancel_btn = _find_button(win, "取消")
+                if cancel_btn is not None:
+                    try:
+                        _ax_press(cancel_btn)
+                        time.sleep(0.3)
+                    finally:
+                        _ax_free(cancel_btn)
                 return False
             try:
                 _ax_press(submit_btn)
@@ -1266,6 +1282,15 @@ class KeyOrderExecutor:
                 return True
             else:
                 _log("自动登录: 登录失败(验证码错误或账号密码错误), 请手动登录", "WARN")
+                # 登录失败后主动点「取消」关闭登录弹窗
+                cancel_btn = _find_button(win, "取消")
+                if cancel_btn is not None:
+                    try:
+                        _ax_press(cancel_btn)
+                        time.sleep(0.3)
+                        _log("已关闭登录弹窗", "INFO")
+                    finally:
+                        _ax_free(cancel_btn)
                 return False
         finally:
             if panel:
