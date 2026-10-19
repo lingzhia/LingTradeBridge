@@ -124,9 +124,13 @@ DEFAULT_CONFIG = {
     # macOS 版: 这里填「同花顺.app」的路径(Windows 版原来是 xiadan.exe)
     "ths_exe_path": "/Applications/同花顺.app",
     # --- 券商账户(预热时若检测到未登录, 自动填入并点登录) ---
-    "broker": "",                       # 券商名(如 "华泰证券" / "中信证券"), 空=不自动登录
-    "account": "",                      # 资金账号
-    "trade_password": "",               # 交易密码(密码框, 界面掩码显示)
+    # 多账户: 每个账户 {broker, account, trade_password}。UI 的「券商」下拉框
+    # 列出这里所有的 broker, 选中后自动带出对应的 account / trade_password。
+    # 旧字段 broker/account/trade_password 仍兼容(首次启动时自动迁移到 accounts[0])。
+    "accounts": [],
+    "broker": "",                       # 兼容旧版: 默认选中的券商(迁移后保留作"上次选中")
+    "account": "",                      # 兼容旧版
+    "trade_password": "",               # 兼容旧版
     "key_delay": 0.5,
     "window_title_keyword": "",
     "follow_ratio_buy": 1.0,     # 全局买入跟单比例
@@ -1420,8 +1424,9 @@ class ControlPanel:
                                    text="🔒 跟单运行中，左侧配置已锁定（点[停止跟单]后可修改）")
 
         self._build_group_ths(left)     # ① 同花顺客户端
-        self._build_group_redis(left)   # ② 信号源 · Redis
-        self._build_group_params(left)  # ③ 跟单规则
+        self._build_group_account(left) # ② 券商账户
+        self._build_group_redis(left)   # ③ 信号源 · Redis
+        self._build_group_params(left)  # ④ 跟单规则
 
         # ===== 右列: 日志 400px / 买入 200px / 卖出 200px =====
         right = tk.Frame(content, bg=UI.BG)
@@ -1630,28 +1635,55 @@ class ControlPanel:
                             acct = st.get("account") or "(未读到账号字段)"
                             gui_log("  已登录: %s" % acct, "OK")
                         else:
-                            # 未登录: 看配置里有没有填账户, 填了就自动尝试登录
+                            # 未登录: 遍历 accounts 数组, 依次尝试自动登录
                             cfg = getattr(self, "cfg", {}) or {}
-                            broker = (cfg.get("broker") or "").strip()
-                            account = (cfg.get("account") or "").strip()
-                            password = cfg.get("trade_password") or ""
-                            if broker and account and password:
-                                gui_log("  未登录, 尝试用配置自动登录(%s / %s)..." % (
-                                    broker, account), "INFO")
-                                try:
-                                    ok_login = self.order_executor.try_auto_login(
-                                        broker=broker, account=account, password=password)
-                                except Exception as _le:
-                                    ok_login = False
-                                    gui_log("  自动登录异常: %s" % _le, "WARN")
-                                if ok_login:
-                                    gui_log("  自动登录成功", "OK")
-                                else:
-                                    gui_log("  自动登录失败(登录表单控件结构尚未识别, "
-                                            "请先在同花顺里手动登录)", "WARN")
+                            accounts = cfg.get("accounts") or []
+                            if not accounts:
+                                gui_log("  未登录 A 股账号, 请在「券商账户」里添加账户"
+                                        "(或在同花顺里手动登录)", "WARN")
+                                # 没有账户可试, 跳过自动登录流程
                             else:
-                                gui_log("  未登录 A 股账号, 请在界面「券商账户」里填写"
-                                        "券商/账号/密码, 或在同花顺里手动登录", "WARN")
+                                # 先扫一下登录表单里有哪些券商可用(占位, 等 dump 后实现)
+                                try:
+                                    avail = self.order_executor._scan_login_brokers()
+                                    if avail:
+                                        gui_log("  登录表单可用券商: %s" % ", ".join(avail), "INFO")
+                                        # 把扫到的券商并入下拉框数据源(去重)
+                                        self._merge_scanned_brokers(avail)
+                                except Exception as _se:
+                                    gui_log("  扫描可用券商失败: %s" % _se, "WARN")
+                                    avail = []
+                                # 依次尝试每个账户
+                                any_success = False
+                                for idx, acc in enumerate(accounts, 1):
+                                    b = (acc.get("broker") or "").strip()
+                                    a = (acc.get("account") or "").strip()
+                                    p = acc.get("trade_password") or ""
+                                    if not (b and a and p):
+                                        gui_log("  [%d/%d] %s: 账户信息不全, 跳过" % (
+                                            idx, len(accounts), b or "(未填券商)"), "WARN")
+                                        continue
+                                    gui_log("  [%d/%d] 尝试登录 %s / %s ..." % (
+                                        idx, len(accounts), b, a), "INFO")
+                                    try:
+                                        ok = self.order_executor.try_auto_login(
+                                            broker=b, account=a, password=p)
+                                    except Exception as _le:
+                                        ok = False
+                                        gui_log("  [%d/%d] %s 登录异常: %s" % (
+                                            idx, len(accounts), b, _le), "WARN")
+                                    if ok:
+                                        gui_log("  [%d/%d] %s 登录成功" % (idx, len(accounts), b), "OK")
+                                        # 把"当前选中"同步到这个成功的 broker, 下次打开还在
+                                        self.cfg["broker"] = b
+                                        any_success = True
+                                        break
+                                    else:
+                                        gui_log("  [%d/%d] %s 登录失败" % (
+                                            idx, len(accounts), b), "WARN")
+                                if not any_success:
+                                    gui_log("  所有配置的账户都登录失败, 请在同花顺里手动登录",
+                                            "WARN")
                 except Exception as e:
                     gui_log("  面板状态识别失败: %s" % e, "WARN")
             finally:
@@ -1674,15 +1706,94 @@ class ControlPanel:
         tk.Label(parent, text=text, fg=UI.TEXT_MUTED, bg=UI.BG,
                  font=self._font_medium).pack(anchor="w", padx=6, pady=(2, 1))
 
+    # ---- 可折叠分组 ----
+    # 左侧 4 个配置区(同花顺/账户/信号源/规则)默认只展开第 1 个, 点标题切换。
+    # 实现: 外层 container 装"可点击标题行 + 卡片 body", 折叠时 body.pack_forget()。
+
+    def _toggle_collapsible(self, container):
+        """点标题: 切换这一组的展开/折叠"""
+        body = container._collapsible_body
+        arrow = container._collapsible_arrow
+        if body.winfo_ismapped():
+            body.pack_forget()
+            arrow.configure(text="▶")
+        else:
+            # 插回标题行下面(保持顺序: 标题 → body)
+            body.pack(fill="x", after=container._collapsible_header)
+            arrow.configure(text="▼")
+
+    def _collapse_all_except(self, keep_title):
+        """折叠所有分组, 只保留 keep_title 那一组展开"""
+        for title, container in self._collapsibles.items():
+            body = container._collapsible_body
+            arrow = container._collapsible_arrow
+            if title == keep_title:
+                if not body.winfo_ismapped():
+                    body.pack(fill="x", after=container._collapsible_header)
+                    arrow.configure(text="▼")
+            else:
+                if body.winfo_ismapped():
+                    body.pack_forget()
+                    arrow.configure(text="▶")
+
+    def _build_collapsible_card(self, parent, title, initially_expanded=True,
+                                header_setup=None):
+        """可折叠分组: 可点击标题行 + 卡片 body。返回 card.body(和原来 RoundedCard 用法一致)。
+
+        header_setup: 可选回调 (header_frame) -> None, 在标题文字 pack 完之后调用,
+            用来往标题行里加额外控件(比如「信号源」的小眼睛)。
+        外部间距由内部 RoundedCard 自己负责(padx=2, pady=(0,8)), 和原来非折叠版本一致。
+        """
+        # container 只作逻辑容器, 不加外边距(避免和 card 自己的边距叠加)
+        container = tk.Frame(parent, bg=UI.BG)
+        container.pack(fill="x")
+
+        header = tk.Frame(container, bg=UI.BG, cursor="hand2")
+        header.pack(fill="x", padx=6, pady=(2, 1))
+        container._collapsible_header = header
+
+        arrow = tk.Label(header, text="▼" if initially_expanded else "▶",
+                         fg=UI.TEXT_MUTED, bg=UI.BG, font=self._font_medium, width=2)
+        arrow.pack(side="left", padx=(4, 0))
+        container._collapsible_arrow = arrow
+
+        title_label = tk.Label(header, text=title, fg=UI.TEXT_MUTED, bg=UI.BG,
+                               font=self._font_medium)
+        title_label.pack(side="left", padx=2)
+
+        # 调用方在标题行加额外控件(眼睛按钮之类)
+        if header_setup is not None:
+            try:
+                header_setup(header)
+            except Exception:
+                pass
+
+        # 内部 card 保留原来的外边距参数, 视觉和折叠前完全一致
+        card = RoundedCard(container, pad=8)
+        card.pack(fill="x", padx=2, pady=(0, 8))
+        g = card.body
+
+        container._collapsible_body = card
+        if not initially_expanded:
+            card.pack_forget()
+
+        # 标题行点击(箭头 + 标题文字 + 标题行空白处)都触发切换
+        _toggle = lambda e, c=container: self._toggle_collapsible(c)
+        for w in (header, arrow, title_label):
+            w.bind("<Button-1>", _toggle)
+
+        # 登记到全局表, 方便 _collapse_all_except 遍历
+        if not hasattr(self, "_collapsibles"):
+            self._collapsibles = {}
+        self._collapsibles[title] = container
+        return g
+
     def _card_hairline(self, parent):
         """卡片内细分隔线 (iOS 分组行分隔)。"""
         tk.Frame(parent, bg=UI.HAIRLINE, height=1).pack(fill="x", padx=6, pady=3)
 
     def _build_group_ths(self, parent):
-        self._card_caption(parent, "① 同花顺客户端")
-        card = RoundedCard(parent, pad=8)
-        card.pack(fill="x", padx=2, pady=(0, 8))
-        g = card.body
+        g = self._build_collapsible_card(parent, "① 同花顺客户端", initially_expanded=True)
 
         row = ttk.Frame(g); row.pack(fill="x", pady=2)
         ttk.Label(row, text="同花顺程序:", width=12, anchor="w").pack(side="left")
@@ -1726,10 +1837,7 @@ class ControlPanel:
         gui_log("已选择同花顺程序: %s" % p)
 
     def _build_group_params(self, parent):
-        self._card_caption(parent, "③ 跟单规则")
-        card = RoundedCard(parent, pad=8)
-        card.pack(fill="x", padx=2, pady=(0, 8))
-        g = card.body
+        g = self._build_collapsible_card(parent, "④ 跟单规则", initially_expanded=False)
 
         # 三行纵向排版: 文字左对齐, 填写框顶到右边
         # 每行 = 一个 Frame, 左边放左对齐标签, 右边放填写框(side="right" 让它贴右边)
@@ -1955,25 +2063,23 @@ class ControlPanel:
             gui_log("若提示辅助功能权限问题, 请到「系统设置 -> 隐私与安全性 -> 辅助功能」授权", "INFO")
 
     def _build_group_redis(self, parent):
-        # ② 信号源 标题行: 左边标题, 右边放小眼睛(脱敏 Redis 地址/端口用)
-        # 注意: 必须用 tk.Frame 并指定 bg=UI.BG —— ttk.Frame 不接受 bg 参数,
-        # 会露出主题默认的白色, 让这一行和周围的灰底不一致
-        caption_row = tk.Frame(parent, bg=UI.BG)
-        caption_row.pack(fill="x", padx=6, pady=(2, 1))
-        tk.Label(caption_row, text="② 信号源", fg=UI.TEXT_MUTED, bg=UI.BG,
-                 font=self._font_medium).pack(side="left")
+        # ③ 信号源: 标题行右边带小眼睛(脱敏 Redis 地址/端口用)
         self._redis_hidden = False
-        # 用 tk.Button 并指定与标题完全一致的底纹/文字色(UI.BG + UI.TEXT_MUTED),
-        # 让眼睛按钮和标题看起来像一体。这里先不 pack —— 由
-        # _apply_signal_source_ui() 按当前信号源决定要不要露出来
-        self.btn_redis_eye = tk.Button(caption_row, text="👁", width=2,
-                                       command=self._toggle_redis_masked,
-                                       bg=UI.BG, fg=UI.TEXT_MUTED,
-                                       activebackground=UI.BG, activeforeground=UI.TEXT_MUTED,
-                                       bd=0, relief="flat", highlightthickness=0, pady=0)
-        card = RoundedCard(parent, pad=8)
-        card.pack(fill="x", padx=2, pady=(0, 8))
-        g = card.body
+
+        def _setup_signal_header(header):
+            # 用 tk.Button 并指定与标题完全一致的底纹/文字色(UI.BG + UI.TEXT_MUTED),
+            # 让眼睛按钮和标题看起来像一体。这里先不 pack —— 由
+            # _apply_signal_source_ui() 按当前信号源决定要不要露出来
+            self.btn_redis_eye = tk.Button(header, text="👁", width=2,
+                                           command=self._toggle_redis_masked,
+                                           bg=UI.BG, fg=UI.TEXT_MUTED,
+                                           activebackground=UI.BG, activeforeground=UI.TEXT_MUTED,
+                                           bd=0, relief="flat", highlightthickness=0, pady=0)
+            # 点眼睛只触发脱敏切换, 不触发折叠(避免和父级 Button-1 冲突)
+            self.btn_redis_eye.bind("<Button-1>", lambda e: "break")
+
+        g = self._build_collapsible_card(parent, "③ 信号源", initially_expanded=False,
+                                         header_setup=_setup_signal_header)
 
         # 下面每个配置区都用统一的标签宽度, 文字起点才会对齐
         _LBL_W = 14
@@ -1990,38 +2096,6 @@ class ControlPanel:
                                        values=tuple(self._src_labels.values()))
         self._src_combo.pack(side="right", padx=(4, 2))
         self._src_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_signal_source_ui())
-
-        # ================= 券商账户 (预热时若未登录, 自动填入并点登录) =================
-        acct_card = RoundedCard(g, pad=8)
-        acct_card.pack(fill="x", padx=2, pady=(0, 8))
-        acct_body = acct_card.body
-        self._card_hairline(acct_body)
-        _ahint = ttk.Frame(acct_body); _ahint.pack(fill="x", pady=(0, 2))
-        ttk.Label(_ahint, text="预热时若检测到 A 股未登录, 自动填入并点登录(空=不自动登录)",
-                  foreground=UI.TEXT_MUTED, font=(self._FONT_NAME, 8)).pack(side="left")
-
-        a_broker = ttk.Frame(acct_body); a_broker.pack(fill="x", pady=2)
-        ttk.Label(a_broker, text="券商:", width=_LBL_W, anchor="w").pack(side="left")
-        self.vars["broker"] = tk.StringVar(value=self.cfg.get("broker", ""))
-        # 常见券商预置, 但也允许手填(其它券商直接输即可)
-        _BROKERS = (
-            "", "华泰证券", "中信证券", "国泰君安", "招商证券", "广发证券",
-            "海通证券", "申万宏源", "银河证券", "国信证券", "东方证券",
-            "兴业证券", "长江证券", "中泰证券", "平安证券", "安信证券",
-        )
-        ttk.Combobox(a_broker, textvariable=self.vars["broker"], width=12,
-                     values=_BROKERS).pack(side="right", padx=(4, 2))
-
-        a_acct = ttk.Frame(acct_body); a_acct.pack(fill="x", pady=2)
-        ttk.Label(a_acct, text="资金账号:", width=_LBL_W, anchor="w").pack(side="left")
-        self.vars["account"] = tk.StringVar(value=self.cfg.get("account", ""))
-        ttk.Entry(a_acct, textvariable=self.vars["account"], width=12).pack(side="right", padx=(4, 2))
-
-        a_pwd = ttk.Frame(acct_body); a_pwd.pack(fill="x", pady=2)
-        ttk.Label(a_pwd, text="交易密码:", width=_LBL_W, anchor="w").pack(side="left")
-        self.vars["trade_password"] = tk.StringVar(value=self.cfg.get("trade_password", ""))
-        ttk.Entry(a_pwd, textvariable=self.vars["trade_password"], width=12,
-                  show="●").pack(side="right", padx=(4, 2))
 
         # ================= HTTP 配置区 (选 HTTP / HTTP+Redis 时展开) =================
         self._http_box = ttk.Frame(g)
@@ -2102,6 +2176,101 @@ class ControlPanel:
         # 按配置里已保存的信号源决定初始展开哪一块(默认 http)
         self._apply_signal_source_ui()
 
+    def _build_group_account(self, parent):
+        # ② 券商账户: 预热时若检测到 A 股未登录, 用这里填的账户自动尝试登录。
+        g = self._build_collapsible_card(parent, "② 券商账户", initially_expanded=False)
+
+        _LBL_W = 14
+        _hint = ttk.Frame(g); _hint.pack(fill="x", pady=(0, 2))
+        ttk.Label(_hint, text="下拉列出预热时扫到的券商 + 已配置的券商; 选券商自动带出账号密码",
+                  foreground=UI.TEXT_MUTED, font=(self._FONT_NAME, 8)).pack(side="left")
+
+        # ---- 券商下拉: 数据源 = 配置 accounts 里的 broker(去重) + 预热扫到的 ----
+        self._card_hairline(g)
+        a_broker = ttk.Frame(g); a_broker.pack(fill="x", pady=2)
+        ttk.Label(a_broker, text="券商:", width=_LBL_W, anchor="w").pack(side="left")
+        # 默认值: 上次选中的 broker, 或 accounts[0] 的 broker
+        _accts = self.cfg.get("accounts") or []
+        _brokers_in_cfg = []
+        for a in _accts:
+            b = (a.get("broker") or "").strip()
+            if b and b not in _brokers_in_cfg:
+                _brokers_in_cfg.append(b)
+        _saved_broker = (self.cfg.get("broker") or "").strip()
+        _init_broker = _saved_broker if _saved_broker in _brokers_in_cfg else (
+            _brokers_in_cfg[0] if _brokers_in_cfg else "")
+        self.vars["broker"] = tk.StringVar(value=_init_broker)
+        self._broker_combo = ttk.Combobox(a_broker, textvariable=self.vars["broker"], width=12,
+                                          values=tuple(_brokers_in_cfg))
+        self._broker_combo.pack(side="right", padx=(4, 2))
+
+        self._card_hairline(g)
+        a_acct = ttk.Frame(g); a_acct.pack(fill="x", pady=2)
+        ttk.Label(a_acct, text="资金账号:", width=_LBL_W, anchor="w").pack(side="left")
+        _init_acct = ""
+        if _init_broker:
+            _info = self._lookup_account(_init_broker, _accts)
+            _init_acct = _info.get("account", "")
+        self.vars["account"] = tk.StringVar(value=_init_acct)
+        ttk.Entry(a_acct, textvariable=self.vars["account"], width=12).pack(side="right", padx=(4, 2))
+
+        self._card_hairline(g)
+        a_pwd = ttk.Frame(g); a_pwd.pack(fill="x", pady=2)
+        ttk.Label(a_pwd, text="交易密码:", width=_LBL_W, anchor="w").pack(side="left")
+        _init_pwd = ""
+        if _init_broker:
+            _info = self._lookup_account(_init_broker, _accts)
+            _init_pwd = _info.get("trade_password", "")
+        self.vars["trade_password"] = tk.StringVar(value=_init_pwd)
+        ttk.Entry(a_pwd, textvariable=self.vars["trade_password"], width=12,
+                  show="●").pack(side="right", padx=(4, 2))
+
+        # 选券商 → 自动带出账号/密码(只在值真的变化时 set, 避免 trace 死循环)
+        def _on_broker_change(*_):
+            if "account" not in self.vars or "trade_password" not in self.vars:
+                return  # 初始化期 account/pwd 还没创建
+            b = self.vars["broker"].get().strip()
+            info = self._lookup_account(b, self.cfg.get("accounts") or [])
+            new_acct = info.get("account", "")
+            new_pwd = info.get("trade_password", "")
+            if self.vars["account"].get() != new_acct:
+                self.vars["account"].set(new_acct)
+            if self.vars["trade_password"].get() != new_pwd:
+                self.vars["trade_password"].set(new_pwd)
+        self.vars["broker"].trace_add("write", _on_broker_change)
+
+    def _lookup_account(self, broker, accounts):
+        """按 broker 名在 accounts 数组里找对应账户; 找不到返回空 dict"""
+        if not broker:
+            return {}
+        for a in accounts or []:
+            if (a.get("broker") or "").strip() == broker:
+                return a
+        return {}
+
+    def _merge_scanned_brokers(self, scanned):
+        """把预热扫到的券商并入「券商」下拉框数据源(去重, 保留原顺序)。
+
+        只在 UI 已经建好(_broker_combo 存在)时生效; 没建好就跳过。
+        不修改配置, 只改下拉框的 values; 用户真要保存新券商得手动输一遍或选完填好再保存。
+        """
+        combo = getattr(self, "_broker_combo", None)
+        if combo is None:
+            return
+        try:
+            cur = list(combo.cget("values") or [])
+        except Exception:
+            cur = []
+        merged = list(cur)
+        for b in scanned or []:
+            b = (b or "").strip()
+            if b and b not in merged:
+                merged.append(b)
+        try:
+            combo.configure(values=tuple(merged))
+        except Exception:
+            pass
+
     def _apply_signal_source_ui(self):
         """按选中的信号源只展开对应的配置区: HTTP 只显示 HTTP 配置, Redis 只显示
         Redis 配置, 选「HTTP + Redis」时两块都展开。"""
@@ -2179,11 +2348,40 @@ class ControlPanel:
     def _collect_config(self):
         cfg = {}
         cfg["ths_exe_path"] = self.vars["ths_exe_path"].get().strip()
-        # --- 券商账户(预热自动登录用) ---
-        cfg["broker"] = self.vars["broker"].get().strip()
-        cfg["account"] = self.vars["account"].get().strip()
-        # 密码框用 show="●" 掩码显示, 但 StringVar 里存的仍是真实值, 直接取即可
-        cfg["trade_password"] = self.vars["trade_password"].get()
+        # --- 券商账户: 多账户数组 ---
+        # 旧版单账户字段(broker/account/trade_password)迁移到 accounts[0], 不再单独保存
+        _cur_broker = self.vars["broker"].get().strip()
+        _cur_acct = self.vars["account"].get().strip()
+        _cur_pwd = self.vars["trade_password"].get()
+        # 从上次保存的 accounts 拿底表(没有就用空列表)
+        _prev_accts = self.cfg.get("accounts") if isinstance(self.cfg, dict) else []
+        if not isinstance(_prev_accts, list):
+            _prev_accts = []
+        # 旧字段迁移: 第一次从旧版升级时, 把 broker/account/trade_password 挪到 accounts[0]
+        _old_b = (self.cfg.get("broker") or "").strip() if isinstance(self.cfg, dict) else ""
+        _old_a = (self.cfg.get("account") or "").strip() if isinstance(self.cfg, dict) else ""
+        _old_p = (self.cfg.get("trade_password") or "") if isinstance(self.cfg, dict) else ""
+        if _old_b and _old_a and not any(
+            (x.get("broker") or "").strip() == _old_b for x in _prev_accts
+        ):
+            _prev_accts.insert(0, {"broker": _old_b, "account": _old_a,
+                                   "trade_password": _old_p})
+        # 当前选中的 broker: 在 accounts 里更新/插入一条
+        _updated = False
+        if _cur_broker:
+            for a in _prev_accts:
+                if (a.get("broker") or "").strip() == _cur_broker:
+                    a["account"] = _cur_acct
+                    a["trade_password"] = _cur_pwd
+                    _updated = True
+                    break
+            if not _updated:
+                _prev_accts.append({"broker": _cur_broker, "account": _cur_acct,
+                                    "trade_password": _cur_pwd})
+        cfg["accounts"] = _prev_accts
+        cfg["broker"] = _cur_broker        # 保留作"上次选中的券商"标记
+        cfg["account"] = ""                # 旧字段不再使用, 清空
+        cfg["trade_password"] = ""
         cfg["key_delay"] = float(self.vars["key_delay"].get().strip())
         cfg["window_title_keyword"] = self.vars["window_title_keyword"].get().strip()
         cfg["follow_ratio_buy"] = float(self.vars["follow_ratio_buy"].get().strip())

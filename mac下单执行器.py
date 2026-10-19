@@ -1118,10 +1118,10 @@ class KeyOrderExecutor:
         """A 股未登录时, 用配置里的账户信息自动登录。
 
         流程:
-          1. 点"立即登录"按钮(实测同花顺在未登录面板上会显示这个按钮)
-          2. 等待登录表单出现(弹窗或页面切换)
-          3. 识别券商/账号/密码输入框并填入
-          4. 点"登录"按钮提交
+          1. 若面板上还有「立即登录」按钮, 先点一下进入登录页
+          2. 等登录表单出现
+          3. 调用 _fill_login_form() 填入券商/账号/密码
+          4. 点「登录」按钮提交
 
         ⚠️ 当前状态: 步骤 1 已实现, 步骤 2-4 需要先 dump 登录表单的真实控件结构
            才能写识别逻辑(不同券商的登录表单可能不一样)。所以目前填完配置后
@@ -1136,28 +1136,65 @@ class KeyOrderExecutor:
         if pid is None:
             _log("自动登录: 找不到同花顺进程", "ERROR")
             return False
-        # 第一步: 点"立即登录"按钮(实测在窗口根下, AXButton, title='立即登录')
         panel, win, why = _locate_panel(pid)
         if win is None:
             _log("自动登录: 找不到同花顺窗口 - %s" % why, "ERROR")
             return False
         try:
-            login_btn = _find_button(win, "立即登录")
-            if login_btn is None:
-                # 可能已经在登录页了, 或者按钮标题不一样
-                _log("自动登录: 找不到「立即登录」按钮(可能已在登录页或标题不同)", "WARN")
+            # 第一步: 点"立即登录"按钮(若还在未登录面板上)
+            login_entry_btn = _find_button(win, "立即登录")
+            if login_entry_btn is not None:
+                try:
+                    _ax_press(login_entry_btn)
+                finally:
+                    _ax_free(login_entry_btn)
+                # 等登录表单出现(占位: 实际应轮询 _find_login_form 直到非 None)
+                time.sleep(0.5)
+            # 第二步: 填入表单
+            if not self._fill_login_form(win, broker, account, password):
+                _log("自动登录: 登录表单填入失败(控件结构尚未识别)", "WARN")
+                return False
+            # 第三步: 点「登录」按钮提交(占位)
+            submit_btn = _find_button(win, "登录")
+            if submit_btn is None:
+                _log("自动登录: 找不到「登录」提交按钮", "WARN")
                 return False
             try:
-                _ax_press(login_btn)
+                _ax_press(submit_btn)
             finally:
-                _ax_free(login_btn)
-            # 第二步-第四步: 等登录表单出现并填入 —— 占位, 等 dump 后实现
-            _log("自动登录: 已点击「立即登录」, 等待登录表单识别逻辑补全", "WARN")
-            return False
+                _ax_free(submit_btn)
+            # 第四步: 等待登录结果(占位: 应轮询 detect_panel_state 直到 logged_in=True)
+            time.sleep(1.0)
+            st = _detect_panel_state_in_window(win)
+            return bool(st.get("logged_in"))
         finally:
             if panel:
                 _release_panel(panel)
             _ax_free(win)
+
+    def _scan_login_brokers(self):
+        """扫描登录表单里可选的券商列表(占位, 等 dump 后实现)。
+
+        实测同花顺登录表单里有个券商下拉框, 里面列出所有支持的券商。
+        实现时应该:
+          1. 找到登录表单里的 AXPopUpButton / AXComboBox(券商选择器)
+          2. 读它的 AXValue 或展开后的选项列表
+        当前返回空列表, 调用方会跳过"扫到的券商并入下拉框"这一步。
+        """
+        return []
+
+    def _fill_login_form(self, win, broker, account, password):
+        """把券商/账号/密码填入登录表单(占位, 等 dump 后实现)。
+
+        实现时应该:
+          1. 在 win 下找登录表单容器(AXSheet / AXDialog, 或含"登录"标题的 Group)
+          2. 找券商选择器(AXPopUpButton), 选中 broker 对应的项
+          3. 找账号输入框(AXTextField, 旁边 label 含"账号"/"资金"), 写入 account
+          4. 找密码输入框(AXTextField 或安全键盘控件), 写入 password
+             注: 部分券商用安全键盘, 不走 AXValue, 需要模拟键盘输入
+        当前直接返回 False, 调用方会提示"登录失败, 请手动"。
+        """
+        return False
 
     # ------------------------------------------------------------------
     # 下单主流程
