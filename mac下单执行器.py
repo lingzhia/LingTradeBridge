@@ -936,6 +936,93 @@ def _find_button(el, title, depth=0):
     return None
 
 
+# ---------------------------------------------------------------------------
+# 登录表单辅助: 同花顺登录弹窗(AXSheet)里, label 和输入控件同行, label 在左。
+# 按"同一行(y 差 < 8px)+ label 在左"配对, 返回 [(label_text, control), ...]。
+# 返回的 control 引用由调用方释放。
+# ---------------------------------------------------------------------------
+def _collect_combos_in_sheet(sheet):
+    """收集弹窗里所有 (label, AXComboBox) 对"""
+    labels, combos, out = [], [], []
+    for el in _ax_elements(sheet):
+        role = _ax_text(el, "AXRole")
+        if role == "AXStaticText":
+            v = _ax_text(el, "AXValue")
+            if v:
+                _CF.CFRetain(el); labels.append((el, v, _ax_pos(el)[1]))
+        elif role == "AXComboBox":
+            _CF.CFRetain(el); combos.append((el, _ax_pos(el)[1]))
+    for c, cy in combos:
+        best = None
+        for l, v, ly in labels:
+            if abs(ly - cy) <= 8:
+                if best is None or abs(ly - cy) < abs(best[2] - cy):
+                    best = (l, v, ly)
+        if best:
+            out.append((best[1], c))
+    for l, _, _ in labels:
+        _ax_free(l)
+    for c, _ in combos:
+        # 已经被 out 引用, 不能释放; 没被引用的要释放
+        if not any(c is cc for _, cc in out):
+            _ax_free(c)
+    return out
+
+
+def _collect_textfields_in_sheet(sheet):
+    """收集弹窗里所有 (label, AXTextField) 对"""
+    labels, fields, out = [], [], []
+    for el in _ax_elements(sheet):
+        role = _ax_text(el, "AXRole")
+        if role == "AXStaticText":
+            v = _ax_text(el, "AXValue")
+            if v:
+                _CF.CFRetain(el); labels.append((el, v, _ax_pos(el)[1]))
+        elif role == "AXTextField":
+            _CF.CFRetain(el); fields.append((el, _ax_pos(el)[1]))
+    for f, fy in fields:
+        best = None
+        for l, v, ly in labels:
+            if abs(ly - fy) <= 8:
+                if best is None or abs(ly - fy) < abs(best[2] - fy):
+                    best = (l, v, ly)
+        if best:
+            out.append((best[1], f))
+    for l, _, _ in labels:
+        _ax_free(l)
+    for f, _ in fields:
+        if not any(f is ff for _, ff in out):
+            _ax_free(f)
+    return out
+
+
+def _set_combo_value(combo, value):
+    """把 AXComboBox 设为指定值。直接写 AXValue, 失败返回 False。"""
+    if not combo or not value:
+        return False
+    err = _ax_set_text(combo, "AXValue", value)
+    if err != 0:
+        return False
+    # 验证写入
+    time.sleep(0.05)
+    actual = _ax_text(combo, "AXValue").strip()
+    return actual == value.strip()
+
+
+def _set_textfield(tf, value):
+    """把 AXTextField 设为指定值。先清空再写入。"""
+    if not tf or value is None:
+        return False
+    _ax_set_text(tf, "AXValue", "")
+    err = _ax_set_text(tf, "AXValue", str(value))
+    if err != 0:
+        return False
+    time.sleep(0.05)
+    actual = _ax_text(tf, "AXValue")
+    # 密码框可能不回显, 只要写入没报错就认为成功
+    return err == 0
+
+
 # ===========================================================================
 # 四、下单执行器
 # ===========================================================================
@@ -1119,15 +1206,11 @@ class KeyOrderExecutor:
 
         流程:
           1. 若面板上还有「立即登录」按钮, 先点一下进入登录页
-          2. 等登录表单出现
+          2. 等登录表单(AXSheet 弹窗)出现
           3. 调用 _fill_login_form() 填入券商/账号/密码
-          4. 点「登录」按钮提交
+          4. 提示用户手输验证码并点登录(验证码无法自动识别)
 
-        ⚠️ 当前状态: 步骤 1 已实现, 步骤 2-4 需要先 dump 登录表单的真实控件结构
-           才能写识别逻辑(不同券商的登录表单可能不一样)。所以目前填完配置后
-           点预热会提示"自动登录失败, 请手动登录", 等 dump 完再补。
-
-        返回 True 表示登录成功, False 表示失败(调用方应提示用户手动登录)。
+        返回 True 表示表单已填好(等用户补验证码+点登录), False 表示失败。
         """
         if not (broker and account and password):
             _log("自动登录: 账户信息不全, 跳过", "WARN")
@@ -1148,53 +1231,101 @@ class KeyOrderExecutor:
                     _ax_press(login_entry_btn)
                 finally:
                     _ax_free(login_entry_btn)
-                # 等登录表单出现(占位: 实际应轮询 _find_login_form 直到非 None)
+                # 等登录表单弹窗出现
                 time.sleep(0.5)
-            # 第二步: 填入表单
+            # 第二步: 填入表单(券商/账号/密码, 验证码留空)
             if not self._fill_login_form(win, broker, account, password):
-                _log("自动登录: 登录表单填入失败(控件结构尚未识别)", "WARN")
+                _log("自动登录: 表单填入失败, 请手动登录", "WARN")
                 return False
-            # 第三步: 点「登录」按钮提交(占位)
-            submit_btn = _find_button(win, "登录")
-            if submit_btn is None:
-                _log("自动登录: 找不到「登录」提交按钮", "WARN")
-                return False
-            try:
-                _ax_press(submit_btn)
-            finally:
-                _ax_free(submit_btn)
-            # 第四步: 等待登录结果(占位: 应轮询 detect_panel_state 直到 logged_in=True)
-            time.sleep(1.0)
-            st = _detect_panel_state_in_window(win)
-            return bool(st.get("logged_in"))
+            _log("自动登录: 已填入券商/账号/密码, 请在同花顺弹窗里手输验证码并点「登录」", "INFO")
+            return True
         finally:
             if panel:
                 _release_panel(panel)
             _ax_free(win)
 
     def _scan_login_brokers(self):
-        """扫描登录表单里可选的券商列表(占位, 等 dump 后实现)。
+        """扫描登录表单里可选的券商列表。
 
-        实测同花顺登录表单里有个券商下拉框, 里面列出所有支持的券商。
-        实现时应该:
-          1. 找到登录表单里的 AXPopUpButton / AXComboBox(券商选择器)
-          2. 读它的 AXValue 或展开后的选项列表
-        当前返回空列表, 调用方会跳过"扫到的券商并入下拉框"这一步。
+        实测同花顺登录弹窗(AXSheet)里有个「证券公司」AXComboBox, 当前值就是上次用的
+        券商。展开下拉能读到所有可选券商, 但 AX 接口读下拉项不太稳, 所以这里只返回
+        当前值(作为"上次用过"的参考)。调用方把它并入 UI 下拉框数据源。
+
+        返回 list[str], 失败返回 []。
         """
-        return []
+        pid = self.ths_hwnd or _find_ths_pid(self._app_name())
+        if pid is None:
+            return []
+        panel, win, _ = _locate_panel(pid)
+        if win is None:
+            return []
+        try:
+            sheet = _find_sheet(win)
+            if sheet is None:
+                # 登录弹窗还没出现, 先不扫
+                return []
+            # 找「证券公司」旁边的 AXComboBox(按位置: label 在左, combo 在右, 同一行)
+            combos = _collect_combos_in_sheet(sheet)
+            for label, combo in combos:
+                if "证券" in label or "券商" in label:
+                    val = _ax_text(combo, "AXValue").strip()
+                    return [val] if val else []
+            return []
+        finally:
+            if panel:
+                _release_panel(panel)
+            _ax_free(win)
 
     def _fill_login_form(self, win, broker, account, password):
-        """把券商/账号/密码填入登录表单(占位, 等 dump 后实现)。
+        """把券商/账号/密码填入登录表单(AXSheet 弹窗)。
 
-        实现时应该:
-          1. 在 win 下找登录表单容器(AXSheet / AXDialog, 或含"登录"标题的 Group)
-          2. 找券商选择器(AXPopUpButton), 选中 broker 对应的项
-          3. 找账号输入框(AXTextField, 旁边 label 含"账号"/"资金"), 写入 account
-          4. 找密码输入框(AXTextField 或安全键盘控件), 写入 password
-             注: 部分券商用安全键盘, 不走 AXValue, 需要模拟键盘输入
-        当前直接返回 False, 调用方会提示"登录失败, 请手动"。
+        实测控件结构(同花顺 Mac 版):
+          - 「证券公司」AXComboBox: 选券商
+          - 「交易帐户」AXComboBox: 填账号(同花顺会记忆上次账号, 这里覆盖)
+          - 「交易密码」AXTextField: 填密码
+          - 「验证码」AXTextField: 留空让用户手填(图片验证码无法自动识别)
+
+        ⚠️ 验证码是同花顺的硬门槛, 自动填完密码后必须让用户手输验证码再点登录。
+           所以本函数只负责填前 3 项, 不点「登录」按钮 —— 调用方在返回 True 后
+           应提示用户"请手输验证码并点登录"。
+
+        返回 True 表示填入成功(等用户补验证码), False 表示失败。
         """
-        return False
+        sheet = _find_sheet(win)
+        if sheet is None:
+            _log("登录表单: 找不到弹窗(AXSheet), 可能还没点「立即登录」", "WARN")
+            return False
+        combos = _collect_combos_in_sheet(sheet)
+        fields = _collect_textfields_in_sheet(sheet)
+
+        ok_broker = ok_acct = ok_pwd = False
+        # 1. 券商(证券公司 combo)
+        for label, combo in combos:
+            if "证券" in label or "券商" in label:
+                ok_broker = _set_combo_value(combo, broker)
+                break
+        if not ok_broker:
+            _log("登录表单: 找不到「证券公司」下拉框, 或填入失败", "WARN")
+            return False
+        # 2. 账号(交易帐户 combo)
+        for label, combo in combos:
+            if "帐户" in label and ("交易" in label or "资金" in label):
+                ok_acct = _set_combo_value(combo, account)
+                break
+        if not ok_acct:
+            _log("登录表单: 找不到「交易帐户」下拉框", "WARN")
+            return False
+        # 3. 密码(交易密码 textfield)
+        for label, tf in fields:
+            if "密码" in label and "交易" in label:
+                ok_pwd = _set_textfield(tf, password)
+                break
+        if not ok_pwd:
+            _log("登录表单: 找不到「交易密码」输入框", "WARN")
+            return False
+        _log("登录表单: 已填入券商=%s 账号=%s 密码=*** (验证码请手输)" % (
+            broker, account), "OK")
+        return True
 
     # ------------------------------------------------------------------
     # 下单主流程

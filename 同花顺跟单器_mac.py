@@ -1654,7 +1654,6 @@ class ControlPanel:
                                     gui_log("  扫描可用券商失败: %s" % _se, "WARN")
                                     avail = []
                                 # 依次尝试每个账户
-                                any_success = False
                                 for idx, acc in enumerate(accounts, 1):
                                     b = (acc.get("broker") or "").strip()
                                     a = (acc.get("account") or "").strip()
@@ -1663,7 +1662,7 @@ class ControlPanel:
                                         gui_log("  [%d/%d] %s: 账户信息不全, 跳过" % (
                                             idx, len(accounts), b or "(未填券商)"), "WARN")
                                         continue
-                                    gui_log("  [%d/%d] 尝试登录 %s / %s ..." % (
+                                    gui_log("  [%d/%d] 尝试填入 %s / %s ..." % (
                                         idx, len(accounts), b, a), "INFO")
                                     try:
                                         ok = self.order_executor.try_auto_login(
@@ -1673,16 +1672,17 @@ class ControlPanel:
                                         gui_log("  [%d/%d] %s 登录异常: %s" % (
                                             idx, len(accounts), b, _le), "WARN")
                                     if ok:
-                                        gui_log("  [%d/%d] %s 登录成功" % (idx, len(accounts), b), "OK")
-                                        # 把"当前选中"同步到这个成功的 broker, 下次打开还在
+                                        gui_log("  [%d/%d] %s 表单已填入, 请在同花顺弹窗里"
+                                                "手输验证码并点「登录」" % (
+                                                    idx, len(accounts), b), "OK")
+                                        # 把"当前选中"同步到这个 broker
                                         self.cfg["broker"] = b
-                                        any_success = True
                                         break
                                     else:
-                                        gui_log("  [%d/%d] %s 登录失败" % (
+                                        gui_log("  [%d/%d] %s 表单填入失败" % (
                                             idx, len(accounts), b), "WARN")
-                                if not any_success:
-                                    gui_log("  所有配置的账户都登录失败, 请在同花顺里手动登录",
+                                else:
+                                    gui_log("  所有配置的账户都填入失败, 请在同花顺里手动登录",
                                             "WARN")
                 except Exception as e:
                     gui_log("  面板状态识别失败: %s" % e, "WARN")
