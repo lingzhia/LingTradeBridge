@@ -4,8 +4,6 @@
   "window_title_keyword": "同花顺",
   "follow_ratio_buy": 1.0,
   "follow_ratio_sell": 1.0,
-  "strategy_ratios": "ths测试:1.00/1.00",
-  "redis_strategy_filter": "ths测试",
   "min_amount": 100,
   "buy_price_max": 0.0,
   "test_buy_mode": "一次下三单",
@@ -29,7 +27,9 @@
     }
   ],
   "activate_enabled": true,
-  "http_host": "127.0.0.1",
+  "http_host": "0.0.0.0",
   "http_port": 8765,
-  "http_api_token": "GsUhRvLqJqpplCtzkKeJjQCB"
+  "http_api_token": "GsUhRvLqJqpplCtzkKeJjQCB",
+  "auto_goto_panel": true,
+  "ths_rail_index": null
 }
