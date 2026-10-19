@@ -1699,7 +1699,7 @@ class ControlPanel:
                                                         _mac_order._ax_press(btn)
                                                     finally:
                                                         _mac_order._ax_free(btn)
-                                                    import time; time.sleep(0.5)
+                                                    time.sleep(0.5)
                                                 # 扫描弹窗里的券商和账号
                                                 sheet = _mac_order._find_sheet(win)
                                                 if sheet:
