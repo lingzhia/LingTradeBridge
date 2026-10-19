@@ -187,13 +187,27 @@ def load_config():
         cfg["signal_source"] = normalize_signal_source(cfg.get("signal_source"))
     # http_enabled 作为派生值同步, 兼容仍读取它的旧代码
     cfg["http_enabled"] = cfg["signal_source"] in ("http", "both")
+
+    # --- Token 安全加固: 检测到内置默认 Token 时自动生成随机值 ---
+    # 避免用户忘记修改导致局域网内任何人可推送信号
+    if cfg.get("http_api_token") == DEFAULT_CONFIG.get("http_api_token"):
+        import secrets
+        cfg["http_api_token"] = secrets.token_urlsafe(24)
+        try:
+            save_config(cfg)
+            print("安全加固: 已自动生成随机 HTTP Token (原 Token 为内置默认值)")
+        except Exception:
+            pass
+
     return cfg
 
 
 def save_config(cfg):
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_PATH)
     except Exception as e:
         print("保存配置失败: %s" % e)
 
@@ -1173,6 +1187,7 @@ class FollowerEngine:
             gui_log(">>> 信号源=%s, 未启动 Redis 监听" % source, "INFO")
         if self.app:
             self.app.root.after(0, self.app._on_follow_started)
+        _write_status(phase="following", following=True, signal_source=source)
 
     def stop_following(self):
         """停止跟单: 必须把 HTTP 信号服务也一起关掉。
@@ -1191,6 +1206,7 @@ class FollowerEngine:
             gui_log("<<< 已停止跟单: HTTP 信号服务已关闭, 端口 %s 已释放" % _port, "INFO")
         else:
             gui_log("<<< 已发送停止信号, 自动跟单将在当前信号处理后暂停", "INFO")
+        _write_status(phase="stopped", following=False)
 
     # ==================== Redis 实时信号源 (与 tools_ths_redis.py 对接) ====================
     def _signal_to_order(self, data):
@@ -1472,6 +1488,8 @@ class FollowerEngine:
             elapsed = time.time() - t_order_start
             gui_log("下单成功: %s %s %d股 (累计%d单) [下单耗时 %.3fs]" % (
                 stock_code, operate, actual_amount, self.order_count, elapsed), "OK")
+            _write_status(order_count=self.order_count, last_order="success",
+                          last_order_detail="%s %s %d股" % (stock_code, operate, actual_amount))
             gui_log("─" * 72, "INFO")
         else:
             if allow_reorder:
@@ -1481,6 +1499,8 @@ class FollowerEngine:
             else:
                 gui_log("下单失败: %s %s %d股 [已记录, 不再重试]" % (
                     stock_code, operate, actual_amount), "ERROR")
+            _write_status(last_order="failed",
+                          last_order_detail="%s %s %d股" % (stock_code, operate, actual_amount))
 
 
 # ===========================================================================
@@ -1759,6 +1779,7 @@ class ControlPanel:
         self._refresh_log_loop()
         threading.Thread(target=self._rdp_keepalive_loop, daemon=True).start()
         gui_log("=== 聚宽转同花顺跟单器已启动 ===", "OK")
+        _write_status(phase="started", following=False, order_count=0)
         gui_log("请先点击[打开同花顺]启动下单客户端并登录, 然后点击[预热]确认能识别到下单面板", "INFO")
         _src = normalize_signal_source(self.cfg.get("signal_source"))
         _src_desc = {"http": "HTTP (http://%s:%s/signal)" % (
@@ -3391,12 +3412,62 @@ class ControlPanel:
         except Exception:
             pass
 
+        # 每 60 秒写一次心跳到 status.json
+        _now_ts = time.time()
+        if _now_ts - getattr(self, "_last_status_ts", 0) >= 60:
+            self._last_status_ts = _now_ts
+            _write_status(following=running,
+                          order_count=self.engine.order_count if self.engine else 0)
+
         self.root.after(500, self._refresh_log_loop)
 
 
 # ===========================================================================
 # 入口
 # ===========================================================================
+def _cleanup_old_logs(keep_days=30):
+    """清理超过 keep_days 天的日志文件, 防止 logs/ 目录无限增长。"""
+    try:
+        if not os.path.isdir(LOG_DIR):
+            return
+        cutoff = time.time() - keep_days * 86400
+        removed = 0
+        for fname in os.listdir(LOG_DIR):
+            if not fname.endswith((".txt", ".log")):
+                continue
+            fpath = os.path.join(LOG_DIR, fname)
+            try:
+                if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                    os.remove(fpath)
+                    removed += 1
+            except Exception:
+                pass
+        if removed:
+            print("已清理 %d 个超过 %d 天的日志文件" % (removed, keep_days))
+    except Exception:
+        pass
+
+
+_STATUS_PATH = os.path.join(BASE_DIR, "status.json")
+
+
+def _write_status(**kwargs):
+    """写入运行状态到 status.json, 供外部监控读取。原子写入。"""
+    try:
+        status = {}
+        if os.path.exists(_STATUS_PATH):
+            with open(_STATUS_PATH, "r", encoding="utf-8") as f:
+                status = json.load(f)
+        status.update(kwargs)
+        status["heartbeat"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tmp = _STATUS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(status, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _STATUS_PATH)
+    except Exception:
+        pass
+
+
 def _hide_console():
     """隐藏黑色控制台窗口 —— macOS 上没有这个需求, 直接空实现。
     (Windows 版会调用 kernel32.GetConsoleWindow 藏掉 cmd 黑框;
@@ -3434,6 +3505,7 @@ def main():
     if getattr(sys, 'frozen', False):
         _hide_console()
     sys.excepthook = _write_crash_log
+    _cleanup_old_logs()
 
     try:
         root = tk.Tk()

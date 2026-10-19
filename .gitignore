@@ -10,6 +10,7 @@ http_api_token.json
 logs/
 已下单委托记录.json
 崩溃日志.txt
+status.json
 
 # macOS
 .DS_Store
