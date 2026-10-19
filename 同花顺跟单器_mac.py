@@ -187,18 +187,6 @@ def load_config():
         cfg["signal_source"] = normalize_signal_source(cfg.get("signal_source"))
     # http_enabled 作为派生值同步, 兼容仍读取它的旧代码
     cfg["http_enabled"] = cfg["signal_source"] in ("http", "both")
-
-    # --- Token 安全加固: 检测到内置默认 Token 时自动生成随机值 ---
-    # 避免用户忘记修改导致局域网内任何人可推送信号
-    if cfg.get("http_api_token") == DEFAULT_CONFIG.get("http_api_token"):
-        import secrets
-        cfg["http_api_token"] = secrets.token_urlsafe(24)
-        try:
-            save_config(cfg)
-            print("安全加固: 已自动生成随机 HTTP Token (原 Token 为内置默认值)")
-        except Exception:
-            pass
-
     return cfg
 
 
