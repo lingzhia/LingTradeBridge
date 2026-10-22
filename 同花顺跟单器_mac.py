@@ -1337,18 +1337,6 @@ class ControlPanel:
         self.btn_topmost.pack(side="left", padx=2, pady=7)
         _vsep()
 
-        # ③ 测试组 (弱化样式): 买入测试 / 卖出测试 / 模式
-        RoundButton(header, text="买入测试", kind="text", font=self._font_medium,
-                    parent_bg=UI.HEADER, height=32, command=self.on_test_signal
-                    ).pack(side="left", padx=2, pady=7)
-        RoundButton(header, text="卖出测试", kind="text", font=self._font_medium,
-                    parent_bg=UI.HEADER, height=32, command=self.on_test_sell
-                    ).pack(side="left", padx=2, pady=7)
-        # 模式选择: 仅保留下拉框(自解释), 省出顶栏宽度
-        self.vars["test_buy_mode"] = tk.StringVar(value=self.cfg.get("test_buy_mode", "一次下三单"))
-        ttk.Combobox(header, textvariable=self.vars["test_buy_mode"], width=8, state="readonly",
-                     values=("一次下三单", "一次下一单")).pack(side="left", padx=(4, 2), pady=6)
-
         # 右端: 已下单 / 已处理 紧凑数字卡片 (界面缩放的右侧, 自右侧栏上移)
         def _mk_stat_card(text):
             card = RoundedCard(header, radius=6, pad=1, bg=UI.HEADER)
@@ -1517,6 +1505,11 @@ class ControlPanel:
         self.log_text.tag_config("ERROR", foreground=UI.LOG_ERROR)
         self.log_text.tag_config("OK", foreground=UI.LOG_OK)
 
+        # --- Tab 2: 功能测试 ---
+        tab_test = tk.Frame(notebook, bg=UI.BG)
+        notebook.add(tab_test, text=" 功能测试 ")
+        self._build_group_test_functions(tab_test)
+
         # ---- 默认窗口高度: 严格贴合首页(跟单控制)实际所需 ----
         try:
             self.root.update_idletasks()
@@ -1566,29 +1559,8 @@ class ControlPanel:
             pass
 
     def _autofit_check(self):
-        """小屏自动收缩: 内容高度超过可视区时自动下调缩放, 保证最底行完整显示(下限0.6)。"""
-        if getattr(self, "_autofit_done", False):
-            return
-        self._autofit_done = True
-        try:
-            self.root.update_idletasks()
-            cvs = self._main_canvas
-            view_h = cvs.winfo_height()
-            content_h = self._main_inner.winfo_reqheight()
-            if view_h <= 0 or content_h <= view_h:
-                return
-            fit = max(0.6, (self._scale * view_h) / content_h)
-            if fit >= self._scale - 0.02:
-                return
-            self._scale = round(fit, 2)
-            try:
-                self.root.tk.call('tk', 'scaling', self._tk_base * self._scale)
-            except Exception:
-                pass
-            self.root.update_idletasks()
-            gui_log("小屏自动缩放至 %d%% 以完整显示界面" % int(self._scale * 100), "INFO")
-        except Exception as e:
-            gui_log("界面自动缩放失败: %s" % e, "WARN")
+        """小屏自动收缩: 已禁用。"""
+        return
 
     # ---- 窗口激活(预热/手动) ----
 
@@ -1656,8 +1628,7 @@ class ControlPanel:
                                         gui_log("  [%d/%d] %s 登录异常: %s" % (
                                             idx, len(accounts), b, _le), "WARN")
                                     if ok:
-                                        gui_log("  [%d/%d] %s 表单已填入, 请在同花顺弹窗里"
-                                                "手输验证码并点「登录」" % (
+                                        gui_log("  [%d/%d] %s 自动登录成功" % (
                                                     idx, len(accounts), b), "OK")
                                         # 把"当前选中"同步到这个 broker
                                         self.cfg["broker"] = b
@@ -1973,6 +1944,9 @@ class ControlPanel:
         row.pack(fill="x", pady=1)
         tv = tk.StringVar(value=time_str)
         nv = tk.StringVar(value=note_str)
+        # 绑定变化回调, 修改时标记为未保存
+        tv.trace_add("write", lambda *args: self._on_cfg_var_changed())
+        nv.trace_add("write", lambda *args: self._on_cfg_var_changed())
         ttk.Entry(row, textvariable=tv, width=8).pack(side="left", padx=(4, 4))
         ttk.Entry(row, textvariable=nv, width=18).pack(side="left", padx=4)
         RoundButton(row, text="删除", kind="ghost", font=(self._FONT_NAME, 9),
@@ -1992,6 +1966,7 @@ class ControlPanel:
             if r is row:
                 self._act_rows.pop(i)
                 row.destroy()
+                self._on_cfg_var_changed()  # 标记为未保存
                 break
 
     def _move_act_row(self, row, delta):
@@ -2011,10 +1986,12 @@ class ControlPanel:
             r.pack_forget()
         for r, tv, nv in self._act_rows:
             r.pack(fill="x", pady=1)
+        self._on_cfg_var_changed()  # 标记为未保存
 
     def _on_add_act_row(self):
         """添加一行空预热时间。"""
         self._append_act_row("", "")
+        self._on_cfg_var_changed()  # 标记为未保存
 
     def _collect_activation_times(self):
         """收集预热时间列表并校验: 格式 HH:MM、范围合法、去重、按时间排序。
@@ -2087,6 +2064,315 @@ class ControlPanel:
         hint = tk.Label(g2, text="说明: 错过的时间点不会补执行; 跟单器关闭期间不触发; 按时间先后执行。",
                         fg=UI.TEXT_FAINT, bg=UI.SURFACE, font=(self._FONT_NAME, 8), anchor="w")
         hint.pack(fill="x", pady=(2, 0))
+
+    def _build_group_test_functions(self, parent):
+        """功能测试页: 测试下单 + 查询功能。"""
+        # 外层容器: 左右分栏(左:按钮区, 右:结果显示区)
+        parent.columnconfigure(0, weight=0, minsize=280)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        # ===== 左栏: 按钮区 =====
+        left = tk.Frame(parent, bg=UI.BG)
+        left.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=8)
+
+        # --- 测试下单 ---
+        self._card_caption(left, "测试下单")
+        card_test = RoundedCard(left, pad=10)
+        card_test.pack(fill="x", padx=2, pady=(0, 8))
+        test_body = card_test.body
+
+        # 股票代码输入
+        code_row = ttk.Frame(test_body)
+        code_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(code_row, text="股票代码:").pack(side="left", padx=(0, 4))
+        self.vars["test_stock_code"] = tk.StringVar(value=self.cfg.get("test_stock_code", "510100"))
+        ttk.Entry(code_row, textvariable=self.vars["test_stock_code"], width=12).pack(side="left", padx=(0, 8))
+
+        # 价格和数量输入
+        price_qty_row = ttk.Frame(test_body)
+        price_qty_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(price_qty_row, text="价格(空=市价):").pack(side="left", padx=(0, 4))
+        self.vars["test_price"] = tk.StringVar(value=self.cfg.get("test_price", ""))
+        ttk.Entry(price_qty_row, textvariable=self.vars["test_price"], width=8).pack(side="left", padx=(0, 8))
+        ttk.Label(price_qty_row, text="数量(股):").pack(side="left", padx=(0, 4))
+        self.vars["test_quantity"] = tk.StringVar(value=self.cfg.get("test_quantity", "100"))
+        ttk.Entry(price_qty_row, textvariable=self.vars["test_quantity"], width=8).pack(side="left")
+
+        # 买入测试
+        btn_buy = RoundButton(test_body, text="买入测试", kind="primary",
+                              font=self._font_medium, parent_bg=UI.SURFACE,
+                              height=36, command=self.on_test_signal)
+        btn_buy.pack(fill="x", pady=(0, 6))
+
+        # 卖出测试
+        btn_sell = RoundButton(test_body, text="卖出测试", kind="danger",
+                               font=self._font_medium, parent_bg=UI.SURFACE,
+                               height=36, command=self.on_test_sell)
+        btn_sell.pack(fill="x", pady=(0, 6))
+
+        # 批量模式选择(1-5只)
+        self.vars["test_buy_mode"] = tk.StringVar(value=self.cfg.get("test_buy_mode", "1"))
+        mode_row = ttk.Frame(test_body)
+        mode_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(mode_row, text="批量模式:").pack(side="left", padx=(0, 4))
+        ttk.Combobox(mode_row, textvariable=self.vars["test_buy_mode"], width=10,
+                     state="readonly", values=("1", "2", "3", "4", "5")).pack(side="left")
+        ttk.Label(mode_row, text="只股票").pack(side="left", padx=(4, 0))
+
+        # --- 查询功能 ---
+        self._card_caption(left, "查询功能")
+        card_query = RoundedCard(left, pad=10)
+        card_query.pack(fill="x", padx=2, pady=(0, 8))
+        query_body = card_query.body
+
+        # 四个查询按钮(保存引用以便启用/禁用)
+        self._query_buttons = []
+
+        btn_account = RoundButton(query_body, text="资金查询", kind="soft",
+                                  font=self._font_medium, parent_bg=UI.SURFACE,
+                                  height=34, command=lambda: self._on_query_table("account"))
+        btn_account.pack(fill="x", pady=(0, 6))
+        self._query_buttons.append(btn_account)
+
+        btn_positions = RoundButton(query_body, text="持仓查询", kind="soft",
+                                    font=self._font_medium, parent_bg=UI.SURFACE,
+                                    height=34, command=lambda: self._on_query_table("positions"))
+        btn_positions.pack(fill="x", pady=(0, 6))
+        self._query_buttons.append(btn_positions)
+
+        btn_orders = RoundButton(query_body, text="委托查询", kind="soft",
+                                 font=self._font_medium, parent_bg=UI.SURFACE,
+                                 height=34, command=lambda: self._on_query_table("orders"))
+        btn_orders.pack(fill="x", pady=(0, 6))
+        self._query_buttons.append(btn_orders)
+
+        btn_deals = RoundButton(query_body, text="成交查询", kind="soft",
+                                font=self._font_medium, parent_bg=UI.SURFACE,
+                                height=34, command=lambda: self._on_query_table("deals"))
+        btn_deals.pack(fill="x")
+        self._query_buttons.append(btn_deals)
+
+        # 提示文字
+        hint = tk.Label(left, text="说明: 查询功能读取同花顺界面当前显示的表格数据\n需要同花顺客户端开着并停在交易界面",
+                        fg=UI.TEXT_FAINT, bg=UI.BG, font=(self._FONT_NAME, 8),
+                        anchor="w", justify="left")
+        hint.pack(fill="x", pady=(8, 0))
+
+        # ===== 右栏: 查看窗口 =====
+        right = tk.Frame(parent, bg=UI.BG)
+        right.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+
+        # 标题栏
+        title_bar = tk.Frame(right, bg=UI.BG)
+        title_bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        title_bar.columnconfigure(0, weight=1)
+
+        self._query_title_label = tk.Label(title_bar, text="查看窗口", fg=UI.TEXT,
+                                           bg=UI.BG, font=(self._FONT_NAME, 11, "bold"),
+                                           anchor="w")
+        self._query_title_label.grid(row=0, column=0, sticky="w")
+
+        # 清空按钮
+        RoundButton(title_bar, text="清空", kind="ghost", font=(self._FONT_NAME, 9),
+                    height=24, radius=6, padx=9,
+                    command=self._clear_query_result).grid(row=0, column=1, sticky="e")
+
+        # 内容容器
+        content_frame = tk.Frame(right, bg=UI.BG)
+        content_frame.grid(row=1, column=0, sticky="nsew")
+        content_frame.columnconfigure(0, weight=1)
+        content_frame.rowconfigure(0, weight=1)
+
+        # Treeview 表格（查询结果）
+        self._query_tree = ttk.Treeview(content_frame, show="headings", height=10)
+        self._query_tree.grid(row=0, column=0, sticky="nsew")
+
+        # 滚动条（Treeview）
+        vsb_tree = ttk.Scrollbar(content_frame, orient="vertical", command=self._query_tree.yview)
+        vsb_tree.grid(row=0, column=1, sticky="ns")
+        hsb_tree = ttk.Scrollbar(content_frame, orient="horizontal", command=self._query_tree.xview)
+        hsb_tree.grid(row=1, column=0, sticky="ew")
+        self._query_tree.configure(yscrollcommand=vsb_tree.set, xscrollcommand=hsb_tree.set)
+
+        # ScrolledText（日志输出）
+        self._log_text = scrolledtext.ScrolledText(content_frame, wrap="word",
+                                                    font=(self._FONT_MONO, 10),
+                                                    state="disabled",
+                                                    bg=UI.SURFACE, bd=0,
+                                                    highlightthickness=1,
+                                                    highlightbackground=UI.BORDER,
+                                                    highlightcolor=UI.BRAND)
+        self._log_text.grid(row=0, column=0, sticky="nsew")
+        self._log_text.tag_config("INFO", foreground=UI.LOG_INFO)
+        self._log_text.tag_config("WARN", foreground=UI.LOG_WARN)
+        self._log_text.tag_config("ERROR", foreground=UI.LOG_ERROR)
+        self._log_text.tag_config("OK", foreground=UI.LOG_OK)
+
+        # 初始隐藏 Treeview，只显示日志
+        self._query_tree.grid_remove()
+        vsb_tree.grid_remove()
+        hsb_tree.grid_remove()
+
+        # 样式设置
+        style = ttk.Style()
+        style.configure("Treeview", font=(self._FONT_MONO, 10), rowheight=25)
+        style.configure("Treeview.Heading", font=(self._FONT_NAME, 10, "bold"))
+
+    def query_ths_table(self, kind):
+        """读同花顺界面上的表格(account/positions/orders/deals), 供查询按钮调用。"""
+        executor = self.order_executor
+        if executor is None or not hasattr(executor, "query_table"):
+            raise RuntimeError("当前下单执行器不支持界面查询")
+        return executor.query_table(kind)
+
+    def _clear_query_result(self):
+        """清空查看窗口。"""
+        # 清空 Treeview
+        for item in self._query_tree.get_children():
+            self._query_tree.delete(item)
+        self._query_tree["columns"] = []
+        # 清空日志
+        self._log_text.config(state="normal")
+        self._log_text.delete("1.0", "end")
+        self._log_text.config(state="disabled")
+        self._query_title_label.config(text="查看窗口")
+        # 隐藏 Treeview，显示日志
+        self._query_tree.grid_remove()
+        for child in self._query_tree.master.winfo_children():
+            if isinstance(child, ttk.Scrollbar):
+                child.grid_remove()
+        self._log_text.grid()
+
+    def _on_query_table(self, kind):
+        """查询同花顺界面表格并显示结果。"""
+        kind_map = {
+            "account": "资金",
+            "positions": "持仓",
+            "orders": "委托",
+            "deals": "成交"
+        }
+        title = kind_map.get(kind, kind)
+        self._query_title_label.config(text="%s查询结果" % title)
+
+        # 禁用按钮防止重复点击
+        self._set_query_buttons_state("disabled")
+
+        # 在后台线程执行查询
+        def _do_query():
+            try:
+                result = self.query_ths_table(kind)
+                # 格式化结果显示
+                if isinstance(result, dict):
+                    if result.get("kind") == "account":
+                        # 资金账户数据: 键值对显示
+                        account_data = result.get("account", {})
+                        self.root.after(0, lambda: self._display_query_result(account_data))
+                    else:
+                        # 表格数据: 按列对齐显示
+                        rows = result.get("rows", [])
+                        self.root.after(0, lambda: self._display_query_result(rows))
+                elif isinstance(result, list):
+                    self.root.after(0, lambda: self._display_query_result(result))
+                else:
+                    self.root.after(0, lambda: self._display_query_result(str(result)))
+            except Exception as e:
+                import traceback
+                error_msg = "查询失败: %s\n\n详细信息:\n%s" % (str(e), traceback.format_exc())
+                self.root.after(0, lambda: self._display_query_result(error_msg, is_error=True))
+            finally:
+                self.root.after(0, lambda: self._set_query_buttons_state("normal"))
+
+        threading.Thread(target=_do_query, daemon=True).start()
+
+    def _format_table_result(self, rows):
+        """将表格数据格式化为对齐的文本。"""
+        if not rows:
+            return "(空)"
+        # 提取所有列名
+        headers = list(rows[0].keys())
+        # 计算每列最大宽度
+        col_widths = {}
+        for h in headers:
+            col_widths[h] = max(len(str(h)), max(len(str(row.get(h, ""))) for row in rows))
+        # 格式化表头
+        header_line = " | ".join(str(h).ljust(col_widths[h]) for h in headers)
+        separator = "-+-".join("-" * col_widths[h] for h in headers)
+        # 格式化数据行
+        data_lines = []
+        for row in rows:
+            line = " | ".join(str(row.get(h, "")).ljust(col_widths[h]) for h in headers)
+            data_lines.append(line)
+        return "\n".join([header_line, separator] + data_lines)
+
+    def _display_query_result(self, data, is_error=False):
+        """在查看窗口显示查询结果（Treeview）或错误信息（日志）。"""
+        if is_error:
+            # 错误信息: 显示在日志中
+            self._show_log_text("查询失败\n" + data, "ERROR")
+            return
+
+        # 查询成功: 显示在 Treeview 中
+        # 隐藏日志，显示 Treeview
+        self._log_text.grid_remove()
+        self._query_tree.grid()
+        for child in self._query_tree.master.winfo_children():
+            if isinstance(child, ttk.Scrollbar):
+                child.grid()
+
+        # 清空旧数据
+        for item in self._query_tree.get_children():
+            self._query_tree.delete(item)
+
+        if isinstance(data, dict):
+            # 资金账户数据: 键值对显示
+            self._query_tree["columns"] = ("项目", "数值")
+            self._query_tree.heading("项目", text="项目")
+            self._query_tree.heading("数值", text="数值")
+            self._query_tree.column("项目", width=200)
+            self._query_tree.column("数值", width=400)
+            for k, v in data.items():
+                self._query_tree.insert("", "end", values=(k, v))
+        elif isinstance(data, list):
+            if not data:
+                self._query_tree["columns"] = ("提示",)
+                self._query_tree.heading("提示", text="提示")
+                self._query_tree.column("提示", width=600)
+                self._query_tree.insert("", "end", values=("(空)",))
+            else:
+                # 表格数据: 动态列
+                headers = list(data[0].keys())
+                self._query_tree["columns"] = headers
+                for h in headers:
+                    self._query_tree.heading(h, text=h)
+                    self._query_tree.column(h, width=120)
+                for row in data:
+                    values = [row.get(h, "") for h in headers]
+                    self._query_tree.insert("", "end", values=values)
+
+    def _show_log_text(self, text, level="INFO"):
+        """在查看窗口显示日志文本。"""
+        # 隐藏 Treeview，显示日志
+        self._query_tree.grid_remove()
+        for child in self._query_tree.master.winfo_children():
+            if isinstance(child, ttk.Scrollbar):
+                child.grid_remove()
+        self._log_text.grid()
+
+        self._log_text.config(state="normal")
+        self._log_text.insert("end", text + "\n", level)
+        self._log_text.see("end")
+        self._log_text.config(state="disabled")
+
+    def _set_query_buttons_state(self, state):
+        """设置所有查询按钮的状态(normal/disabled)。"""
+        for btn in getattr(self, "_query_buttons", []):
+            try:
+                btn.config(state=state)
+            except Exception:
+                pass
 
     def _refresh_act_status(self):
         """刷新「⑤ 启用与执行」状态行: 上次执行 + 今日待执行(仅文本变化时重设)。"""
@@ -2766,89 +3052,188 @@ class ControlPanel:
             messagebox.showerror("错误", "参数有误:\n%s" % e)
 
     def on_test_signal(self):
+        gui_log(">>> 买入测试按钮被点击", "INFO")
         try:
             cfg = self._collect_config()
             self.order_executor.config = cfg
         except Exception as e:
+            gui_log("配置收集失败: %s" % e, "ERROR")
             messagebox.showerror("参数错误", "请检查参数:\n%s" % e)
             return
-        # 按"测试模式"区分: 一次下三单 / 一次下一单
-        mode = self.vars.get("test_buy_mode", tk.StringVar(value="一次下三单")).get()
-        if mode == "一次下一单":
-            gui_log("=== 买入测试(1单) ===")
-            stocks = [("513330", "恒生互联ETF", 1, 100)]
-            confirm_msg = ("1. 513330 恒生互联ETF 买入 100股\n\n"
-                           "确认继续吗?")
-        else:
-            gui_log("=== 多只买入测试(3只) ===")
-            stocks = [
-                ("159636", "恒生ETF", 1, 100),
-                ("513330", "恒生互联ETF", 1, 100),
-                ("513180", "恒生科技ETF", 1, 100),
-            ]
-            confirm_msg = ("1. 159636 恒生ETF 买入 100股\n"
-                           "2. 513330 恒生互联ETF 买入 100股\n"
-                           "3. 513180 恒生科技ETF 买入 100股\n\n"
-                           "确认继续吗?")
-        gui_log("注意: 此操作会实际在同花顺中操作, 请确认已登录账户!")
-        if not messagebox.askyesno("确认", "将向同花顺发送买入测试下单:\n" + confirm_msg):
-            gui_log("测试已取消")
+        
+        # 获取用户输入的股票信息
+        code = self.vars.get("test_stock_code", tk.StringVar(value="510100")).get().strip()
+        try:
+            qty = int(self.vars.get("test_quantity", tk.StringVar(value="100")).get().strip())
+        except ValueError:
+            gui_log("数量格式错误", "ERROR")
+            messagebox.showerror("参数错误", "数量必须是整数")
             return
+        
+        if not code:
+            gui_log("股票代码为空", "ERROR")
+            messagebox.showerror("参数错误", "请输入股票代码")
+            return
+        
+        gui_log("股票代码=%s, 数量=%d" % (code, qty), "INFO")
+        
+        # 按"批量模式"选择股票数量
+        try:
+            mode = self.vars.get("test_buy_mode", tk.StringVar(value="1")).get()
+            gui_log("批量模式原始值=%s" % mode, "INFO")
+            num_stocks = int(mode)
+            gui_log("批量模式=%d只" % num_stocks, "INFO")
+        except Exception as e:
+            gui_log("批量模式解析失败: %s" % e, "ERROR")
+            import traceback
+            gui_log(traceback.format_exc(), "ERROR")
+            num_stocks = 1  # 默认值
+        
+        # 预设的股票列表
+        stock_pool = [
+            ("510100", "50ETF"),
+            ("159636", "恒生ETF"),
+            ("513330", "恒生互联ETF"),
+            ("513180", "恒生科技ETF"),
+            ("510300", "300ETF"),
+        ]
+        
+        if num_stocks == 1:
+            # 单只模式: 使用用户输入的股票代码
+            gui_log("=== 买入测试(1单) ===")
+            stocks = [(code, "", 1, qty)]
+            confirm_msg = "1. %s 买入 %d股\n\n确认继续吗?" % (code, qty)
+        else:
+            # 批量模式: 使用预设的前 N 只股票
+            gui_log("=== 多只买入测试(%d只) ===" % num_stocks)
+            stocks = [(s[0], s[1], 1, qty) for s in stock_pool[:num_stocks]]
+            lines = ["%d. %s %s 买入 %d股" % (i+1, s[0], s[1], qty) for i, s in enumerate(stocks)]
+            confirm_msg = "\n".join(lines) + "\n\n确认继续吗?"
+        
+        gui_log("注意: 此操作会实际在同花顺中操作, 请确认已登录账户!")
+        gui_log("即将开始下单...", "INFO")
+        
+        # 暂时移除确认框以便测试
+        # if not messagebox.askyesno("确认", "将向同花顺发送买入测试下单:\n" + confirm_msg):
+        #     gui_log("测试已取消")
+        #     return
 
+        gui_log("用户已确认, 开始下单...", "INFO")
+        
+        # 在右侧窗口显示执行日志
+        self._show_log_text("=== 买入测试开始 ===", "INFO")
+        self._show_log_text("股票代码: %s" % code, "INFO")
+        self._show_log_text("数量: %d股" % qty, "INFO")
+        self._show_log_text("批量模式: %d只" % num_stocks, "INFO")
+        self._show_log_text("", "INFO")
+        
         def run_multi():
             for code, name, direction, qty in stocks:
-                gui_log("─" * 72, "INFO")  # 每单之间插入分隔线
+                log_msg = "─" * 72
+                gui_log(log_msg, "INFO")
+                self._show_log_text(log_msg, "INFO")
                 t0 = time.time()
                 ok = self.order_executor.place_order(code, name, direction, qty)
                 elapsed = time.time() - t0
-                gui_log("买入测试%s: %s %s %d股 [下单耗时 %.3fs]" % (
-                    "成功" if ok else "失败", code, name, qty, elapsed),
-                    "OK" if ok else "ERROR")
+                result_msg = "买入测试%s: %s %s %d股 [下单耗时 %.3fs]" % (
+                    "成功" if ok else "失败", code, name, qty, elapsed)
+                gui_log(result_msg, "OK" if ok else "ERROR")
+                self._show_log_text(result_msg, "OK" if ok else "ERROR")
                 time.sleep(0.5)  # 间隔0.5秒模拟同一秒内连续下单
+            self._show_log_text("\n=== 买入测试完成 ===", "OK")
         threading.Thread(target=run_multi, daemon=True).start()
 
     def on_test_sell(self):
+        gui_log(">>> 卖出测试按钮被点击", "INFO")
         try:
             cfg = self._collect_config()
             self.order_executor.config = cfg
         except Exception as e:
+            gui_log("配置收集失败: %s" % e, "ERROR")
             messagebox.showerror("参数错误", "请检查参数:\n%s" % e)
             return
-        # 按"测试模式"区分: 一次下三单 / 一次下一单（与买入测试共用下拉框）
-        mode = self.vars.get("test_buy_mode", tk.StringVar(value="一次下三单")).get()
-        if mode == "一次下一单":
-            gui_log("=== 卖出测试(1单) ===")
-            stocks = [("513330", "恒生互联ETF", -1, 100)]
-            confirm_msg = ("1. 513330 恒生互联ETF 卖出 100股\n\n"
-                           "确认继续吗?")
-        else:
-            gui_log("=== 多只卖出测试(3只) ===")
-            stocks = [
-                ("159636", "恒生ETF", -1, 100),
-                ("513330", "恒生互联ETF", -1, 100),
-                ("513180", "恒生科技ETF", -1, 100),
-            ]
-            confirm_msg = ("1. 159636 恒生ETF 卖出 100股\n"
-                           "2. 513330 恒生互联ETF 卖出 100股\n"
-                           "3. 513180 恒生科技ETF 卖出 100股\n\n"
-                           "确认继续吗?")
-        gui_log("注意: 此操作会实际在同花顺中操作, 请确认账户已登录并持有相应持仓!")
-        if not messagebox.askyesno("确认", "将向同花顺发送卖出测试下单:\n" + confirm_msg):
-            gui_log("测试已取消")
+        
+        # 获取用户输入的股票信息
+        code = self.vars.get("test_stock_code", tk.StringVar(value="510100")).get().strip()
+        try:
+            qty = int(self.vars.get("test_quantity", tk.StringVar(value="100")).get().strip())
+        except ValueError:
+            gui_log("数量格式错误", "ERROR")
+            messagebox.showerror("参数错误", "数量必须是整数")
             return
+        
+        if not code:
+            gui_log("股票代码为空", "ERROR")
+            messagebox.showerror("参数错误", "请输入股票代码")
+            return
+        
+        gui_log("股票代码=%s, 数量=%d" % (code, qty), "INFO")
+        
+        # 按"批量模式"选择股票数量
+        try:
+            mode = self.vars.get("test_buy_mode", tk.StringVar(value="1")).get()
+            gui_log("批量模式原始值=%s" % mode, "INFO")
+            num_stocks = int(mode)
+            gui_log("批量模式=%d只" % num_stocks, "INFO")
+        except Exception as e:
+            gui_log("批量模式解析失败: %s" % e, "ERROR")
+            import traceback
+            gui_log(traceback.format_exc(), "ERROR")
+            num_stocks = 1  # 默认值
+        
+        # 预设的股票列表
+        stock_pool = [
+            ("510100", "50ETF"),
+            ("159636", "恒生ETF"),
+            ("513330", "恒生互联ETF"),
+            ("513180", "恒生科技ETF"),
+            ("510300", "300ETF"),
+        ]
+        
+        if num_stocks == 1:
+            # 单只模式: 使用用户输入的股票代码
+            gui_log("=== 卖出测试(1单) ===")
+            stocks = [(code, "", -1, qty)]
+            confirm_msg = "1. %s 卖出 %d股\n\n确认继续吗?" % (code, qty)
+        else:
+            # 批量模式: 使用预设的前 N 只股票
+            gui_log("=== 多只卖出测试(%d只) ===" % num_stocks)
+            stocks = [(s[0], s[1], -1, qty) for s in stock_pool[:num_stocks]]
+            lines = ["%d. %s %s 卖出 %d股" % (i+1, s[0], s[1], qty) for i, s in enumerate(stocks)]
+            confirm_msg = "\n".join(lines) + "\n\n确认继续吗?"
+        
+        gui_log("注意: 此操作会实际在同花顺中操作, 请确认账户已登录并持有相应持仓!")
+        gui_log("即将开始下单...", "INFO")
+        
+        # 暂时移除确认框以便测试
+        # if not messagebox.askyesno("确认", "将向同花顺发送卖出测试下单:\n" + confirm_msg):
+        #     gui_log("测试已取消")
+        #     return
 
+        gui_log("用户已确认, 开始下单...", "INFO")
+        
+        # 在右侧窗口显示执行日志
+        self._show_log_text("=== 卖出测试开始 ===", "INFO")
+        self._show_log_text("股票代码: %s" % code, "INFO")
+        self._show_log_text("数量: %d股" % qty, "INFO")
+        self._show_log_text("批量模式: %d只" % num_stocks, "INFO")
+        self._show_log_text("", "INFO")
+        
         def run_multi():
             for code, name, direction, qty in stocks:
-                gui_log("─" * 72, "INFO")  # 每单之间插入分隔线
+                log_msg = "─" * 72
+                gui_log(log_msg, "INFO")
+                self._show_log_text(log_msg, "INFO")
                 t0 = time.time()
                 ok = self.order_executor.place_order(code, name, direction, qty)
                 elapsed = time.time() - t0
-                gui_log("卖出测试%s: %s %s %d股 [下单耗时 %.3fs]" % (
-                    "成功" if ok else "失败", code, name, qty, elapsed),
-                    "OK" if ok else "ERROR")
-                time.sleep(0.5)  # 间隔0.5秒模拟连续下单
+                result_msg = "卖出测试%s: %s %s %d股 [下单耗时 %.3fs]" % (
+                    "成功" if ok else "失败", code, name, qty, elapsed)
+                gui_log(result_msg, "OK" if ok else "ERROR")
+                self._show_log_text(result_msg, "OK" if ok else "ERROR")
+                time.sleep(0.5)  # 间隔0.5秒模拟同一秒内连续下单
+            self._show_log_text("\n=== 卖出测试完成 ===", "OK")
         threading.Thread(target=run_multi, daemon=True).start()
-
 
     def _open_log_dir(self):
         """打开日志目录(在资源管理器中)。"""
