@@ -694,12 +694,55 @@ def navigate_to_order_panel(pid=None, config=None):
 
 def _find_sheet(win):
     """在窗口里找"确认委托"那个小窗(类型是 AXSheet), 没有就返回 None"""
-    for el in _ax_elements(win):
-        role = _ax_text(el, "AXRole")
-        if role == "AXSheet":
-            return el
-        _ax_free(el)
-    return None
+    els = _ax_elements(win)
+    sheet = None
+    try:
+        for el in els:
+            if _ax_text(el, "AXRole") == "AXSheet":
+                # 额外加一层引用抵消下面 _ax_free_all 的释放, sheet 要带出去用
+                _CF.CFRetain(el)
+                sheet = el
+                break
+    finally:
+        _ax_free_all(els)
+    return sheet
+
+
+# 「连接已被主站断开」这类登出提示框的识别关键字
+# (同花顺每晚自动登出时会弹: 警告 / 用户连接已被主站断开, 请重新登录! / [确认])
+_LOGOUT_HINTS = ("重新登录", "主站断开")
+
+
+def _handle_logout_sheet(win):
+    """检查窗口上是否挂着「连接断开, 请重新登录」提示框; 有就点「确认」并返回 True。
+
+    靠弹窗文字识别, 不会误伤普通下单确认框(那是"委托确认"类文字)。
+    引用纪律: sheet 和每个按钮都只释放一次。
+    """
+    sheet = _find_sheet(win)
+    if not sheet:
+        return False
+    try:
+        texts, buttons = _sheet_texts_and_buttons(sheet)
+        try:
+            joined = " ".join(texts)
+            if not any(h in joined for h in _LOGOUT_HINTS):
+                return False
+            hit = None
+            for title, btn in buttons:
+                if title == "确认":
+                    hit = btn
+                    break
+            if hit is None:
+                _log("登出提示框上没找到「确认」按钮, 请手动处理", "WARN")
+                return False
+            _ax_press(hit)
+            return True
+        finally:
+            for _, btn in buttons:
+                _ax_free(btn)
+    finally:
+        _ax_free(sheet)
 
 
 def _sheet_texts_and_buttons(sheet):
@@ -1101,6 +1144,13 @@ class KeyOrderExecutor:
                 _log("请在左侧导航栏里点开「交易」那一屏(能看到 代码/价格/数量 三个输入框)", "INFO")
             return []
         _log("  当前面板内容: 代码=「%s」 价格=「%s」 数量=「%s」" % self.current_panel_values(), "INFO")
+        # 预热时顺手点掉「连接断开, 请重新登录」提示框(同花顺每晚自动登出会弹),
+        # 不点的话它一直挂着; 点掉后若未登录, 界面层会接着走自动登录
+        try:
+            if _handle_logout_sheet(self._win):
+                _log("检测到同花顺登出提示框, 已自动点「确认」", "WARN")
+        except Exception as _e:
+            _log("检查登出提示框时出错: %s" % _e, "WARN")
         return [(self.ths_hwnd, panel["title"])]
 
     def current_panel_values(self):
@@ -1297,6 +1347,34 @@ class KeyOrderExecutor:
                 _release_panel(panel)
             _ax_free(win)
 
+    def _auto_relogin(self):
+        """登出后用配置里的券商账户自动重新登录, 成功返回 True。
+
+        同花顺每晚自动登出后, 第二天第一次下单会先撞到「连接断开, 请重新登录」
+        提示框(由 _clear_leftover_dialog 点掉), 这里接着把账户登回去。
+        账户取自配置的 accounts 数组(兼容旧版单账户字段 broker/account/trade_password)。
+        """
+        cfg = self.config or {}
+        accounts = list(cfg.get("accounts") or [])
+        if not accounts:
+            b = (cfg.get("broker") or "").strip()
+            a = (cfg.get("account") or "").strip()
+            p = cfg.get("trade_password") or ""
+            if b and a and p:
+                accounts = [{"broker": b, "account": a, "trade_password": p}]
+        if not accounts:
+            _log("自动重新登录: 配置里没有券商账户, 请打开跟单器手动登录", "WARN")
+            return False
+        for acc in accounts:
+            b = (acc.get("broker") or "").strip()
+            a = (acc.get("account") or "").strip()
+            p = acc.get("trade_password") or ""
+            if not (b and a and p):
+                continue
+            if self.try_auto_login(broker=b, account=a, password=p):
+                return True
+        return False
+
     def _scan_login_brokers(self):
         """扫描登录表单里可选的券商列表。
 
@@ -1444,7 +1522,20 @@ class KeyOrderExecutor:
         t0 = time.time()
 
         # 2. 先清掉可能残留的确认框(点「取消」= 放弃上一单, 绝不会凭空多下一单)
-        self._clear_leftover_dialog(win)
+        leftover = self._clear_leftover_dialog(win)
+        if leftover == "relogin":
+            # 同花顺每晚自动登出弹的「连接断开, 请重新登录」框, 已在上面点掉;
+            # 此时账户已登出, 先自动重登, 不然填单必失败
+            _log("  检测到「连接断开, 请重新登录」提示框, 已点「确认」", "WARN")
+            if not self._auto_relogin():
+                _log("下单失败: 自动重新登录未成功, 已中止(未提交)", "ERROR")
+                return False
+            # 登录后界面整个重建过, 旧的面板/窗口引用全部作废, 重新定位
+            panel, why = self._ensure_panel()
+            if panel is None:
+                _log("下单失败: 重新登录后没找到交易面板 (%s)" % why, "ERROR")
+                return False
+            win = self._win
 
         # 3. 填单, 并当场回读自校验 —— 填错了就地中止, 绝不提交
         status, info = self._fill_panel(panel, stock_code, direction, amount)
@@ -1488,22 +1579,42 @@ class KeyOrderExecutor:
         return ok
 
     def _clear_leftover_dialog(self, win):
-        """把上一次没点掉的确认框收掉(点「取消」, 不会提交任何单)"""
+        """把上一次没点掉的确认框收掉(点「取消」, 不会提交任何单)。
+
+        返回: None=没有弹窗 / "cancelled"=点了「取消」 / "relogin"=登出提示框已点「确认」。
+
+        ⚠️ 引用纪律: 每个按钮引用只允许释放一次。以前这里第一轮循环对
+        非「取消」按钮释放一遍、第二轮又全部释放一遍, 同一按钮被释放两次,
+        直接把整个进程崩掉(2026-10-22 买入测试崩溃的元凶), 千万别改回去。
+        """
         try:
             sheet = _find_sheet(win)
             if not sheet:
-                return
-            texts, buttons = _sheet_texts_and_buttons(sheet)
-            for title, btn in buttons:
-                if title == "取消":
-                    _ax_press(btn)
-                    break
-                _ax_free(btn)
-            for _, btn in buttons:
-                _ax_free(btn)
-            _ax_free(sheet)
+                return None
+            try:
+                texts, buttons = _sheet_texts_and_buttons(sheet)
+                try:
+                    joined = " ".join(texts)
+                    if any(h in joined for h in _LOGOUT_HINTS):
+                        kind, want = "relogin", "确认"
+                    else:
+                        kind, want = "cancelled", "取消"
+                    hit = None
+                    for title, btn in buttons:
+                        if title == want:
+                            hit = btn
+                            break
+                    if hit is None:
+                        return None
+                    _ax_press(hit)
+                    return kind
+                finally:
+                    for _, btn in buttons:
+                        _ax_free(btn)
+            finally:
+                _ax_free(sheet)
         except Exception:
-            pass
+            return None
 
     def _fill_panel(self, panel, stock_code, direction, amount):
         """
