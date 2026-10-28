@@ -1,24 +1,18 @@
-# Python
-__pycache__/
-*.py[cod]
-*.so
-.venv/
-venv/
+# Rust 构建产物与本地依赖缓存
+core/target/
+core/.cargo/
 
-http_api_token.json
-# Runtime output
-logs/
-已下单委托记录.json
-崩溃日志.txt
-status.json
-
-# macOS
-.DS_Store
-__MACOSX/
-
-# 本地工具目录(会话/记忆等), 不参与版本管理
-.workbuddy/
-
-# OCR 工具: 源码 + 编译脚本入库, 编译产物和 swift 模块缓存不入库
+# OCR 编译产物（用 tools/build_ocr.sh 重新编译）
 tools/ocr
 tools/.swiftcache/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 运行期产物
+logs/
+status.json
+*.sock
+.workbuddy/

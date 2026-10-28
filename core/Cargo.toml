@@ -1,0 +1,22 @@
+[package]
+name = "citics-core"
+version = "0.1.0"
+edition = "2021"
+description = "中信证券网上交易客户端自动化核心"
+
+[dependencies]
+# macOS 系统框架绑定
+core-foundation = "0.10"
+core-graphics = "0.24"
+objc2 = "0.5"
+objc2-foundation = "0.2"
+objc2-app-kit = "0.2"
+
+# 序列化与 IPC
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
+lto = true
+strip = true
