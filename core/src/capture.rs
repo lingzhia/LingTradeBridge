@@ -57,6 +57,18 @@ impl CGRect {
     pub fn null() -> Self {
         Self::new(0.0, 0.0, 0.0, 0.0)
     }
+    pub fn x(&self) -> f64 {
+        self.origin.x
+    }
+    pub fn y(&self) -> f64 {
+        self.origin.y
+    }
+    pub fn w(&self) -> f64 {
+        self.size.w
+    }
+    pub fn h(&self) -> f64 {
+        self.size.h
+    }
 }
 
 // CoreGraphics 常量（与系统头文件数值一致）

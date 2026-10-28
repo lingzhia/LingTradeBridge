@@ -360,6 +360,9 @@ const HEADER_WORDS: &[&str] = &[
     "证券市值", "成交金额", "成交类型", "业务名称", "委托类型",
     "今买成交数量", "无费用参考盈亏", "盈亏比例", "托管单元", "冻结金额",
     "多金融产品市值", "OTC市值", "备注", "撤单数量",
+    // 信用区委托/成交表专有的列头。缺了它们，`snap_header` 就贴不回来，
+    // 表里会多出「撳单标志」「已撳数量」这种一次性的列名
+    "已撤数量", "撤单标志", "成交状态", "委托编号", "成交编号",
 ];
 
 /// 列头文字归一化
@@ -371,6 +374,63 @@ pub fn clean_header(t: &str) -> String {
         .replace('\u{3000}', "")
         .replace('（', "(")
         .replace('）', ")")
+}
+
+/// 把 OCR 认错的列头贴回规范名
+///
+/// 13px 的小字 Vision 经常只错一个字：「昨日余額」认成「昨日余級」、
+/// 「撤单标志」认成「撳单标志」、「成交金额」认成「成交金額」。
+/// 这样同一张表每次读出来的**列名都不一样**，上层按列名取值就会时灵时不灵。
+///
+/// 判据故意收得很紧：**字数必须相同，且至少 len-1 个字对得上**。
+/// 放松成"包含"会出事 —— 「今买成交数量」包含「成交数量」，一包含就贴，
+/// 整整两列会被合并成一列。
+fn snap_header(t: &str) -> String {
+    let c = clean_header(t);
+    if c.is_empty() {
+        return t.to_string();
+    }
+    let chars: Vec<char> = c.chars().collect();
+    let mut best: Option<(usize, &str)> = None;
+    for k in HEADER_WORDS {
+        let kc = clean_header(k);
+        let kchars: Vec<char> = kc.chars().collect();
+        if kchars.len() != chars.len() {
+            continue;
+        }
+        let hit = chars.iter().filter(|ch| kchars.contains(ch)).count();
+        if hit + 1 >= chars.len() && best.map_or(true, |(b, _)| hit > b) {
+            best = Some((hit, k));
+        }
+    }
+    match best {
+        Some((_, name)) => clean_header(name),
+        None => c,
+    }
+}
+
+/// OCR 把小数点认成逗号时修回来
+///
+/// 实测「最新市值 134389,800」实际是 134389.800。只在**能确定**是小数点时改：
+///
+/// - 只有一个逗号，且逗号前超过 3 位数字 → 不可能是千分位，必是小数点
+/// - 只有一个逗号，且逗号后不是 3 位数字 → 不可能是千分位，必是小数点
+///
+/// 其余情况（`1,234,567` 这种规整千分位）原样返回，宁可不动。
+fn fix_decimal_comma(t: &str) -> String {
+    if t.matches(',').count() != 1 || t.contains('.') {
+        return t.to_string();
+    }
+    let (a, b) = t.split_once(',').unwrap();
+    if !a.chars().all(|c| c.is_ascii_digit() || c == '-') || !b.chars().all(|c| c.is_ascii_digit()) {
+        return t.to_string();
+    }
+    let before = a.trim_start_matches('-').len();
+    let after = b.len();
+    if before > 3 || after != 3 {
+        return t.replace(',', ".");
+    }
+    t.to_string()
 }
 
 /// 读表格，返回 (列头, 行, 「共N条」里的 N)
@@ -389,7 +449,12 @@ pub fn read_table_full(
     y_min: f64,
     y_max: Option<f64>,
 ) -> (Vec<String>, Vec<Vec<(String, String)>>, Option<u32>) {
-    let words = ocr::ocr_window(win_number, None);
+    // 表格必须用分块识别，不能用整窗识别。
+    //
+    // 列头只有 13px 高，整窗识别会把相邻列头并成一条（实测「委托类型 成交价格」），
+    // 被并掉的那一列整个消失，它下面的数字全部错位到前一列。
+    // 分块后每条竖条里只剩两三个列头，就能各自成条（实测表头 11 → 15 个）。
+    let words = ocr::ocr_window_tiled(win_number, None, 400.0, 200.0);
     if words.is_empty() {
         return (Vec::new(), Vec::new(), None);
     }
@@ -449,8 +514,10 @@ pub fn read_table_full(
 
     let mut header_cells: Vec<&Word> = bands[header_key].clone();
     header_cells.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
-    let header_names: Vec<String> =
-        header_cells.iter().map(|c| c.trimmed().to_string()).collect();
+    let header_names: Vec<String> = header_cells
+        .iter()
+        .map(|c| snap_header(&c.trimmed()))
+        .collect();
 
     // 列边界用「列头中心点的中点」切。
     //
@@ -524,6 +591,7 @@ pub fn read_table_full(
             };
 
             for (text, px) in pieces {
+                let text = fix_decimal_comma(&text);
                 for (i, (l, r)) in bounds.iter().enumerate() {
                     if px >= *l && px < *r {
                         let cell = &mut row[i].1;
@@ -640,6 +708,38 @@ mod tests {
         let (cx, cy) = Zone::Trade.center();
         assert!(cx > RAIL_X && cx < RAIL_X + RAIL_W);
         assert!(cy > RAIL_Y[4] && cy < RAIL_Y[4] + RAIL_H);
+    }
+
+    #[test]
+    fn 列头错字能贴回规范名() {
+        // 都是实测 OCR 出来的错字
+        assert_eq!(snap_header("昨日余級"), "昨日余额");
+        assert_eq!(snap_header("撳单标志"), "撤单标志");
+        assert_eq!(snap_header("成交金額"), "成交金额");
+        // 本来就对的不能被改坏
+        assert_eq!(snap_header("证券代码"), "证券代码");
+        // 带空格全角括号的要归一化
+        assert_eq!(snap_header("盈亏比例 （%）"), "盈亏比例(%)");
+    }
+
+    #[test]
+    fn 列头贴名不能把长列名并短列名() {
+        // 「今买成交数量」包含「成交数量」，一包含就贴会把两列并成一列
+        assert_ne!(snap_header("今买成交数量"), snap_header("成交数量"));
+        assert_eq!(snap_header("今买成交数量"), "今买成交数量");
+        assert_eq!(snap_header("成交数量"), "成交数量");
+    }
+
+    #[test]
+    fn 逗号当小数点只在确定时修() {
+        assert_eq!(fix_decimal_comma("134389,800"), "134389.800");
+        assert_eq!(fix_decimal_comma("0,5030"), "0.5030");
+        // 规整千分位不动
+        assert_eq!(fix_decimal_comma("1,234,567"), "1,234,567");
+        // 单个千分位也不动（3 位数字，前段 ≤3 位，无法区分，宁可不动）
+        assert_eq!(fix_decimal_comma("1,234"), "1,234");
+        // 已经有小数点的不动
+        assert_eq!(fix_decimal_comma("1.234,5"), "1.234,5");
     }
 }
 

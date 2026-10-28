@@ -86,7 +86,12 @@ pub fn ocr_words(image_path: &str) -> Vec<Word> {
         }
     };
 
-    let out = match Command::new(&bin).arg(image_path).output() {
+    run_ocr(&bin, image_path, &[])
+}
+
+/// 跑一次 OCR 二进制并解析输出
+fn run_ocr(bin: &Path, image_path: &str, extra: &[String]) -> Vec<Word> {
+    let out = match Command::new(bin).arg(image_path).args(extra).output() {
         Ok(o) => o,
         Err(e) => {
             eprintln!("OCR 执行失败: {e}");
@@ -138,6 +143,60 @@ pub fn ocr_window(win_number: u32, crop: Option<crate::capture::CGRect>) -> Vec<
     let words = ocr_words(&path);
     let _ = std::fs::remove_file(&path);
     words
+}
+
+/// 分块识别：把整条横带切成宽 `tile_w`、步进 `step` 的竖条逐条识别，再去重合并
+///
+/// # 为什么需要它
+///
+/// 通达信表格列头只有 13px 高。Vision 在一整条横带上识别时会把相邻两三个
+/// 列头并成一个观测（实测把「委托类型」「成交价格」并成「委托类型 成交价格」，
+/// 于是「成交价格」这一列整个消失，它下面的数字全部错位到前一列）。
+/// 切成 400px 竖条、重叠 50% 后，每条里只剩两三个列头，识别就干净了
+/// （实测整窗只能认到 11 个表头，分块能认全 15 个）。
+///
+/// **只用于表格区域**。块间重叠 + 边界丢弃 + 去重都在 tools/ocr 里做。
+pub fn ocr_window_tiled(
+    win_number: u32,
+    crop: Option<crate::capture::CGRect>,
+    tile_w: f64,
+    step: f64,
+) -> Vec<Word> {
+    let path = match crate::capture::temp_screenshot(win_number, crop) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let bin = match ocr_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!("OCR 工具缺失，请先编译 tools/ocr");
+            let _ = std::fs::remove_file(&path);
+            return Vec::new();
+        }
+    };
+    // 裁切后子图高度未知，用 1e9 让工具自己夹到图片底部
+    let extra = vec![
+        "--tiles".to_string(),
+        tile_w.to_string(),
+        step.to_string(),
+        "0".to_string(),
+        "1e9".to_string(),
+    ];
+    let words = run_ocr(&bin, &path, &extra);
+    let _ = std::fs::remove_file(&path);
+
+    // 子图坐标 → 整窗坐标
+    match crop {
+        Some(r) => words
+            .into_iter()
+            .map(|w| Word {
+                x: w.x + r.x(),
+                y: w.y + r.y(),
+                ..w
+            })
+            .collect(),
+        None => words,
+    }
 }
 
 /// 找第一个完全匹配（或包含）目标文字的词
