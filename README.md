@@ -138,6 +138,51 @@ cd core && CARGO_HOME=.cargo ./target/release/citics-core --check
 旧写法 `{"op":"query","kind":"positions","account":"credit"}` 仍然可用
 （HTTP 跟单链路内部就是这么调的），新代码请用命名空间。
 
+## HTTP 接口
+
+给外部策略/信号源用。默认 `127.0.0.1:8899`，除 `/health` 和 `/` 外都要
+`Authorization: Bearer <http_api_token>`（token 为空时**服务拒绝启动**）。
+
+和 IPC 一样按账户分两套命名空间 —— 信用账户的持仓、委托与普通账户完全独立，
+信用区还多出一批普通区没有的动作：
+
+| 普通账户 | 信用账户 |
+|---|---|
+| `POST /normal/signal` | `POST /credit/signal` |
+| `GET /normal/positions` | `GET /credit/positions` |
+| `GET /normal/orders` | `GET /credit/orders` |
+| `GET /normal/deals` | `GET /credit/deals` |
+| `GET /normal/account` | `GET /credit/account` |
+
+```bash
+TOKEN=$(配置里的 http_api_token)
+
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8899/credit/positions
+
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+     -d '{"action":"buy","security":"600000","amount":100,"price":10.5}' \
+     http://127.0.0.1:8899/credit/signal
+```
+
+**路径里的账户优先于配置**。`/credit/signal` 明确要求在信用账户下单，
+就不去看配置里的 `follow_account` —— 调用方写明了用哪套账户，再去读配置
+是跟调用方对着干。响应里回显 `account` 字段，核对它而不是只看 `ok`。
+
+信用账户尚未实现、但名字已预留的接口返回 **501**（不是 404，免得看起来
+像路径拼错）：
+
+```
+POST /credit/margin_buy     融资买入
+POST /credit/short_sell     融券卖出
+POST /credit/repay_cash     现金还款
+POST /credit/repay_stock    卖券还款
+POST /credit/buy_to_repay   买券还券
+POST /credit/return_stock   现券还券
+```
+
+老路径 `/signal`、`/positions` 等继续可用（同花顺版的策略推送代码不用改）：
+账户取配置里的 `follow_account`，查询默认普通账户。
+
 ## 内核生命周期
 
 **内核可以完全脱离界面独立运行**（命令行、`launchd`、别的工具拉起来），
@@ -185,7 +230,7 @@ cd core && CARGO_HOME=.cargo ./target/release/citics-core --check
 
 进行中：面板导航、填单、四类查询（持仓/委托/成交/资金）。
 
-未开始：HTTP 信号跟单、仓位管理。
+未开始：仓位管理、信用账户独有委托（融资买入/融券卖出/还款还券）。
 
 ## 与其他子项目的关系
 

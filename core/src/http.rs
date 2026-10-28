@@ -1,10 +1,24 @@
 //! HTTP 信号服务
 //!
-//! 协议与同花顺版 `http信号服务.py` 保持一致，方便复用已有的策略推送代码：
-//!   GET  /health     健康检查（免鉴权）
-//!   GET  /           端点列表（免鉴权，不含任何账户数据）
-//!   POST /signal     接收信号，需 `Authorization: Bearer <token>`
-//!   GET  /positions|/orders|/deals|/account   查询，同样需鉴权
+//! 协议与同花顺版 `http信号服务.py` 保持一致，方便复用已有的策略推送代码。
+//!
+//! **接口按账户分两套命名空间**（普通 normal / 信用 credit）：这两个账户是
+//! 平行的两套界面，持仓委托各不相通，信用区还多出一批普通区没有的动作。
+//! 用一套路径加 `?account=` 参数会让调用方分不清语义，也没地方挂信用独有的接口。
+//!
+//!   GET  /health                              健康检查（免鉴权）
+//!   GET  /                                    端点列表（免鉴权，不含账户数据）
+//!
+//!   POST /normal/signal                       普通账户下单信号
+//!   POST /credit/signal                       信用账户下单信号
+//!   GET  /normal/positions|orders|deals|account
+//!   GET  /credit/positions|orders|deals|account
+//!
+//!   信用账户独有、尚未实现的接口（明确返回未实现，不是 404）：
+//!   POST /credit/margin_buy|short_sell|repay_cash|repay_stock|buy_to_repay|return_stock
+//!
+//! 兼容老路径 `/signal`、`/positions` 等（同花顺版的策略推送代码不用改）：
+//! 账户取配置里的 `follow_account`，查询默认普通账户。
 //!
 //! 只用 `std::net` 手写 HTTP，不引第三方 web 框架 —— 这个服务只需要处理
 //! 单机、单客户端、低频的 JSON 推送，为一个最小实现拉进 axum/hyper 一整套
@@ -21,11 +35,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-/// 信号处理回调：收到一条信号 JSON，返回给调用方的响应体
-pub type SignalHandler = Arc<dyn Fn(&serde_json::Value) -> serde_json::Value + Send + Sync>;
+/// 信号处理回调：(指定账户, 信号 JSON) -> 响应体
+///
+/// 账户 `Some("normal"|"credit")` 表示调用方在 URL 里指定了用哪个账户；
+/// `None` 表示走老路径 `/signal`，由实现取配置里的 `follow_account`。
+pub type SignalHandler = Arc<
+    dyn Fn(Option<&str>, &serde_json::Value) -> serde_json::Value + Send + Sync,
+>;
 
-/// 查询回调：路径 -> (参数, 返回值)
-pub type QueryHandler = Arc<dyn Fn(&str) -> Result<serde_json::Value, String> + Send + Sync>;
+/// 查询回调：(账户, 查询类型) -> 返回值
+///
+/// 账户是 `Some("normal")` / `Some("credit")`；`None` 表示走老路径，由实现
+/// 决定用什么账户（当前是普通账户）。
+pub type QueryHandler =
+    Arc<dyn Fn(Option<&str>, &str) -> Result<serde_json::Value, String> + Send + Sync>;
 
 pub struct HttpServer {
     stop: Arc<AtomicBool>,
@@ -110,6 +133,38 @@ impl Drop for HttpServer {
     }
 }
 
+/// 信用账户独有、尚未实现的动作
+///
+/// 名字先定下来，实现前明确回 501「未实现」—— 让调用方能区分「这个名字是对
+/// 的但还没做」和「路径写错了」。这些动作对应信用委托的二级标签（融资买入 /
+/// 融券卖出 / 现金还款 / 卖券还款 / 买券还券 / 现券还券），面板布局与普通
+/// 下单面板完全不同，未在实盘验证过不放出。
+const CREDIT_PENDING: &[&str] = &[
+    "margin_buy",
+    "short_sell",
+    "repay_cash",
+    "repay_stock",
+    "buy_to_repay",
+    "return_stock",
+];
+
+/// 把路径拆成 (账户命名空间, 动作)
+///
+/// `/credit/positions` → `(Some("credit"), "positions")`
+/// `/positions`        → `(None, "positions")`（老路径，账户由实现决定）
+/// `/`                 → `(None, "")`
+fn parse_path(path: &str) -> (Option<&'static str>, &str) {
+    let rest = path.trim_start_matches('/');
+    for ns in ["normal", "credit"] {
+        if let Some(tail) = rest.strip_prefix(ns).and_then(|t| t.strip_prefix('/')) {
+            if !tail.is_empty() {
+                return (Some(if ns == "normal" { "normal" } else { "credit" }), tail);
+            }
+        }
+    }
+    (None, rest)
+}
+
 /// 一个请求的解析结果
 struct Request {
     method: String,
@@ -143,8 +198,21 @@ fn handle_conn(
         return respond(&mut stream, 200, &serde_json::json!({
             "ok": true,
             "service": "citics-order-http",
-            "endpoints": ["GET /health", "POST /signal",
-                          "GET /account", "GET /positions", "GET /orders", "GET /deals"]
+            "namespaces": ["normal", "credit"],
+            "endpoints": [
+                "GET /health",
+                "POST /normal/signal", "POST /credit/signal",
+                "GET /normal/account", "GET /normal/positions",
+                "GET /normal/orders", "GET /normal/deals",
+                "GET /credit/account", "GET /credit/positions",
+                "GET /credit/orders", "GET /credit/deals",
+                "POST /credit/margin_buy", "POST /credit/short_sell",
+                "POST /credit/repay_cash", "POST /credit/repay_stock",
+                "POST /credit/buy_to_repay", "POST /credit/return_stock",
+            ],
+            "legacy": ["POST /signal",
+                       "GET /account", "GET /positions",
+                       "GET /orders", "GET /deals"]
         }));
     }
 
@@ -159,7 +227,23 @@ fn handle_conn(
         }));
     }
 
-    if req.method == "POST" && req.path == "/signal" {
+    // 拆路径：/credit/positions → (Some("credit"), "positions")
+    // 老路径 /positions 没有前缀，账户给 None，由实现决定。
+    let (ns, action) = parse_path(&req.path);
+
+    // 信用独有、尚未实现的动作。必须先于 dispatch 拦下来 —— 否则会被
+    // 当成未知路径返回 404，调用方会以为是路径拼错了。
+    if req.method == "POST" && ns == Some("credit") && CREDIT_PENDING.contains(&action) {
+        return respond(&mut stream, 501, &serde_json::json!({
+            "ok": false,
+            "error": format!(
+                "credit.{action} 尚未实现：需要信用委托二级标签面板的填单与复核，未在实盘验证"
+            ),
+            "pending": CREDIT_PENDING,
+        }));
+    }
+
+    if req.method == "POST" && action == "signal" {
         let v: serde_json::Value = match serde_json::from_str(&req.body) {
             Ok(v) => v,
             Err(e) => {
@@ -173,15 +257,14 @@ fn handle_conn(
                 "ok": false, "error": "信号必须是 JSON 对象"
             }));
         }
-        let out = signal(&v);
+        let out = signal(ns, &v);
         return respond(&mut stream, 200, &out);
     }
 
     if req.method == "GET" {
-        let kind = req.path.trim_start_matches('/');
-        match query(kind) {
+        match query(ns, action) {
             Ok(v) => {
-                let mut body = serde_json::json!({"ok": true});
+                let mut body = serde_json::json!({"ok": true, "account": ns.unwrap_or("normal")});
                 if let (Some(dst), Some(src)) = (body.as_object_mut(), v.as_object()) {
                     for (k, val) in src {
                         dst.insert(k.clone(), val.clone());
@@ -276,4 +359,34 @@ fn respond(stream: &mut TcpStream, status: u16, body: &serde_json::Value) -> std
     stream.write_all(head.as_bytes())?;
     stream.write_all(payload.as_bytes())?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 路径按账户拆命名空间() {
+        assert_eq!(parse_path("/credit/positions"), (Some("credit"), "positions"));
+        assert_eq!(parse_path("/normal/signal"), (Some("normal"), "signal"));
+        assert_eq!(parse_path("/credit/margin_buy"), (Some("credit"), "margin_buy"));
+        // 老路径不带命名空间
+        assert_eq!(parse_path("/positions"), (None, "positions"));
+        assert_eq!(parse_path("/signal"), (None, "signal"));
+        assert_eq!(parse_path("/"), (None, ""));
+        // 名字里含 credit 但不是命名空间，不能被误拆
+        assert_eq!(parse_path("/creditreport"), (None, "creditreport"));
+        assert_eq!(parse_path("/credit/"), (None, "credit/"));
+    }
+
+    #[test]
+    fn 信用待开发动作有名字() {
+        assert!(CREDIT_PENDING.contains(&"margin_buy"));
+        assert!(CREDIT_PENDING.contains(&"short_sell"));
+        assert!(CREDIT_PENDING.contains(&"repay_cash"));
+        assert!(CREDIT_PENDING.contains(&"return_stock"));
+        // 普通账户的接口不该出现在这里面 —— 否则会被当成未实现拦掉
+        assert!(!CREDIT_PENDING.contains(&"signal"));
+        assert!(!CREDIT_PENDING.contains(&"positions"));
+    }
 }
