@@ -199,8 +199,22 @@ pub fn unlock_once(
     let cy = panel::LOCK_PWD_Y + panel::LOCK_PWD_H / 2.0;
     panel::click_in_window(win, cx, cy, settle);
 
-    // 清空再填。用剪贴板粘贴而不是逐字敲 —— 中信的密码框对合成按键不敏感
-    input::select_all_and_replace(password, settle * 0.5);
+    // 逐位按键输入，**不能用剪贴板粘贴**。
+    //
+    // 这个框是安全输入框（Secure Input），实测 Cmd+V / Cmd+A 全被系统拦掉：
+    // 粘贴后框内一个字符都没有，而我们还以为填进去了，接着点确定当然解不开。
+    // 数字键盘的物理键码则能正常输入。
+    input::press_key(input::KEY_DELETE, settle * 0.3);
+    for ch in password.chars() {
+        match input::digit_keycode(ch) {
+            Some(code) => input::press_key(code, 0.05),
+            None => {
+                // 非数字密码：退回 unicode 直送（不会被安全输入拦截的少),
+                // 但至少能覆盖字母类密码
+                input::type_text(&ch.to_string(), 0.05);
+            }
+        }
+    }
 
     // 点"确定"。坐标实测自 OCR：密码框正下方偏左，28×16 的小按钮。
     // 同时补一次回车 —— 这两个动作任一都能提交，双保险且成本极低。

@@ -49,6 +49,23 @@ pub const KEY_DELETE: CGKeyCode = 51;
 pub const KEY_ESC: CGKeyCode = 53;
 pub const KEY_LEFT: CGKeyCode = 123;
 
+/// 数字键 0-9 的键码（美国键盘布局，与 macOS 虚拟键码表一致）
+pub fn digit_keycode(c: char) -> Option<CGKeyCode> {
+    Some(match c {
+        '0' => 29,
+        '1' => 18,
+        '2' => 19,
+        '3' => 20,
+        '4' => 21,
+        '5' => 23,
+        '6' => 22,
+        '7' => 26,
+        '8' => 28,
+        '9' => 25,
+        _ => return None,
+    })
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CGPoint2 {
