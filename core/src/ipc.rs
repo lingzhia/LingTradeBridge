@@ -123,8 +123,6 @@ impl Shared {
         c.app_path = saved.app_path;
         c.settle = saved.settle;
         c.trade_password = saved.trade_password;
-        c.auto_unlock = saved.auto_unlock;
-        c.unlock_interval = saved.unlock_interval.max(5);
         c.unlock_max_fail = saved.unlock_max_fail.max(1);
         c
     }
@@ -159,14 +157,6 @@ pub fn serve(cfg: CoreConfig) -> std::io::Result<()> {
     });
 
     eprintln!("中信自动化核心已就绪，socket: {}", path.display());
-
-    // 自动解锁守护线程
-    if shared.cfg().auto_unlock {
-        let bg = Arc::clone(&shared);
-        std::thread::spawn(move || autounlock_loop(bg));
-    } else {
-        eprintln!("自动解锁: 已关闭");
-    }
 
     for stream in listener.incoming() {
         match stream {
@@ -241,6 +231,49 @@ fn handle_conn(stream: UnixStream, shared: Arc<Shared>) {
             break;
         }
         let _ = writer.flush();
+    }
+}
+
+/// 操作前确保交易界面处于解锁态
+///
+/// 设计取舍：**不做后台守护线程**。定时轮询会在用户离开电脑时不停尝试输密码，
+/// 一旦密码错就更糟——券商对连续错密码锁账户，半夜被锁早晨就用不了了。
+/// 改成"有活要干才解锁"：只有在真的要执行操作、而界面又恰好锁着时，
+/// 才输一次密码。没活干的时候完全不碰客户端。
+fn ensure_unlocked(
+    win: &capture::WindowInfo,
+    pid: u32,
+    cfg: &CoreConfig,
+    shared: &Shared,
+) -> Result<(), String> {
+    if !unlock::is_locked(pid, win.number) {
+        return Ok(());
+    }
+    // 没配密码就别乱点，让调用方明确报错
+    if cfg.trade_password.is_empty() {
+        return Err("交易界面已锁定，且未配置交易密码（请在界面里填好并保存）".into());
+    }
+
+    let mut g = shared.guard.lock().unwrap();
+    let out = unlock::unlock_guarded(
+        win,
+        &cfg.trade_password,
+        cfg.settle,
+        pid,
+        &mut g,
+        cfg.unlock_max_fail,
+    );
+    match out {
+        UnlockOutcome::Success => Ok(()),
+        UnlockOutcome::NotLocked => Ok(()),
+        UnlockOutcome::Failed => Err(format!(
+            "交易界面已锁定，自动解锁失败（连续第 {} 次，上限 {}）",
+            g.fail_count, cfg.unlock_max_fail
+        )),
+        UnlockOutcome::CircuitOpen => Err(
+            "自动解锁处于熔断状态（连续输错密码已停止尝试），请手动解锁后重置熔断".into(),
+        ),
+        UnlockOutcome::NoPassword => Err("交易界面已锁定，且未配置交易密码".into()),
     }
 }
 
@@ -436,14 +469,14 @@ fn do_unlock(req: &Request, shared: &Shared) -> Response {
 /// 查询
 fn do_query(req: &Request, shared: &Shared) -> Response {
     let cfg = shared.cfg();
-    let (_pid, win) = match panel::ensure_window(&cfg.app_path) {
+    let (pid, win) = match panel::ensure_window(&cfg.app_path) {
         Some(v) => v,
         None => return Response::err(req.id, "客户端窗口不可用"),
     };
 
-    // 锁着的时候读出来的是锁屏提示，不是表格。先说清楚，别让人以为是空仓
-    if unlock::is_locked(_pid, win.number) {
-        return Response::err(req.id, "交易界面已锁定，请先解锁再查询");
+    // 锁着的时候读出来的是锁屏提示，不是表格 —— 先解锁一次再干活
+    if let Err(e) = ensure_unlocked(&win, pid, &cfg, shared) {
+        return Response::err(req.id, e);
     }
 
     let kind = req.kind.as_deref().unwrap_or("");
@@ -589,82 +622,3 @@ pub fn ax_ready() -> bool {
     input::accessibility_allowed()
 }
 
-
-/// 自动解锁守护线程
-///
-/// # 设计取舍
-///
-/// 它只做一件事：发现锁了就去解。但有两道闸门：
-///   1. 熔断打开就整个线程退出，不再尝试（券商连错会锁账户）
-///   2. 没配密码就空转等待，不做无用功
-///
-/// 日志只写状态变化，不写"每次检查" —— 否则盘后一直挂着会刷爆日志。
-fn autounlock_loop(shared: Arc<Shared>) {
-    if shared.cfg().trade_password.is_empty() {
-        eprintln!("自动解锁: 未配置交易密码，守护线程待命");
-    }
-
-    let mut last_state: Option<bool> = None;
-
-    loop {
-        // 每轮都现读配置，改密码/改间隔/开关自动解锁都即时生效，不必重启核心
-        let cfg = shared.cfg();
-        std::thread::sleep(std::time::Duration::from_secs(cfg.unlock_interval));
-
-        // 熔断检查
-        {
-            let g = shared.guard.lock().unwrap();
-            if g.tripped {
-                eprintln!("自动解锁: 熔断已打开，守护线程退出。请手动解锁并重置");
-                return;
-            }
-        }
-
-        // 没密码就等着
-        if cfg.trade_password.is_empty() {
-            continue;
-        }
-
-        let (pid, win) = match panel::ensure_window(&cfg.app_path) {
-            Some(v) => v,
-            None => continue,
-        };
-
-        let locked = unlock::is_locked(pid, win.number);
-        match last_state {
-            Some(prev) if prev == locked => continue, // 状态没变，不重复干活
-            _ => {
-                if locked {
-                    eprintln!("检测到交易界面已锁定，尝试自动解锁");
-                }
-                last_state = Some(locked);
-            }
-        }
-
-        if !locked {
-            continue;
-        }
-
-        let mut g = shared.guard.lock().unwrap();
-        let out = unlock::unlock_guarded(
-            &win,
-            &cfg.trade_password,
-            cfg.settle,
-            pid,
-            &mut g,
-            cfg.unlock_max_fail,
-        );
-        match out {
-            UnlockOutcome::Success => eprintln!("自动解锁成功"),
-            UnlockOutcome::Failed => eprintln!(
-                "自动解锁失败（连续第 {} 次，上限 {}）",
-                g.fail_count, cfg.unlock_max_fail
-            ),
-            UnlockOutcome::CircuitOpen => {
-                eprintln!("自动解锁已熔断，停止尝试");
-                return;
-            }
-            _ => {}
-        }
-    }
-}

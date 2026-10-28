@@ -53,8 +53,6 @@ DEFAULT_CONFIG = {
     "app_path": "/Applications/中信证券网上交易.app",
     "settle": 0.45,
     "trade_password": "",
-    "auto_unlock": True,
-    "unlock_interval": 20,
     "unlock_max_fail": 3,
     "http_port": 8899,
     "following": False,
@@ -232,26 +230,23 @@ class App:
             row, text="", foreground="#c0392b")
         self.unlock_hint.pack(side="left", padx=8)
 
-        # 自动解锁设置
-        auto = ttk.LabelFrame(self.root, text="自动解锁")
+        # 解锁策略
+        #
+        # 刻意**没有**"定时自动解锁"开关：后台轮询会在没人看着的时候反复试密码，
+        # 密码错一次就记一次，券商对连续错密码是锁账户的。
+        # 现在只有执行业务操作（查询/下单）时才会检查并解锁一次。
+        auto = ttk.LabelFrame(self.root, text="解锁策略")
         auto.pack(fill="x", **pad)
 
-        row = ttk.Frame(auto)
-        row.pack(fill="x", padx=10, pady=6)
-        self.auto_unlock_var = tk.BooleanVar(
-            value=bool(self.cfg.get("auto_unlock", True)))
-        ttk.Checkbutton(row, text="检测到界面锁定就自动解锁",
-                        variable=self.auto_unlock_var).pack(side="left")
+        ttk.Label(
+            auto,
+            text="不做定时自动解锁。只在执行查询/下单时发现界面锁定，才自动解锁一次。",
+            foreground="#555555",
+        ).pack(anchor="w", padx=10, pady=(6, 4))
 
         row = ttk.Frame(auto)
         row.pack(fill="x", padx=10, pady=(0, 8))
-        ttk.Label(row, text="检查间隔（秒）").pack(side="left")
-        self.interval_var = tk.StringVar(
-            value=str(self.cfg.get("unlock_interval", 20)))
-        ttk.Spinbox(row, from_=5, to=300, width=6,
-                    textvariable=self.interval_var).pack(side="left", padx=6)
-
-        ttk.Label(row, text="连错几次停手").pack(side="left", padx=(20, 0))
+        ttk.Label(row, text="连错几次停手").pack(side="left", padx=(0, 0))
         self.maxfail_var = tk.StringVar(
             value=str(self.cfg.get("unlock_max_fail", 3)))
         ttk.Spinbox(row, from_=1, to=10, width=6,
@@ -364,11 +359,6 @@ class App:
         cfg["app_name"] = os.path.basename(
             cfg["app_path"]).replace(".app", "") or DEFAULT_CONFIG["app_name"]
         cfg["trade_password"] = self.pwd_var.get()
-        cfg["auto_unlock"] = bool(self.auto_unlock_var.get())
-        try:
-            cfg["unlock_interval"] = max(5, int(self.interval_var.get()))
-        except ValueError:
-            cfg["unlock_interval"] = 20
         try:
             cfg["unlock_max_fail"] = max(1, int(self.maxfail_var.get()))
         except ValueError:

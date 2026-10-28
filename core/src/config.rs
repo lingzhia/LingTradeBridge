@@ -30,12 +30,6 @@ pub struct AppConfig {
     /// 交易密码。空字符串表示未配置
     #[serde(default)]
     pub trade_password: String,
-    /// 是否自动解锁
-    #[serde(default = "def_true")]
-    pub auto_unlock: bool,
-    /// 检查锁的间隔（秒）
-    #[serde(default = "def_interval")]
-    pub unlock_interval: u64,
     /// 连错几次后熔断
     #[serde(default = "def_max_fail")]
     pub unlock_max_fail: u32,
@@ -59,12 +53,6 @@ fn def_app_path() -> String {
 fn def_settle() -> f64 {
     0.45
 }
-fn def_true() -> bool {
-    true
-}
-fn def_interval() -> u64 {
-    20
-}
 fn def_max_fail() -> u32 {
     3
 }
@@ -82,8 +70,6 @@ impl Default for AppConfig {
             app_path: def_app_path(),
             settle: def_settle(),
             trade_password: String::new(),
-            auto_unlock: def_true(),
-            unlock_interval: def_interval(),
             unlock_max_fail: def_max_fail(),
             http_port: def_http_port(),
             following: false,
@@ -198,7 +184,6 @@ mod tests {
     fn 缺字段用默认值() {
         let c: AppConfig = serde_json::from_str(r#"{"trade_password":"123456"}"#).unwrap();
         assert_eq!(c.unlock_max_fail, 3);
-        assert!(c.auto_unlock);
         assert!(c.has_password());
     }
 }

@@ -42,10 +42,6 @@ pub struct CoreConfig {
     pub socket_path: PathBuf,
     /// 交易密码（从配置文件读入，仅存内存）
     pub trade_password: String,
-    /// 自动解锁守护线程是否启用
-    pub auto_unlock: bool,
-    /// 守护线程检查间隔（秒）
-    pub unlock_interval: u64,
     /// 配置文件路径
     pub config_path: PathBuf,
 }
@@ -59,8 +55,6 @@ impl Default for CoreConfig {
             unlock_max_fail: 3,
             socket_path: PathBuf::from("/tmp/citics-core.sock"),
             trade_password: String::new(),
-            auto_unlock: true,
-            unlock_interval: 20,
             config_path: config::default_config_path(),
         }
     }
@@ -104,8 +98,6 @@ fn main() {
     cfg.app_path = saved.app_path.clone();
     cfg.settle = saved.settle;
     cfg.trade_password = saved.trade_password.clone();
-    cfg.auto_unlock = saved.auto_unlock;
-    cfg.unlock_interval = saved.unlock_interval.max(5);
     cfg.unlock_max_fail = saved.unlock_max_fail.max(1);
 
     if let Err(e) = ipc::serve(cfg) {
