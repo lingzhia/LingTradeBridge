@@ -296,7 +296,9 @@ class App:
         ensure_user_data_dir()
         self.cfg = load_config()
         self.core = CoreClient()
-        self.core_proc = None
+        self.core_proc = None          # 只有「本 GUI 拉起来的」内核才有句柄
+        self.core_owned = False        # 内核是不是本 GUI 启动的
+        self.core_pid = None           # 从 ping/status 拿到的内核 pid
         self.log_queue = queue.Queue()
         self.show_password = tk.BooleanVar(value=False)
         self._log_lock = threading.Lock()
@@ -308,6 +310,9 @@ class App:
 
         self._build()
         self._pump_log()
+        # 先探内核再进入轮询：启动那一刻界面上就必须如实显示内核在不在跑，
+        # 不能等三秒后的第一次轮询才给出结果。
+        self._startup_check()
         self._poll_status()
         self.log(f"配置：{CONFIG_PATH}")
         self.log(f"日志：{today_log_path()}")
@@ -332,6 +337,15 @@ class App:
         self.detail_var = tk.StringVar(value="")
         ttk.Label(top, textvariable=self.detail_var, anchor="w",
                   foreground="#777").pack(side="left", padx=12)
+
+        # 内核状态单独一个标签，放右边。
+        # 内核可以脱离 GUI 独立运行，所以「内核在跑吗」和「交易界面能用吗」
+        # 是两件独立的事，不能挤在同一个标签里显示。
+        self.core_var = tk.StringVar(value="内核：检测中…")
+        self.core_label = tk.Label(
+            top, textvariable=self.core_var, anchor="e",
+            font=(FONT_UI, 11), fg="#666")
+        self.core_label.pack(side="right")
 
         # ---- 主区域：左右分栏 ----
         main = ttk.PanedWindow(self.root, orient="horizontal")
@@ -722,12 +736,82 @@ class App:
         threading.Thread(target=work, daemon=True).start()
         self.root.after(3000, self._poll_status)
 
+    # ------------------------------------------------------------------
+    # 内核进程：探测 / 启动 / 停止
+    # ------------------------------------------------------------------
+    #
+    # 内核可以完全脱离 GUI 独立运行（命令行、launchd、别的工具拉起来）。
+    # 所以「内核在不在跑」必须以 socket 上的真实应答为准，不能靠
+    # self.core_proc 判断 —— 那个句柄只在「本 GUI 亲手拉起」时才存在，
+    # 内核被别处启动时它是 None，误用它就会把「在跑」显示成「没跑」。
+    #
+    # 两件事分开：ping 探活（轻，不碰客户端），status 读交易界面状态（重）。
+
+    def _startup_check(self, auto_start=True):
+        """探一次内核，结果直接反映到界面。
+
+        `auto_start` 只在界面启动那一刻为 True —— 那时用户还没机会做任何
+        决定，替他把内核拉起来是帮忙。但如果是用户刚点了「停止核心」，
+        同样这条探测就绝不能顺手又起一个，那是跟用户对着干。
+        """
+        def work():
+            r = self.core.call("ping", timeout=5)
+            self.root.after(0, lambda: self._render_core_probe(r, auto_start=auto_start))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_core_state(self, running, pid=None, follow=False):
+        """内核指示器只由这一处写。
+
+        所有路径（启动探测、定时轮询、启动/停止内核）都调它，
+        口径才不会打架 —— 之前「status 通了但标签还说未运行」就是这么来的。
+        """
+        owned = self.core_proc is not None and self.core_proc.poll() is None
+        self.core_owned = owned and running
+        self.core_pid = pid if running else None
+
+        if not running:
+            self.core_var.set("内核：未运行")
+            self.core_label.configure(fg="#999")
+            return
+
+        shown = pid or (self.core_proc.pid if owned else None)
+        who = f"pid {shown}" if shown else "外部启动"
+        # 本 GUI 拉起来的标「本界面」，别处启动的标「外部」，
+        # 用户能一眼看出关掉界面会不会把别人的跟单带走
+        tag = "本界面" if owned else "外部"
+        text = f"内核：运行中 · {tag}（{who}）"
+        if follow:
+            text += " · 跟单中"
+        self.core_var.set(text)
+        self.core_label.configure(fg="#1e8449")
+
+    def _render_core_probe(self, r, auto_start=False):
+        if not r.get("ok"):
+            self._render_core_state(False)
+            # 内核没跑时，「启动核心」是唯一有意义的动作，替用户点一下，
+            # 免得打开界面看到一片「核心未运行」却不知道要按哪个按钮。
+            if auto_start:
+                self.log("未检测到内核，正在自动启动…")
+                self.on_start_core()
+            return
+
+        pid = r.get("core_pid")
+        self._render_core_state(True, pid, bool(r.get("follow_running")))
+        if auto_start and not (self.core_proc and self.core_proc.poll() is None):
+            who = f"pid {pid}" if pid else "外部启动"
+            self.log(f"检测到内核已在运行（{who}），直接接管使用")
+
     def _render_status(self, r):
         if not r.get("ok"):
             self.status_var.set("核心未运行")
             self.status_label.configure(fg="#999")
             self.detail_var.set(r.get("error", ""))
+            # status 都连不上，等于内核不在了 —— 内核指示器跟着变，
+            # 否则会出现「交易界面未检测」但「内核运行中」的矛盾画面。
+            self._render_core_state(False)
             return
+
+        self._render_core_state(True, r.get("core_pid"), bool(r.get("follow_running")))
 
         state = r.get("state")
         mapping = {
@@ -1092,6 +1176,17 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def on_start_core(self):
+        # 先问 socket，而不是问 self.core_proc：内核可能是别处启动的，
+        # 那种情况下 core_proc 是 None，但内核明明在跑，再起一个就会
+        # 顶掉 socket 文件、把前一个变成收不到请求的僵尸进程。
+        r = self.core.call("ping", timeout=5)
+        if r.get("ok"):
+            pid = r.get("core_pid")
+            who = f"pid {pid}" if pid else "未知 pid"
+            self.log(f"核心已在运行（{who}），无需重复启动")
+            self._render_core_probe(r)
+            return
+
         if self.core_proc and self.core_proc.poll() is None:
             self.log("核心已在运行")
             return
@@ -1110,11 +1205,8 @@ class App:
         if os.path.exists(OCR_BIN):
             env["CITICS_OCR_BIN"] = OCR_BIN
 
-        try:
-            if os.path.exists(SOCKET_PATH):
-                os.unlink(SOCKET_PATH)
-        except Exception:
-            pass
+        # 不在这里删 socket 文件：内核自己会判断「是活的就拒绝启动、
+        # 是残骸才清掉」。GUI 抢先删会打掉一个正在服务的内核的入口。
 
         self.core_proc = subprocess.Popen(
             [bin_, "--socket", SOCKET_PATH],
@@ -1122,6 +1214,14 @@ class App:
             text=True, env=env,
         )
         self.log(f"核心已启动 (pid {self.core_proc.pid})")
+        self._render_core_state(True, self.core_proc.pid)
+
+        # 内核 bind 失败会立刻退出（比如端口/socket 被占），等一拍确认真的活着
+        def verify():
+            if self.core_proc is not None and self.core_proc.poll() is not None:
+                self.log("核心启动后立即退出，看日志…", "ERROR")
+                self._render_core_state(False)
+        self.root.after(900, verify)
 
         def tail():
             for line in self.core_proc.stdout:
@@ -1129,15 +1229,43 @@ class App:
         threading.Thread(target=tail, daemon=True).start()
 
     def on_stop_core(self):
-        if not self.core_proc or self.core_proc.poll() is not None:
-            self.log("核心未在运行")
+        owned_alive = self.core_proc is not None and self.core_proc.poll() is None
+
+        if owned_alive:
+            # 自己拉起来的：直接发信号，能拿到退出码
+            self.core_proc.terminate()
+            try:
+                self.core_proc.wait(timeout=5)
+            except Exception:
+                self.core_proc.kill()
+            self.log("核心已停止")
+            self.core_proc = None
+            self._render_core_state(False)
             return
-        self.core_proc.terminate()
-        try:
-            self.core_proc.wait(timeout=5)
-        except Exception:
-            self.core_proc.kill()
-        self.log("核心已停止")
+
+        # 不是本 GUI 启动的：走 IPC 让内核自己退，比按 pid 发信号干净 ——
+        # 内核会自己删掉 socket 文件，不会留下残骸让下次启动误判。
+        r = self.core.call("ping", timeout=5)
+        if not r.get("ok"):
+            self.log("核心未在运行")
+            self._render_core_state(False)
+            return
+
+        pid = r.get("core_pid")
+        if not messagebox.askyesno(
+                "停止核心",
+                f"内核不是本界面启动的（pid {pid}）。\n"
+                "停止它会让正在进行的跟单中断。确定停止吗？"):
+            return
+
+        res = self.core.call("shutdown", timeout=10)
+        if not res.get("ok"):
+            self.log(f"停止内核失败：{res.get('error')}", "ERROR")
+            return
+        self.log(f"已请求核心退出（pid {pid}）")
+        self._render_core_state(False)
+        # 等它真的退干净：socket 消失后 ping 才会失败。只探不启。
+        self.root.after(800, lambda: self._startup_check(auto_start=False))
 
     def on_open_log_dir(self):
         try:
@@ -1146,10 +1274,19 @@ class App:
             self.log(f"打开日志目录失败：{e}", "ERROR")
 
     def on_close(self):
-        if self.core_proc and self.core_proc.poll() is None:
+        owned_alive = self.core_proc is not None and self.core_proc.poll() is None
+        if owned_alive:
             if not messagebox.askyesno("退出", "核心仍在运行，一起停止吗？"):
                 return
             self.on_stop_core()
+        elif self.core_pid:
+            # 内核是别处启动的，默认不动它：那可能是别人在跑跟单，
+            # 关界面顺手杀掉等于断人交易。
+            if messagebox.askyesno(
+                    "退出",
+                    f"内核（pid {self.core_pid}）不是本界面启动的，仍在运行。\n"
+                    "要一起停止吗？选「否」则只关闭界面。"):
+                self.on_stop_core()
         self.root.destroy()
 
 

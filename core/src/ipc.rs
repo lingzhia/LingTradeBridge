@@ -88,6 +88,12 @@ pub struct Response {
     pub account: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// 核心自己的 pid。GUI 靠它判断「内核在跑吗、是谁启动的、要停谁」
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core_pid: Option<u32>,
+    /// 跟单是否在运行（内核可能由外部启动并在跑单，GUI 只是旁观者）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_running: Option<bool>,
 }
 
 impl Response {
@@ -105,6 +111,8 @@ impl Response {
             unlock_tripped: None,
             account: None,
             pid: None,
+            core_pid: None,
+            follow_running: None,
         }
     }
     fn err(id: u64, msg: impl Into<String>) -> Self {
@@ -161,14 +169,58 @@ impl Shared {
     }
 }
 
+/// 探测 socket 上是不是已经有一个活着的内核
+///
+/// 返回 `Some(pid)` 表示有内核在应答（pid 可能解析不出来，那就是 `Some(None)`），
+/// 返回 `None` 表示连不上 —— 文件只是上次留下的残骸。
+fn probe_running(path: &Path) -> Option<Option<u32>> {
+    let stream = UnixStream::connect(path).ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let mut w = match stream.try_clone() {
+        Ok(w) => w,
+        Err(_) => return Some(None),
+    };
+    if writeln!(w, "{{\"id\":0,\"op\":\"ping\"}}").is_err() {
+        return Some(None);
+    }
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line).is_err() {
+        return Some(None);
+    }
+    let pid = serde_json::from_str::<serde_json::Value>(line.trim())
+        .ok()
+        .and_then(|v| v.get("core_pid").and_then(|p| p.as_u64()))
+        .map(|p| p as u32);
+    Some(pid)
+}
+
 /// 启动服务
 pub fn serve(cfg: CoreConfig) -> std::io::Result<()> {
     let path = cfg.socket_path.clone();
     let guard = UnlockGuard::load(unlock::default_state_path());
 
-    // 清掉上一次异常退出留下的 socket 文件
+    // 关键防线：已经有内核在跑时绝不能 bind。
+    //
+    // Unix socket 的 bind 会直接顶掉别人的 socket 文件 —— 两个进程都活着，
+    // 但只有后起的那个能收到请求，前一个变成收不到活的僵尸；更糟的是
+    // GUI 会以为"内核没跑"然后又起一个，越积越多。
     if Path::new(&path).exists() {
-        let _ = std::fs::remove_file(&path);
+        match probe_running(&path) {
+            Some(existing) => {
+                let who = existing
+                    .map(|p| format!("pid {p}"))
+                    .unwrap_or_else(|| "未知 pid".to_string());
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("已有内核在运行（{who}），不要重复启动。socket: {}", path.display()),
+                ));
+            }
+            // 连不上 = 上次异常退出留下的残留文件，清掉
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
 
     let listener = UnixListener::bind(&path)?;
@@ -858,8 +910,13 @@ fn ensure_unlocked(
 fn dispatch(req: &Request, shared: &Shared) -> Response {
     match req.op.as_str() {
         "ping" => {
+            // 最轻的存活探测：不碰客户端、不截图、不做 OCR。
+            // GUI 启动时用它判断「内核已经在跑了吗」，顺带拿到 pid，
+            // 这样即便内核是命令行/外部的启动的，也能显示并管理。
             let mut r = Response::ok(req.id);
             r.detail = Some("pong".into());
+            r.core_pid = Some(std::process::id());
+            r.follow_running = Some(shared.follow.lock().unwrap().is_some());
             r
         }
 
@@ -904,6 +961,8 @@ fn dispatch(req: &Request, shared: &Shared) -> Response {
                 unlock_tripped: None,
                 account: None,
                 pid: Some(pid),
+                core_pid: Some(std::process::id()),
+                follow_running: None,
             };
         }
         // 调试用：在窗口坐标上点一下（x/y 来自请求的 seq/ts 两个数值字段不好读，
@@ -956,6 +1015,26 @@ fn dispatch(req: &Request, shared: &Shared) -> Response {
             })]);
             return r;
         }
+        // 让 GUI 能停掉不是它拉起来的内核。
+        //
+        // 内核可以脱离 GUI 独立运行（命令行 / launchd 拉起来），那种情况下
+        // 按 pid 发信号也行，但走 IPC 更干净：能确认内核真的收到并打算退出，
+        // 也能让内核自己把 socket 文件收拾掉。
+        "shutdown" => {
+            let path = shared.base.socket_path.clone();
+            let mut r = Response::ok(req.id);
+            r.detail = Some("内核正在退出".into());
+            r.core_pid = Some(std::process::id());
+            // 响应要先写回客户端 —— dispatch 返回后 handle_conn 才 write+flush，
+            // 所以这里只能延后再退，不能立刻 exit。
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let _ = std::fs::remove_file(&path);
+                std::process::exit(0);
+            });
+            r
+        }
+
         "query" => do_query(req, shared),
 
         "place_order" => do_place_order(req, shared),
@@ -1002,6 +1081,9 @@ fn status(req: &Request, shared: &Shared) -> Response {
     let g = shared.guard.lock().unwrap();
     r.unlock_fail_count = Some(g.fail_count);
     r.unlock_tripped = Some(g.tripped);
+    drop(g);
+    r.core_pid = Some(std::process::id());
+    r.follow_running = Some(shared.follow.lock().unwrap().is_some());
     r
 }
 

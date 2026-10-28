@@ -94,17 +94,34 @@ cd core && CARGO_HOME=.cargo ./target/release/citics-core --check
 ## IPC 协议
 
 本地 Unix socket（`/tmp/citics-core.sock`，权限 600），一行一个 JSON。
+**不是 TCP 端口** —— 只有本机、只有本用户能连，不需要另做鉴权。
 
 ```jsonc
-{"id":1,"op":"status"}                    // 客户端与锁状态
-{"id":2,"op":"unlock"}                    // 用配置里的密码解锁
-{"id":3,"op":"unlock","password":"..."}   // 指定密码
-{"id":4,"op":"reset_unlock"}              // 手动重置熔断
-{"id":5,"op":"query","kind":"positions"}  // positions|orders|deals|funds
+{"id":1,"op":"ping"}                      // 内核存活探测，返回 core_pid
+{"id":2,"op":"status"}                    // 客户端与锁状态
+{"id":3,"op":"unlock"}                    // 用配置里的密码解锁
+{"id":4,"op":"unlock","password":"..."}   // 指定密码
+{"id":5,"op":"reset_unlock"}              // 手动重置熔断
+{"id":6,"op":"query","kind":"positions"}  // positions|orders|deals|funds
+{"id":7,"op":"shutdown"}                  // 让内核自行退出（GUI 停止外部内核用）
 ```
 
 响应带同一个 `id`，`ok` 表示成败，`error` 说明原因。
 密码经本机 socket 传输，不落盘、不回显、不写日志。
+
+## 内核生命周期
+
+**内核可以完全脱离界面独立运行**（命令行、`launchd`、别的工具拉起来），
+界面是可选的运维入口，不是必需组件。因此：
+
+- `ping` / `status` 都返回 `core_pid`，界面据此显示内核 pid 和来源（本界面 / 外部）。
+- 界面启动时先用 `ping` 探活：没内核就自动拉一个，已有内核就直接接管，
+  **绝不重复启动**。
+- 内核启动前也会反向探测 socket：能连上说明已有内核在跑，直接拒绝启动
+  （否则 `bind` 会顶掉别人的 socket 文件，旧进程变成收不到请求的僵尸）；
+  连不上说明只是上次异常退出的残骸，清掉再用。
+- 「停止核心」对非本界面启动的内核会二次确认，然后走 `shutdown` op
+  让内核自己退 —— 比按 pid 发信号干净，内核会顺手删掉 socket 文件。
 
 ## 自动解锁的安全设计
 
