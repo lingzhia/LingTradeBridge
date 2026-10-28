@@ -234,6 +234,25 @@ fn handle_conn(stream: UnixStream, shared: Arc<Shared>) {
     }
 }
 
+/// 值像不像一个金额/数字
+///
+/// 资金表里混着「普通客户」「人民币」这类文本列，光靠表头匹配会把它们当数值字段收进来。
+fn looks_numeric(v: &str) -> bool {
+    let t = v.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let mut digits = 0;
+    for c in t.chars() {
+        if c.is_ascii_digit() {
+            digits += 1;
+        } else if !matches!(c, '.' | '-' | '+' | ',' | '%' | ' ') {
+            return false;
+        }
+    }
+    digits > 0
+}
+
 /// 宽松包含判断：允许 OCR 认错一两个字
 ///
 /// 比较两串中文时，只要短的那串有**超过一半字符**出现在长串里就算命中。
@@ -607,23 +626,43 @@ fn do_query_funds(
         return Response::err(req.id, "没读到资金表，可能不在交易面板或停留在了别的页");
     }
 
+    // 字段名 → 取值。用 HashSet 去重，避免同一列被匹配两次。
+    //
+    // 这里踩过两个坑：
+    //   1. 模糊匹配让「总资产」同时命中了旁边的列，一个字段映射出三个值，
+    //      其中一个是「普通客户」（资产属性列的内容）。
+    //   2. 表头行里「总资产」在 OCR 后的表头列表中出现两次（左右各一个面板）。
+    // 所以：先按精确列名优先匹配，匹配不到才用模糊；同一列只回报一次。
     let want = [
-        "资金余额", "可用资金", "可取资金", "冻结金额", "冻结资金",
+        "资金余额", "可用资金", "可取资金", "冻结金额",
         "证券市值", "总市值", "总资产", "现金资产",
     ];
 
     let mut found: Vec<(String, String)> = Vec::new();
+    let mut used: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let row = &rows[0];
-    for h in &headers {
-        let Some(col_idx) = want.iter().position(|w| fuzzy_contains(h, w)) else {
+
+    for w in want {
+        // 先找精确相等的列
+        let exact = headers.iter().position(|h| panel::clean_header(h) == panel::clean_header(w));
+        let idx = exact.or_else(|| {
+            // 退而求其次：模糊匹配，但要求该列尚未被占用
+            headers
+                .iter()
+                .enumerate()
+                .position(|(i, h)| !used.contains(&i) && fuzzy_contains(h, w))
+        });
+        let Some(i) = idx else { continue };
+        if used.contains(&i) {
             continue;
-        };
-        // rows 里每列是 (header, value)，直接按表头名取，不用再猜位置
-        if let Some((_, v)) = row.iter().find(|(hh, _)| hh == h) {
-            if !v.is_empty() {
-                found.push((want[col_idx].to_string(), v.clone()));
-            }
         }
+        // 值必须是"像数字"的样子，挡掉「普通客户」这种文本列
+        let Some((_, v)) = row.get(i) else { continue };
+        if !looks_numeric(v) {
+            continue;
+        }
+        used.insert(i);
+        found.push((w.to_string(), v.clone()));
     }
 
     if found.is_empty() {

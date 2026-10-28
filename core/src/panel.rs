@@ -287,7 +287,7 @@ const HEADER_WORDS: &[&str] = &[
 ///
 /// 「盈亏比例 （%）」这类带空格和全角括号的列头，得先抹平再比对，
 /// 否则明明在词表里也认不出来。
-fn clean_header(t: &str) -> String {
+pub fn clean_header(t: &str) -> String {
     t.replace(' ', "")
         .replace('\u{3000}', "")
         .replace('（', "(")
