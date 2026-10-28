@@ -151,10 +151,10 @@ pub fn detect_locked_by_ocr(win_number: u32) -> bool {
 pub const LOCK_OK_X: f64 = 987.0;
 pub const LOCK_OK_Y: f64 = 451.0;
 
-const LOCK_BAND_X: f64 = 700.0;
-const LOCK_BAND_Y: f64 = 340.0;
-const LOCK_BAND_W: f64 = 700.0;
-const LOCK_BAND_H: f64 = 260.0;
+pub const LOCK_BAND_X: f64 = 700.0;
+pub const LOCK_BAND_Y: f64 = 340.0;
+pub const LOCK_BAND_W: f64 = 700.0;
+pub const LOCK_BAND_H: f64 = 260.0;
 
 /// 当前是否锁定
 ///
@@ -163,30 +163,19 @@ const LOCK_BAND_H: f64 = 260.0;
 ///   2. AX 有嫌疑 → 用 OCR 确认，**只有 OCR 也认为锁了才算锁**
 ///
 /// 反过来（AX 命中就认定锁）会导致行情界面误判、密码明文进搜索框。
-pub fn is_locked(pid: u32, win_number: u32) -> bool {
-    // AX 只用来**提前排除**：如果明确看到输入框，说明很可能是行情界面的搜索框，
-    // 但即便如此也要 OCR 确认（真锁屏时 AX 常常一个节点都取不到）。
+pub fn is_locked(_pid: u32, win_number: u32) -> bool {
+    // 判据只有一个：OCR 在锁屏区域读到锁定文字。
     //
-    // 早前写成 `if !ax_suspects_lock { return false }`，等于要求 AX 先命中，
-    // 结果真锁屏时 AX 为空、直接返回"未锁定"，自动解锁形同虚设。
-    // 现在 AX 只在"确定不是密码框"时才否决，其余一律以 OCR 为准。
-    if ax_definitely_not_lock(pid) {
-        return false;
-    }
+    // 这里**故意不用 AX 做任何前置判断**，踩过两次坑：
+    //   1. 写成 `if !ax_suspects_lock { return false }` —— 要求 AX 先命中，
+    //      但真锁屏时 AX 是空的，于是永远返回"未锁定"。
+    //   2. 改成"AX 树非空就断定不锁" —— 锁屏时 AX 其实有 120 个节点
+    //      （对话框、按钮都在），于是又一次把真锁屏判成未锁定。
+    // AX 在中信这里是自绘界面，节点构成跟锁不锁没关系，拿它当判据只会误判。
+    // 而 OCR 读"交易界面已锁定"这句话，实测既准又稳（锁定时必读到，行情界面读不到）。
     detect_locked_by_ocr(win_number)
 }
 
-/// AX 是否能明确断定"这不是锁屏"
-///
-/// 只有在**同时**满足：拿得到 AX 树、且树里有足够的控件、且找不到密码框特征时，
-/// 才敢说不是锁屏。拿不到 AX（真锁屏的常见情况）一律不下结论。
-fn ax_definitely_not_lock(pid: u32) -> bool {
-    let nodes = crate::input::collect_ax_tree(pid, 5);
-    if nodes.is_empty() {
-        return false; // 拿不到就别乱判断
-    }
-    !ax_suspects_lock_from(&nodes)
-}
 
 /// 执行一次解锁
 ///

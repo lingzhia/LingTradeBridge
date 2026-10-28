@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::panel;
 use crate::unlock::{self, UnlockGuard, UnlockOutcome};
+use crate::config;
+
 use crate::{capture, input, ocr, CoreConfig};
 
 /// 请求
@@ -101,8 +103,31 @@ impl Response {
 
 /// 服务共享状态
 struct Shared {
-    cfg: CoreConfig,
+    /// 启动时的基础配置（socket 路径等命令行相关项）
+    base: CoreConfig,
     guard: Mutex<UnlockGuard>,
+}
+
+impl Shared {
+    /// 现读配置
+    ///
+    /// 每次执行功能都重新读一遍配置文件，而不是用启动时的快照。
+    /// 理由很实际：用户在界面上改完配置，期望**下一次操作就生效**，
+    /// 而不是"改完还要重启核心"。重启会打断正在跑的事情，也容易忘。
+    ///
+    /// 读盘成本可以忽略（一个几百字节的 JSON，操作间隔是秒级以上）。
+    fn cfg(&self) -> CoreConfig {
+        let saved = config::AppConfig::load(&self.base.config_path);
+        let mut c = self.base.clone();
+        c.app_name = saved.app_name;
+        c.app_path = saved.app_path;
+        c.settle = saved.settle;
+        c.trade_password = saved.trade_password;
+        c.auto_unlock = saved.auto_unlock;
+        c.unlock_interval = saved.unlock_interval.max(5);
+        c.unlock_max_fail = saved.unlock_max_fail.max(1);
+        c
+    }
 }
 
 /// 启动服务
@@ -129,14 +154,14 @@ pub fn serve(cfg: CoreConfig) -> std::io::Result<()> {
     ctrlc_like(&cleanup_path);
 
     let shared = Arc::new(Shared {
-        cfg,
+        base: cfg,
         guard: Mutex::new(guard),
     });
 
     eprintln!("中信自动化核心已就绪，socket: {}", path.display());
 
     // 自动解锁守护线程
-    if shared.cfg.auto_unlock {
+    if shared.cfg().auto_unlock {
         let bg = Arc::clone(&shared);
         std::thread::spawn(move || autounlock_loop(bg));
     } else {
@@ -242,7 +267,7 @@ fn dispatch(req: &Request, shared: &Shared) -> Response {
 
         // 调试用：导出原始 OCR 词及其坐标，排查列归属问题
         "raw_ocr" => {
-            let (pid, win) = match panel::ensure_window(&shared.cfg.app_path) {
+            let (pid, win) = match panel::ensure_window(&shared.cfg().app_path) {
                 Some(v) => v,
                 None => return Response::err(req.id, "客户端未运行"),
             };
@@ -269,6 +294,37 @@ fn dispatch(req: &Request, shared: &Shared) -> Response {
                 unlock_tripped: None,
                 pid: Some(pid),
             };
+        }
+        // 调试用：分别报告 AX 预筛、裁切 OCR、最终结论
+        "lock_probe" => {
+            let (pid, win) = match panel::ensure_window(&shared.cfg().app_path) {
+                Some(v) => v,
+                None => return Response::err(req.id, "客户端未运行"),
+            };
+            let ax_nodes = input::collect_ax_tree(pid, 5);
+            let crop = capture::CGRect::new(
+                unlock::LOCK_BAND_X,
+                unlock::LOCK_BAND_Y,
+                unlock::LOCK_BAND_W,
+                unlock::LOCK_BAND_H,
+            );
+            let words = ocr::ocr_window(win.number, Some(crop));
+            let texts: Vec<String> = words.iter().map(|w| w.trimmed().to_string()).collect();
+            let looks = panel::looks_locked(&words);
+            let final_locked = unlock::is_locked(pid, win.number);
+
+            let mut r = Response::ok(req.id);
+            r.detail = Some(format!(
+                "AX节点={}（仅参考） | 裁切词数={} | looks_locked={} | 最终={}",
+                ax_nodes.len(), words.len(), looks, final_locked
+            ));
+            r.rows = Some(vec![serde_json::json!({
+                "ax_nodes": ax_nodes.len(),
+                "words": texts,
+                "looks_locked": looks,
+                "final": final_locked,
+            })]);
+            return r;
         }
         "query" => do_query(req, shared),
 
@@ -320,7 +376,7 @@ fn status(req: &Request, shared: &Shared) -> Response {
 
 /// 手动解锁
 fn do_unlock(req: &Request, shared: &Shared) -> Response {
-    let cfg = &shared.cfg;
+    let cfg = shared.cfg();
     let (pid, win) = match panel::ensure_window(&cfg.app_path) {
         Some(v) => v,
         None => return Response::err(req.id, "客户端窗口不可用"),
@@ -379,7 +435,7 @@ fn do_unlock(req: &Request, shared: &Shared) -> Response {
 
 /// 查询
 fn do_query(req: &Request, shared: &Shared) -> Response {
-    let cfg = &shared.cfg;
+    let cfg = shared.cfg();
     let (_pid, win) = match panel::ensure_window(&cfg.app_path) {
         Some(v) => v,
         None => return Response::err(req.id, "客户端窗口不可用"),
@@ -394,7 +450,7 @@ fn do_query(req: &Request, shared: &Shared) -> Response {
 
     // 资金明细不是一个表格页签，它是独立的按钮，读数方式也不同
     if kind == "funds" {
-        return do_query_funds(req, &win, cfg);
+        return do_query_funds(req, &win, &cfg);
     }
 
     let (tab, must_have): (&str, &[&str]) = match kind {
@@ -544,7 +600,7 @@ pub fn ax_ready() -> bool {
 ///
 /// 日志只写状态变化，不写"每次检查" —— 否则盘后一直挂着会刷爆日志。
 fn autounlock_loop(shared: Arc<Shared>) {
-    let cfg = &shared.cfg;
+    let cfg = shared.cfg();
     if cfg.trade_password.is_empty() {
         eprintln!("自动解锁: 未配置交易密码，守护线程待命");
     }
