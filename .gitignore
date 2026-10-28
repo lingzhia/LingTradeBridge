@@ -18,3 +18,7 @@ __MACOSX/
 
 # 本地工具目录(会话/记忆等), 不参与版本管理
 .workbuddy/
+
+# OCR 工具: 源码 + 编译脚本入库, 编译产物和 swift 模块缓存不入库
+tools/ocr
+tools/.swiftcache/
