@@ -49,6 +49,9 @@ impl Zone {
 
 /// 普通交易顶部标签，y 都是 41，按 x 区分
 pub const TAB_Y: f64 = 41.0;
+
+/// 「买入」页签的 x —— 它是回到交易面板最可靠的入口
+pub const TAB_TRADE_X: f64 = 89.0;
 pub const TAB_TRADE: &[(&str, f64)] = &[
     ("买入", 92.0),
     ("卖出", 186.0),

@@ -234,6 +234,25 @@ fn handle_conn(stream: UnixStream, shared: Arc<Shared>) {
     }
 }
 
+/// 宽松包含判断：允许 OCR 认错一两个字
+///
+/// 比较两串中文时，只要短的那串有**超过一半字符**出现在长串里就算命中。
+/// 例如表头「讧券名称」对必须项「证券名称」：4 个字里 3 个对上 → 命中。
+/// 这样既不会因为形近字误判整个页签，也不至于把「成交价格」当成「委托价格」——
+/// 那两者只有 2/4 相同，达不到阈值。
+fn fuzzy_contains(header: &str, want: &str) -> bool {
+    if header.contains(want) {
+        return true;
+    }
+    let h: Vec<char> = header.chars().filter(|c| !c.is_whitespace()).collect();
+    let w: Vec<char> = want.chars().filter(|c| !c.is_whitespace()).collect();
+    if w.is_empty() || h.is_empty() {
+        return false;
+    }
+    let hit = w.iter().filter(|c| h.contains(c)).count();
+    hit * 2 > w.len()
+}
+
 /// 操作前确保交易界面处于解锁态
 ///
 /// 设计取舍：**不做后台守护线程**。定时轮询会在用户离开电脑时不停尝试输密码，
@@ -479,6 +498,14 @@ fn do_query(req: &Request, shared: &Shared) -> Response {
         return Response::err(req.id, e);
     }
 
+    // 回到交易面板。
+    //
+    // 底部那几个页签（持仓/委托/成交/资金明细）只在交易面板里存在。
+    // 如果上一次操作把界面留在了行情、银证转账或别的页，直接点页签会点空，
+    // 然后读到的就是完全不相干的表 —— 表现出来像"表头不对"，
+    // 实际是页面根本没切过去。先点「买入」回面板，成本很低。
+    panel::click_in_window(&win, panel::TAB_TRADE_X, panel::TAB_Y, cfg.settle);
+
     let kind = req.kind.as_deref().unwrap_or("");
 
     // 资金明细不是一个表格页签，它是独立的按钮，读数方式也不同
@@ -509,9 +536,13 @@ fn do_query(req: &Request, shared: &Shared) -> Response {
     if headers.is_empty() {
         return Response::err(req.id, "没读到表头，可能不在交易面板或截图失败");
     }
+    // 表头校验用"宽松匹配"：OCR 会把形近字认错（实测「证券名称」被认成「讧券名称」），
+    // 精确 contains 就会把一整个好好的页签判成"不在交易面板"。
+    // 要求这么严是为了防止读错页签，但正确做法是容忍单字差异，
+    // 而不是因为一个错字就否掉整张表。
     let missing: Vec<&str> = must_have
         .iter()
-        .filter(|h| !headers.iter().any(|x| x.contains(**h)))
+        .filter(|h| !headers.iter().any(|x| fuzzy_contains(x, h)))
         .copied()
         .collect();
     if !missing.is_empty() {
@@ -556,57 +587,57 @@ fn do_query_funds(
     win: &capture::WindowInfo,
     cfg: &crate::CoreConfig,
 ) -> Response {
-    // 「资金明细」是底部工具栏右侧的按钮，不在页签行上
-    panel::click_in_window(win, 483.0, panel::BOTTOM_Y + 0.0, cfg.settle);
+    // 「资金明细」是底部工具栏最右边的按钮，不在页签行上
+    panel::click_in_window(win, 483.0, panel::BOTTOM_Y, cfg.settle);
 
     let words = ocr::ocr_window(win.number, None);
     if words.is_empty() {
         return Response::err(req.id, "OCR 无结果，可能截图失败");
     }
 
-    let labels = [
-        "资金余额", "可用资金", "可取资金", "冻结资金",
-        "总资产", "证券市值", "可用金额", "可取金额",
+    // 按表头对齐取数，而不是"找标签再找右边的数字"。
+    //
+    // 之前的做法是拿一组硬编码标签名去匹配，然后找同一行右侧最近的数字。
+    // 实测有两个问题：表头本身会被 OCR 认错（「资产属性」→「资产屈性」），
+    // 以及数字列之间会被合并成一个长串（"310.61 10310.610"），
+    // 于是"最近的数字"经常取到隔壁列，读出来的资金余额是错的。
+    // 现在先用表头定位每列的 x，再按列中心把数字归位。
+    let (headers, rows, _total) = panel::read_table_full(win.number, panel::TABLE_Y_MIN, None);
+    if headers.is_empty() || rows.is_empty() {
+        return Response::err(req.id, "没读到资金表，可能不在交易面板或停留在了别的页");
+    }
+
+    let want = [
+        "资金余额", "可用资金", "可取资金", "冻结金额", "冻结资金",
+        "证券市值", "总市值", "总资产", "现金资产",
     ];
 
     let mut found: Vec<(String, String)> = Vec::new();
-    for w in &words {
-        let t = w.trimmed();
-        if !labels.contains(&t) {
+    let row = &rows[0];
+    for h in &headers {
+        let Some(col_idx) = want.iter().position(|w| fuzzy_contains(h, w)) else {
             continue;
-        }
-        // 在同一行、位于标签右侧的最近一个数字
-        let mut best: Option<&ocr::Word> = None;
-        let mut best_dx = f64::INFINITY;
-        for other in &words {
-            if (other.cy() - w.cy()).abs() > 10.0 {
-                continue;
+        };
+        // rows 里每列是 (header, value)，直接按表头名取，不用再猜位置
+        if let Some((_, v)) = row.iter().find(|(hh, _)| hh == h) {
+            if !v.is_empty() {
+                found.push((want[col_idx].to_string(), v.clone()));
             }
-            let dx = other.cx() - w.cx();
-            if dx <= 0.0 {
-                continue;
-            }
-            if other.trimmed().chars().any(|c| c.is_ascii_digit()) && dx < best_dx {
-                best_dx = dx;
-                best = Some(other);
-            }
-        }
-        if let Some(b) = best {
-            found.push((t.to_string(), b.trimmed().to_string()));
         }
     }
 
     if found.is_empty() {
-        return Response::err(req.id, "没读到资金字段，可能不在交易面板");
+        let mut r = Response::err(req.id, "资金表读到了，但没有一个已知的资金字段");
+        r.detail = Some(format!("表头: {}", headers.join("|")));
+        return r;
     }
 
     let mut r = Response::ok(req.id);
-    r.total = Some(found.len());
     r.detail = Some(format!("读到 {} 个资金字段", found.len()));
     r.rows = Some(
         found
-            .iter()
-            .map(|(k, v)| serde_json::json!({ k.clone(): v.clone() }))
+            .into_iter()
+            .map(|(k, v)| serde_json::json!({ "字段": k, "值": v }))
             .collect(),
     );
     r
