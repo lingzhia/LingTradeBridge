@@ -24,7 +24,7 @@ use crate::panel;
 use crate::unlock::{self, UnlockGuard, UnlockOutcome};
 use crate::config;
 
-use crate::{capture, input, ocr, order, CoreConfig};
+use crate::{capture, follow, http, input, ocr, order, CoreConfig};
 
 /// 请求
 #[derive(Debug, Deserialize)]
@@ -117,6 +117,25 @@ struct Shared {
     /// 启动时的基础配置（socket 路径等命令行相关项）
     base: CoreConfig,
     guard: Mutex<UnlockGuard>,
+    /// 跟单引擎状态（惰性初始化，只有真正启动跟单时才建台账）
+    follow: Mutex<Option<FollowRuntime>>,
+}
+
+/// 跟单运行期
+struct FollowRuntime {
+    server: http::HttpServer,
+    ledger: follow::Ledger,
+    started_at: String,
+    /// 累计跟单成功数
+    ok_count: u64,
+    /// 最近一条信号的处理说明，供 GUI 轮询显示
+    last_note: String,
+}
+
+impl FollowRuntime {
+    fn note(&mut self, s: String) {
+        self.last_note = s;
+    }
 }
 
 impl Shared {
@@ -165,6 +184,7 @@ pub fn serve(cfg: CoreConfig) -> std::io::Result<()> {
     let shared = Arc::new(Shared {
         base: cfg,
         guard: Mutex::new(guard),
+        follow: Mutex::new(None),
     });
 
     eprintln!("中信自动化核心已就绪，socket: {}", path.display());
@@ -281,6 +301,295 @@ fn fuzzy_contains(header: &str, want: &str) -> bool {
     }
     let hit = w.iter().filter(|c| h.contains(c)).count();
     hit * 2 > w.len()
+}
+
+/// 启动跟单：拉起 HTTP 信号服务
+fn do_follow_start(req: &Request, shared: &Shared) -> Response {
+    let cfg = shared.cfg();
+    let app = config::AppConfig::load(std::path::Path::new(&cfg.config_path));
+
+    let token = app.http_api_token.trim().to_string();
+    if token.is_empty() {
+        return Response::err(
+            req.id,
+            "未配置 HTTP Token。这个端口能直接触发真实下单，不允许无鉴权启动",
+        );
+    }
+
+    let mut slot = shared.follow.lock().unwrap();
+    if slot.is_some() {
+        let mut r = Response::ok(req.id);
+        r.detail = Some("跟单已在运行中".into());
+        return r;
+    }
+
+    // 信号处理回调：完整走一遍 归一化 → 过滤 → 判重 → 下单 → 记账
+    let shared2 = unsafe { std::mem::transmute::<&Shared, &'static Shared>(shared) };
+    let signal: http::SignalHandler = std::sync::Arc::new(move |v: &serde_json::Value| {
+        handle_signal(v, shared2)
+    });
+
+    // 查询回调：复用现有 query 逻辑
+    let shared3 = unsafe { std::mem::transmute::<&Shared, &'static Shared>(shared) };
+    let query: http::QueryHandler = std::sync::Arc::new(move |kind: &str| {
+        let k = if kind == "account" { "funds" } else { kind };
+        let req = Request {
+            id: 0,
+            op: "query".into(),
+            password: None,
+            code: None,
+            direction: None,
+            amount: None,
+            price: None,
+            kind: Some(k.to_string()),
+            action: None,
+            account: Some(app_account_str(&shared3.cfg())),
+        };
+        let r = do_query(&req, shared3);
+        if r.ok {
+            let mut m = serde_json::Map::new();
+            if let Some(rows) = r.rows {
+                m.insert("rows".into(), serde_json::Value::Array(rows));
+            }
+            if let Some(t) = r.total {
+                m.insert("total".into(), serde_json::Value::from(t));
+            }
+            if let Some(d) = r.detail {
+                m.insert("detail".into(), serde_json::Value::String(d));
+            }
+            Ok(serde_json::Value::Object(m))
+        } else {
+            Err(r.error.unwrap_or_else(|| "查询失败".into()))
+        }
+    });
+
+    match http::HttpServer::start(&app.http_host, app.http_port, &token, signal, query) {
+        Ok(server) => {
+            let addr = server.addr().to_string();
+            let lan = !matches!(app.http_host.as_str(), "127.0.0.1" | "localhost" | "::1");
+            *slot = Some(FollowRuntime {
+                server,
+                ledger: follow::Ledger::load(),
+                started_at: now_str(),
+                ok_count: 0,
+                last_note: if lan {
+                    format!("HTTP 已绑定 {addr}（局域网可访问）")
+                } else {
+                    format!("HTTP 已监听 {addr}")
+                },
+            });
+            let mut r = Response::ok(req.id);
+            r.detail = Some(format!("跟单已启动，HTTP 信号服务监听 {addr}"));
+            r
+        }
+        Err(e) => Response::err(req.id, format!("启动失败: {e}")),
+    }
+}
+
+/// 停止跟单：必须真的把监听关掉
+fn do_follow_stop(req: &Request, shared: &Shared) -> Response {
+    let mut slot = shared.follow.lock().unwrap();
+    match slot.take() {
+        Some(mut rt) => {
+            rt.server.stop();
+            let mut r = Response::ok(req.id);
+            r.detail = Some(format!(
+                "跟单已停止，端口已释放；本次共成交 {} 单",
+                rt.ok_count
+            ));
+            r
+        }
+        None => {
+            let mut r = Response::ok(req.id);
+            r.detail = Some("跟单本来就没在跑".into());
+            r
+        }
+    }
+}
+
+/// 跟单状态
+fn do_follow_status(req: &Request, shared: &Shared) -> Response {
+    let mut slot = shared.follow.lock().unwrap();
+    let mut r = Response::ok(req.id);
+    match slot.as_mut() {
+        Some(rt) => {
+            r.state = Some("running".into());
+            r.detail = Some(format!(
+                "监听 {}，启动于 {}，已跟单 {} 笔；最近：{}",
+                rt.server.addr(),
+                rt.started_at,
+                rt.ok_count,
+                rt.last_note
+            ));
+            r.total = Some(rt.ok_count as usize);
+        }
+        None => {
+            r.state = Some("idle".into());
+            r.detail = Some("跟单未启动".into());
+            r.total = Some(0);
+        }
+    }
+    r
+}
+
+fn app_account_str(cfg: &CoreConfig) -> String {
+    let app = config::AppConfig::load(std::path::Path::new(&cfg.config_path));
+    follow::follow_account(&app).as_str().to_string()
+}
+
+/// 处理一条信号
+fn handle_signal(v: &serde_json::Value, shared: &Shared) -> serde_json::Value {
+    let cfg = shared.cfg();
+    let app = config::AppConfig::load(std::path::Path::new(&cfg.config_path));
+
+    // 1. 归一化
+    let order = match follow::signal_to_order(v, &app) {
+        Ok(o) => o,
+        Err(f) => {
+            return serde_json::json!({"ok": false, "status": "filtered", "reason": f.reason()})
+        }
+    };
+
+    // 2. 过滤闸门（必须在判重之前，见 follow.rs 顶部说明）
+    if let Err(f) = follow::apply_filters(&order, &app) {
+        return serde_json::json!({
+            "ok": false, "status": "filtered", "reason": f.reason(),
+            "code": order.code, "direction": order.side_str()
+        });
+    }
+
+    let mut slot = shared.follow.lock().unwrap();
+    let Some(rt) = slot.as_mut() else {
+        return serde_json::json!({
+            "ok": false, "status": "not_running",
+            "reason": "跟单已停止，信号被丢弃"
+        });
+    };
+
+    // 3. 判重
+    if !app.allow_reorder && rt.ledger.contains(&order.uid) {
+        rt.note(format!("重复信号已跳过: {} {}", order.code, order.side_str()));
+        return serde_json::json!({
+            "ok": false, "status": "duplicate", "uid": order.uid,
+            "code": order.code, "direction": order.side_str()
+        });
+    }
+
+    // 4. 先记 uid 再下单：这样即使下单中途崩溃，重启后也不会重复下同一单。
+    //    下单失败时按 allow_reorder 决定是否回滚。
+    rt.ledger.mark(&order.uid);
+
+    let (pid, win) = match panel::ensure_window(&cfg.app_path) {
+        Some(v) => v,
+        None => {
+            rt.ledger.unmark(&order.uid);
+            rt.note("客户端窗口不可用".into());
+            return serde_json::json!({
+                "ok": false, "status": "error", "reason": "客户端窗口不可用"
+            });
+        }
+    };
+
+    if let Err(e) = ensure_unlocked(&win, pid, &cfg, shared) {
+        rt.ledger.unmark(&order.uid);
+        rt.note(format!("解锁失败: {e}"));
+        return serde_json::json!({"ok": false, "status": "error", "reason": e});
+    }
+
+    let account = follow::follow_account(&app);
+
+    // 5. 委托价格
+    //
+    // 同花顺版用界面自动价再上下让档；这里没有那个能力，也不能凭空调价 ——
+    // 价格来源优先级：信号价 > 配置的兜底价。都没有就拒绝下单，
+    // 绝不"猜一个价格"发出去，那等于拿真钱赌博。
+    let price = if order.price > 0.0 {
+        format!("{:.3}", order.price)
+    } else {
+        rt.ledger.unmark(&order.uid);
+        rt.note("信号没有价格，拒绝下单".into());
+        return serde_json::json!({
+            "ok": false, "status": "error",
+            "reason": "信号未提供价格。跟单必须有明确价格，不能替用户猜"
+        });
+    };
+
+    let side = if order.direction == 1 {
+        order::Side::Buy
+    } else {
+        order::Side::Sell
+    };
+
+    let outcome = order::place_order(
+        &win,
+        pid,
+        &cfg,
+        account,
+        side,
+        &order.code,
+        &price,
+        order.amount,
+        false,
+    );
+
+    let (success, detail) = match outcome {
+        order::PlaceOutcome::Accepted { order_no } => (
+            true,
+            match order_no {
+                Some(n) => format!("受理成功，合同号 {n}"),
+                None => "受理成功".to_string(),
+            },
+        ),
+        order::PlaceOutcome::Rejected { reason } => (false, format!("券商拒绝: {reason}")),
+        order::PlaceOutcome::Failed { reason } => (false, format!("下单失败: {reason}")),
+    };
+
+    if success {
+        rt.ok_count += 1;
+    } else if app.allow_reorder {
+        // 允许重试时把 uid 摘掉，下次同信号还能再试
+        rt.ledger.unmark(&order.uid);
+    }
+    rt.note(format!(
+        "{} {} {}股 @{} → {}",
+        order.code,
+        order.side_str(),
+        order.amount,
+        price,
+        detail
+    ));
+
+    rt.ledger.push_record(serde_json::json!({
+        "uid": order.uid,
+        "time": order.time,
+        "code": order.code,
+        "name": order.name,
+        "direction": order.side_str(),
+        "amount": order.amount,
+        "raw_amount": order.raw_amount,
+        "price": price,
+        "ratio": order.ratio,
+        "strategy": order.strategy,
+        "account": account.as_str(),
+        "success": success,
+        "detail": detail,
+        "place_at": now_str(),
+    }));
+
+    serde_json::json!({
+        "ok": success,
+        "status": if success { "accepted" } else { "failed" },
+        "uid": order.uid,
+        "code": order.code,
+        "direction": order.side_str(),
+        "amount": order.amount,
+        "price": price,
+        "detail": detail,
+    })
+}
+
+fn now_str() -> String {
+    follow::now_string()
 }
 
 /// 下单
@@ -525,6 +834,10 @@ fn dispatch(req: &Request, shared: &Shared) -> Response {
         "query" => do_query(req, shared),
 
         "place_order" => do_place_order(req, shared),
+
+        "follow_start" => do_follow_start(req, shared),
+        "follow_stop" => do_follow_stop(req, shared),
+        "follow_status" => do_follow_status(req, shared),
 
         other => Response::err(req.id, format!("未知操作: {other}")),
     }

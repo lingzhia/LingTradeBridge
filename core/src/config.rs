@@ -36,12 +36,39 @@ pub struct AppConfig {
     /// HTTP 信号服务端口
     #[serde(default = "def_http_port")]
     pub http_port: u16,
-    /// 跟单开关
+    /// HTTP 信号服务监听地址。默认只听本机；改成局域网 IP 才能被别的机器推信号
+    #[serde(default = "def_http_host")]
+    pub http_host: String,
+    /// HTTP 鉴权 Token。空字符串表示不启动 HTTP 服务
+    #[serde(default)]
+    pub http_api_token: String,
+    /// 跟单开关（持久化上次的状态，启动时不自动开始）
     #[serde(default)]
     pub following: bool,
-    /// 跟单比例
+    /// 买入跟单比例
     #[serde(default = "def_ratio")]
-    pub follow_ratio: f64,
+    pub follow_ratio_buy: f64,
+    /// 卖出跟单比例
+    #[serde(default = "def_ratio")]
+    pub follow_ratio_sell: f64,
+    /// 最小下单量（股）。算出不足这个数时兜底到它
+    #[serde(default = "def_min_amount")]
+    pub min_amount: i64,
+    /// 买入价格上限（元）。信号价超过它就跳过买入；0 表示不限制
+    #[serde(default)]
+    pub buy_price_max: f64,
+    /// 忽略所有买入信号
+    #[serde(default)]
+    pub ignore_buy: bool,
+    /// 忽略所有卖出信号
+    #[serde(default)]
+    pub ignore_sell: bool,
+    /// 允许同一信号重复下单（跳过去重）
+    #[serde(default)]
+    pub allow_reorder: bool,
+    /// 跟单作用在哪个账户上
+    #[serde(default = "def_account")]
+    pub follow_account: String,
 }
 
 fn def_app_name() -> String {
@@ -62,6 +89,15 @@ fn def_http_port() -> u16 {
 fn def_ratio() -> f64 {
     1.0
 }
+fn def_http_host() -> String {
+    "127.0.0.1".into()
+}
+fn def_min_amount() -> i64 {
+    100
+}
+fn def_account() -> String {
+    "normal".into()
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -72,8 +108,17 @@ impl Default for AppConfig {
             trade_password: String::new(),
             unlock_max_fail: def_max_fail(),
             http_port: def_http_port(),
+            http_host: def_http_host(),
+            http_api_token: String::new(),
             following: false,
-            follow_ratio: def_ratio(),
+            follow_ratio_buy: def_ratio(),
+            follow_ratio_sell: def_ratio(),
+            min_amount: def_min_amount(),
+            buy_price_max: 0.0,
+            ignore_buy: false,
+            ignore_sell: false,
+            allow_reorder: false,
+            follow_account: def_account(),
         }
     }
 }
@@ -88,7 +133,22 @@ impl AppConfig {
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
         match std::fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Ok(s) => {
+                let mut cfg: Self = serde_json::from_str(&s).unwrap_or_default();
+                // 旧版只有一个 follow_ratio，两个方向共用。升级后拆成买/卖两个，
+                // 这里把老值搬过去，免得用户升级后比例悄悄变回 1.0。
+                if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&s) {
+                    if let Some(old) = raw.get("follow_ratio").and_then(|v| v.as_f64()) {
+                        if raw.get("follow_ratio_buy").is_none() {
+                            cfg.follow_ratio_buy = old;
+                        }
+                        if raw.get("follow_ratio_sell").is_none() {
+                            cfg.follow_ratio_sell = old;
+                        }
+                    }
+                }
+                cfg
+            }
             Err(_) => Self::default(),
         }
     }

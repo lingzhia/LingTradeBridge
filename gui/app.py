@@ -259,6 +259,98 @@ class App:
             foreground="#b9770e", wraplength=820, justify="left"
         ).pack(fill="x", padx=10, pady=(0, 8))
 
+        # ---- 跟单 ----
+        fol = ttk.LabelFrame(self.root, text="跟单（HTTP 信号源）")
+        fol.pack(fill="x", **pad)
+
+        r1 = ttk.Frame(fol)
+        r1.pack(fill="x", padx=10, pady=(8, 2))
+        ttk.Label(r1, text="监听").pack(side="left")
+        self.http_host_var = tk.StringVar(
+            value=self.cfg.get("http_host", "127.0.0.1"))
+        ttk.Entry(r1, textvariable=self.http_host_var, width=14).pack(
+            side="left", padx=(4, 2))
+        ttk.Label(r1, text=":").pack(side="left")
+        self.http_port_var = tk.StringVar(
+            value=str(self.cfg.get("http_port", 8899)))
+        ttk.Entry(r1, textvariable=self.http_port_var, width=7).pack(
+            side="left", padx=(2, 10))
+
+        ttk.Label(r1, text="Token").pack(side="left")
+        self.http_token_var = tk.StringVar(
+            value=self.cfg.get("http_api_token", ""))
+        ttk.Entry(r1, textvariable=self.http_token_var, width=30,
+                  show="").pack(side="left", padx=(4, 6))
+        ttk.Button(r1, text="随机生成",
+                   command=self.on_gen_token).pack(side="left")
+
+        r2 = ttk.Frame(fol)
+        r2.pack(fill="x", padx=10, pady=2)
+        ttk.Label(r2, text="买入比例").pack(side="left")
+        self.ratio_buy_var = tk.StringVar(
+            value=str(self.cfg.get("follow_ratio_buy", 1.0)))
+        ttk.Spinbox(r2, from_=0.0, to=1.0, increment=0.1, width=6,
+                    textvariable=self.ratio_buy_var).pack(side="left", padx=(4, 10))
+
+        ttk.Label(r2, text="卖出比例").pack(side="left")
+        self.ratio_sell_var = tk.StringVar(
+            value=str(self.cfg.get("follow_ratio_sell", 1.0)))
+        ttk.Spinbox(r2, from_=0.0, to=1.0, increment=0.1, width=6,
+                    textvariable=self.ratio_sell_var).pack(side="left", padx=(4, 10))
+
+        ttk.Label(r2, text="最小下单量").pack(side="left")
+        self.min_amount_var = tk.StringVar(
+            value=str(self.cfg.get("min_amount", 100)))
+        ttk.Spinbox(r2, from_=100, to=10000, increment=100, width=7,
+                    textvariable=self.min_amount_var).pack(side="left", padx=(4, 10))
+
+        ttk.Label(r2, text="买入价上限").pack(side="left")
+        self.buy_max_var = tk.StringVar(
+            value=str(self.cfg.get("buy_price_max", 0)))
+        ttk.Entry(r2, textvariable=self.buy_max_var, width=8).pack(
+            side="left", padx=(4, 2))
+        ttk.Label(r2, text="元 (0=不限)").pack(side="left")
+
+        r3 = ttk.Frame(fol)
+        r3.pack(fill="x", padx=10, pady=2)
+        ttk.Label(r3, text="账户").pack(side="left")
+        self.follow_account_var = tk.StringVar(
+            value=self.cfg.get("follow_account", "normal"))
+        ttk.Combobox(r3, textvariable=self.follow_account_var, width=10,
+                     state="readonly",
+                     values=["normal", "credit"]).pack(side="left", padx=(4, 10))
+
+        self.ignore_buy_var = tk.BooleanVar(
+            value=bool(self.cfg.get("ignore_buy", False)))
+        ttk.Checkbutton(r3, text="忽略买入",
+                        variable=self.ignore_buy_var).pack(side="left")
+        self.ignore_sell_var = tk.BooleanVar(
+            value=bool(self.cfg.get("ignore_sell", False)))
+        ttk.Checkbutton(r3, text="忽略卖出",
+                        variable=self.ignore_sell_var).pack(side="left", padx=(8, 0))
+        self.allow_reorder_var = tk.BooleanVar(
+            value=bool(self.cfg.get("allow_reorder", False)))
+        ttk.Checkbutton(r3, text="允许重复下单",
+                        variable=self.allow_reorder_var).pack(side="left", padx=(8, 0))
+
+        r4 = ttk.Frame(fol)
+        r4.pack(fill="x", padx=10, pady=(4, 8))
+        ttk.Button(r4, text="保存跟单配置",
+                   command=self.on_save_follow).pack(side="left")
+        ttk.Button(r4, text="开始跟单",
+                   command=self.on_follow_start).pack(side="left", padx=6)
+        ttk.Button(r4, text="停止跟单",
+                   command=self.on_follow_stop).pack(side="left")
+        ttk.Button(r4, text="跟单状态",
+                   command=self.on_follow_status).pack(side="left", padx=6)
+
+        ttk.Label(
+            fol,
+            text="⚠ 跟单会用信号自带的价格直接下单，不替你猜价格。"
+                 "信号缺 price/current_price 时会被拒绝。Token 为空时服务不会启动。",
+            foreground="#b9770e", wraplength=820, justify="left"
+        ).pack(fill="x", padx=10, pady=(0, 8))
+
         # 操作按钮
         ops = ttk.Frame(self.root)
         ops.pack(fill="x", **pad)
@@ -363,7 +455,89 @@ class App:
             cfg["unlock_max_fail"] = max(1, int(self.maxfail_var.get()))
         except ValueError:
             cfg["unlock_max_fail"] = 3
+
+        cfg["http_host"] = self.http_host_var.get().strip() or "127.0.0.1"
+        try:
+            cfg["http_port"] = int(self.http_port_var.get())
+        except ValueError:
+            cfg["http_port"] = 8899
+        cfg["http_api_token"] = self.http_token_var.get().strip()
+        try:
+            cfg["follow_ratio_buy"] = float(self.ratio_buy_var.get())
+        except ValueError:
+            cfg["follow_ratio_buy"] = 1.0
+        try:
+            cfg["follow_ratio_sell"] = float(self.ratio_sell_var.get())
+        except ValueError:
+            cfg["follow_ratio_sell"] = 1.0
+        try:
+            cfg["min_amount"] = max(100, int(self.min_amount_var.get()))
+        except ValueError:
+            cfg["min_amount"] = 100
+        try:
+            cfg["buy_price_max"] = float(self.buy_max_var.get() or 0)
+        except ValueError:
+            cfg["buy_price_max"] = 0.0
+        cfg["follow_account"] = self.follow_account_var.get()
+        cfg["ignore_buy"] = bool(self.ignore_buy_var.get())
+        cfg["ignore_sell"] = bool(self.ignore_sell_var.get())
+        cfg["allow_reorder"] = bool(self.allow_reorder_var.get())
         return cfg
+
+    # -- 跟单 -------------------------------------------------------------
+
+    def on_gen_token(self):
+        import secrets
+        self.http_token_var.set(secrets.token_urlsafe(18))
+        self.log("已生成新 Token，记得点「保存跟单配置」")
+
+    def on_save_follow(self):
+        cfg = self._collect()
+        if not cfg["http_api_token"]:
+            messagebox.showwarning(
+                "Token 为空",
+                "HTTP 信号服务必须配置 Token 才会启动。\n"
+                "这个端口能直接触发真实下单，不做无鉴权启动。")
+        save_config(cfg)
+        self.cfg = cfg
+        self.log("跟单配置已保存（下一次操作即生效，不必重启核心）")
+
+    def on_follow_start(self):
+        cfg = self._collect()
+        save_config(cfg)
+        self.cfg = cfg
+
+        def work():
+            try:
+                r = self.client.call("follow_start")
+            except Exception as exc:
+                self.log(f"启动跟单失败: {exc}", "ERROR")
+                return
+            if r.get("ok"):
+                self.log("✓ " + (r.get("detail") or "跟单已启动"))
+            else:
+                self.log("✗ " + (r.get("error") or "启动失败"), "ERROR")
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_follow_stop(self):
+        def work():
+            try:
+                r = self.client.call("follow_stop")
+            except Exception as exc:
+                self.log(f"停止跟单失败: {exc}", "ERROR")
+                return
+            self.log(r.get("detail") or r.get("error") or "已停止")
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_follow_status(self):
+        def work():
+            try:
+                r = self.client.call("follow_status")
+            except Exception as exc:
+                self.log(f"查询跟单状态失败: {exc}", "ERROR")
+                return
+            self.log(f"跟单状态: {r.get('state')} — {r.get('detail')}")
+        threading.Thread(target=work, daemon=True).start()
 
     def on_save_password(self):
         cfg = self._collect()

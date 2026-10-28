@@ -19,6 +19,8 @@
 
 mod capture;
 mod config;
+mod follow;
+mod http;
 mod input;
 mod ipc;
 mod ocr;
