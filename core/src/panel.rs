@@ -256,113 +256,264 @@ pub const TABLE_Y_MIN: f64 = 520.0;
 /// 底部指数状态条会被误认成表格行，所以 y_max 要减去 25 像素。
 pub fn read_table(
     win_number: u32,
-    expected_headers: &[&str],
+    _expected_headers: &[&str],
     y_min: f64,
     y_max: Option<f64>,
 ) -> Vec<Vec<(String, String)>> {
+    read_table_full(win_number, y_min, y_max).1
+}
+
+/// 已知列头词表
+///
+/// 必须用"全量已知词"来认表头行，而不是只认调用方关心的那几列。
+/// 只认少数列的话，表头里那些没被认出的列会被**整列丢掉**，
+/// 于是其余列的数字全挤进剩下的几列里，读出来就是一团乱。
+const HEADER_WORDS: &[&str] = &[
+    "证券代码", "证券名称", "委托数量", "成交数量", "股票余额", "可用股份",
+    "昨日余额", "参考持股", "委托价格", "成交价格", "买卖标志", "操作",
+    "委托日期", "委托时间", "成交时间", "申请编号", "合同编号", "委托状态",
+    "成本价", "当前价", "当前成本", "最新市值", "最新市俏", "浮动盈亏",
+    "冻结数量", "可用余额", "股份余额", "股东代码", "债券全价",
+    "资金账号", "银行名称", "币种", "资金余额", "可用资金", "可取资金",
+    "证券市值", "成交金额", "成交类型", "业务名称", "委托类型",
+    "今买成交数量", "无费用参考盈亏", "盈亏比例", "托管单元", "冻结金额",
+    "多金融产品市值", "OTC市值", "备注", "撤单数量",
+];
+
+/// 列头文字归一化
+///
+/// 「盈亏比例 （%）」这类带空格和全角括号的列头，得先抹平再比对，
+/// 否则明明在词表里也认不出来。
+fn clean_header(t: &str) -> String {
+    t.replace(' ', "")
+        .replace('\u{3000}', "")
+        .replace('（', "(")
+        .replace('）', ")")
+}
+
+/// 读表格，返回 (列头, 行, 「共N条」里的 N)
+///
+/// 通达信表格是自绘的，没有 AXTable，只能截图 OCR 再按坐标还原。
+///
+/// # 区域边界（实测 1920×956 窗口）
+///
+/// - `y≈515` 是「刷新 / 导出 / 共N条」工具条
+/// - `y≈540` 是列头行
+/// - `y≈565` 起是数据行
+/// - `y≈935` 是底部指数状态栏（上证指数/创业板指…），必须切掉，
+///   否则会被当成数据行，读出「深证成指 11371.48」这种假记录
+pub fn read_table_full(
+    win_number: u32,
+    y_min: f64,
+    y_max: Option<f64>,
+) -> (Vec<String>, Vec<Vec<(String, String)>>, Option<u32>) {
     let words = ocr::ocr_window(win_number, None);
     if words.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new(), None);
     }
 
-    // 找表头行：至少命中 3 个列名才算数，否则可能只是正文里恰好出现的字样
-    let mut header_y: Option<f64> = None;
-    let mut header_hits = 0;
-    for w in &words {
-        let hits = expected_headers
+    let hard_max = words.iter().map(|w| w.cy()).fold(0.0_f64, f64::max);
+    let y_end = y_max.unwrap_or(hard_max - 25.0);
+
+    let region: Vec<&Word> = words
+        .iter()
+        .filter(|w| w.cy() >= y_min - 25.0 && w.cy() <= y_end)
+        .collect();
+    if region.is_empty() {
+        return (Vec::new(), Vec::new(), None);
+    }
+
+    // 按 y 聚行。
+    //
+    // 这里**不能**量化分箱（比如 cy/5 取整）。同一行里不同文字的高度不一样，
+    // cy = y + h/2 就会有零点几像素的差，正好跨在箱边界上就被劈成两行。
+    // 实测「证券代码」cy=547、「证券名称」cy=548.5，5 像素分箱会分到 109 和 110，
+    // 结果表头只剩一半列，其余列的数字全挤进剩下的列里。
+    // 改成按容差聚类：先把 cy 排序，差值在 8 像素内的算同一行。
+    let mut bands: Vec<Vec<&Word>> = Vec::new();
+    {
+        let mut sorted: Vec<&Word> = region.clone();
+        sorted.sort_by(|a, b| a.cy().partial_cmp(&b.cy()).unwrap_or(std::cmp::Ordering::Equal));
+        for w in sorted {
+            match bands.last_mut() {
+                Some(last) if (last[0].cy() - w.cy()).abs() < 8.0 => last.push(w),
+                _ => bands.push(vec![w]),
+            }
+        }
+    }
+
+    // 找列头行：整行里命中已知词最多的那一行
+    let header_set: std::collections::HashSet<String> =
+        HEADER_WORDS.iter().map(|h| clean_header(h)).collect();
+
+    let mut header_key: Option<usize> = None;
+    let mut best = 0usize;
+    for (i, cells) in bands.iter().enumerate() {
+        let n = cells
             .iter()
-            .filter(|h| w.trimmed() == **h || w.trimmed().contains(**h))
+            .filter(|c| header_set.contains(&clean_header(&c.trimmed())))
             .count();
-        if hits >= 3 && hits > header_hits {
-            header_hits = hits;
-            header_y = Some(w.y);
+        if n > best {
+            best = n;
+            header_key = Some(i);
         }
     }
-    let header_y = match header_y {
-        Some(y) => y,
-        None => return Vec::new(),
+
+    // 列头行至少命中 3 个已知列头。不够就宁可当没读到，也别乱造表
+    let header_key = match header_key {
+        Some(k) if best >= 3 => k,
+        _ => return (Vec::new(), Vec::new(), None),
     };
-    if header_y < y_min {
-        return Vec::new();
-    }
 
-    // 表头各列的中心点
-    let headers: Vec<&Word> = words
-        .iter()
-        .filter(|w| (w.y - header_y).abs() < 8.0)
-        .filter(|w| expected_headers.iter().any(|h| w.trimmed().contains(*h)))
-        .collect();
-    if headers.len() < 2 {
-        return Vec::new();
-    }
-    let mut cols: Vec<(f64, String)> = headers
-        .iter()
-        .map(|w| (w.cx(), w.trimmed().to_string()))
-        .collect();
-    cols.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut header_cells: Vec<&Word> = bands[header_key].clone();
+    header_cells.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+    let header_names: Vec<String> =
+        header_cells.iter().map(|c| c.trimmed().to_string()).collect();
 
-    // 列归属边界 = 相邻列中心的**中点**
-    let mut bounds: Vec<f64> = Vec::new();
-    for i in 0..cols.len() {
-        if i == 0 {
-            bounds.push(f64::NEG_INFINITY);
-        } else {
-            bounds.push((cols[i - 1].0 + cols[i].0) / 2.0);
+    // 列边界用「列头中心点的中点」切。
+    //
+    // 实测：列头「昨日余额」x=206，而它的数据 x=195（OCR 偏左约 11px）。
+    // 用左边缘切会把 195 那条判给「证券名称」列，中心点切就不会错。
+    let centers: Vec<f64> = header_cells.iter().map(|c| c.cx()).collect();
+    let bounds: Vec<(f64, f64)> = (0..centers.len())
+        .map(|i| {
+            let left = if i > 0 {
+                (centers[i - 1] + centers[i]) / 2.0
+            } else {
+                -1.0e6
+            };
+            let right = if i + 1 < centers.len() {
+                (centers[i] + centers[i + 1]) / 2.0
+            } else {
+                1.0e6
+            };
+            (left, right)
+        })
+        .collect();
+
+    // 「共N条」：用来区分「确实没数据」和「解析失败」。
+    // 没有这个校验，读出 0 行时分不清是空表还是 bug。
+    let mut total: Option<u32> = None;
+    for w in &words {
+        if let Some(n) = parse_total(&w.trimmed()) {
+            total = Some(n);
+            break;
         }
     }
 
-    // 数据区的下边界：避开底部状态条
-    let max_y = words.iter().map(|w| w.y).fold(0.0_f64, f64::max);
-    let y_end = y_max.unwrap_or(max_y - 25.0);
-
-    // 只取表头下方、下边界以上的文字
-    let mut body: Vec<&Word> = words
-        .iter()
-        .filter(|w| w.y > header_y + 6.0 && w.y < y_end)
-        .collect();
-    body.sort_by(|a, b| a.cy().partial_cmp(&b.cy()).unwrap_or(std::cmp::Ordering::Equal));
-
-    // 按 y 聚行（同一行的文字 y 差不超过 8 像素）
-    let mut rows: Vec<Vec<&Word>> = Vec::new();
-    for w in body {
-        match rows.last_mut() {
-            Some(last) if (last[0].cy() - w.cy()).abs() < 8.0 => last.push(w),
-            _ => rows.push(vec![w]),
+    let mut out: Vec<Vec<(String, String)>> = Vec::new();
+    for (key, cells) in bands.iter().enumerate() {
+        if key <= header_key {
+            continue;
         }
-    }
+        let mut cells: Vec<&Word> = cells.clone();
+        cells.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        if cells.len() < 2 {
+            continue;
+        }
 
-    // 每行按 x 排序，再按列边界塞进对应列
-    let mut out = Vec::new();
-    for mut row in rows {
-        row.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
-        let mut cells: Vec<(String, String)> = cols
+        let mut row: Vec<(String, String)> = header_names
             .iter()
-            .map(|(_, name)| (name.clone(), String::new()))
+            .map(|h| (h.clone(), String::new()))
             .collect();
-        for w in row {
-            let cx = w.cx();
-            let mut idx = 0;
-            for (i, b) in bounds.iter().enumerate() {
-                if cx >= *b {
-                    idx = i;
-                }
+
+        for c in cells {
+            let c_start = c.x;
+            let c_end = c.x + c.w.max(4.0);
+
+            // 这条文字横跨了哪几列
+            let covered: Vec<usize> = bounds
+                .iter()
+                .enumerate()
+                .filter(|(_, (l, r))| c_start < *r && c_end > *l)
+                .map(|(i, _)| i)
+                .collect();
+            if covered.is_empty() {
+                continue;
             }
-            if idx < cells.len() {
-                if cells[idx].1.is_empty() {
-                    cells[idx].1 = w.trimmed().to_string();
-                } else {
-                    cells[idx].1.push(' ');
-                    cells[idx].1.push_str(w.trimmed());
+
+            // OCR 常把相邻几列的数字并成一条，比如
+            // "0 1.0008 1.0000 10008.00" 横跨五列。整块塞进一列就毁了，
+            // 按空格拆开后用字符宽度比例估算每段的位置，再逐个归列。
+            let pieces: Vec<(String, f64)> = if covered.len() == 1 {
+                vec![(c.trimmed().to_string(), c.cx())]
+            } else {
+                split_merged(&c.trimmed(), c_start, c_end)
+            };
+
+            for (text, px) in pieces {
+                for (i, (l, r)) in bounds.iter().enumerate() {
+                    if px >= *l && px < *r {
+                        let cell = &mut row[i].1;
+                        if cell.is_empty() {
+                            *cell = text.clone();
+                        } else {
+                            cell.push(' ');
+                            cell.push_str(&text);
+                        }
+                        break;
+                    }
                 }
             }
         }
-        // 整行全空就丢掉
-        if cells.iter().any(|(_, v)| !v.is_empty()) {
-            out.push(cells);
+
+        // 至少落进 2 列，且第一列得像点样子，否则是噪声行
+        let filled = row.iter().filter(|(_, v)| !v.is_empty()).count();
+        if filled >= 2 {
+            let first = &row[0].1;
+            let ok = first
+                .chars()
+                .next()
+                .map(|ch| ch.is_ascii_digit() || ch.is_ascii_alphabetic())
+                .unwrap_or(false);
+            if ok {
+                out.push(row);
+            }
         }
+    }
+
+    (header_names, out, total)
+}
+
+/// 把跨多列的一条 OCR 文字按空格拆开，估算每段中心 x
+///
+/// 宽度按字符数比例分配 —— Vision 不给每个 token 的单独坐标，
+/// 这是在没有更细粒度信息时最稳的近似。
+fn split_merged(text: &str, x_start: f64, x_end: f64) -> Vec<(String, f64)> {
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    if parts.len() <= 1 {
+        return vec![(text.to_string(), x_start + (x_end - x_start) / 2.0)];
+    }
+    let span = (x_end - x_start).max(1.0);
+    let total_chars: usize = parts.iter().map(|p| p.chars().count()).sum::<usize>()
+        + parts.len()
+        - 1;
+    let mut out = Vec::new();
+    let mut cursor = x_start;
+    for p in parts {
+        let ratio = (p.chars().count() + 1) as f64 / total_chars as f64;
+        out.push((p.to_string(), cursor + span * ratio / 2.0));
+        cursor += span * ratio;
     }
     out
 }
+
+/// 从「共 12 条」里取出 12
+fn parse_total(text: &str) -> Option<u32> {
+    let t: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let idx = t.find("共")?;
+    let rest = &t[idx + "共".len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    // 「共N条」后面必须跟「条」，否则可能只是正文里的「共」字
+    if !rest.contains('条') {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 
 /// 把一次点击送到窗口内坐标处
 ///

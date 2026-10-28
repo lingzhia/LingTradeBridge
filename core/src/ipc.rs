@@ -240,6 +240,36 @@ fn dispatch(req: &Request, shared: &Shared) -> Response {
             r
         }
 
+        // 调试用：导出原始 OCR 词及其坐标，排查列归属问题
+        "raw_ocr" => {
+            let (pid, win) = match panel::ensure_window(&shared.cfg.app_path) {
+                Some(v) => v,
+                None => return Response::err(req.id, "客户端未运行"),
+            };
+            let words = ocr::ocr_window(win.number, None);
+            let rows: Vec<serde_json::Value> = words
+                .iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "x": w.x, "y": w.y, "w": w.w, "h": w.h, "t": w.trimmed()
+                    })
+                })
+                .collect();
+            let n = rows.len();
+            return Response {
+                id: req.id,
+                ok: true,
+                error: None,
+                state: None,
+                detail: Some(format!("{n} 个词")),
+                verified: None,
+                total: Some(n),
+                rows: Some(rows),
+                unlock_fail_count: None,
+                unlock_tripped: None,
+                pid: Some(pid),
+            };
+        }
         "query" => do_query(req, shared),
 
         "place_order" => {
@@ -356,8 +386,9 @@ fn do_query(req: &Request, shared: &Shared) -> Response {
     };
 
     let kind = req.kind.as_deref().unwrap_or("");
+    // 表头由 panel::read_table 自己从界面全量识别，这里只需要判断页签对不对
     let headers: &[&str] = match kind {
-        "positions" => &["证券代码", "证券名称", "股票余额", "可用余额", "成本价", "当前价"],
+        "positions" => &["证券代码", "证券名称", "股份余额", "可用股份", "成本价", "当前价"],
         "orders" => &["委托时间", "证券代码", "证券名称", "买卖标志", "委托价格", "委托数量"],
         "deals" => &["成交时间", "证券代码", "证券名称", "买卖标志", "成交价格", "成交数量"],
         "funds" => &["资金余额", "可用金额", "可取金额"],
