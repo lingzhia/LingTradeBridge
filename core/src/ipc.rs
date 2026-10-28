@@ -600,14 +600,15 @@ pub fn ax_ready() -> bool {
 ///
 /// 日志只写状态变化，不写"每次检查" —— 否则盘后一直挂着会刷爆日志。
 fn autounlock_loop(shared: Arc<Shared>) {
-    let cfg = shared.cfg();
-    if cfg.trade_password.is_empty() {
+    if shared.cfg().trade_password.is_empty() {
         eprintln!("自动解锁: 未配置交易密码，守护线程待命");
     }
 
     let mut last_state: Option<bool> = None;
 
     loop {
+        // 每轮都现读配置，改密码/改间隔/开关自动解锁都即时生效，不必重启核心
+        let cfg = shared.cfg();
         std::thread::sleep(std::time::Duration::from_secs(cfg.unlock_interval));
 
         // 熔断检查
