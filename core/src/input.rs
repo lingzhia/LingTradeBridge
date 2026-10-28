@@ -616,6 +616,18 @@ impl AxElement {
         rc == 0
     }
 
+    /// 复制一份独立引用（内部 CFRetain）
+    ///
+    /// 为什么不 derive Clone：`raw` 是裸指针，Drop 会 CFRelease。
+    /// 直接用 Clone 复制指针会让两个对象都去释放同一份引用，必崩。
+    /// 这里显式 CFRetain，让副本拥有自己的一份。
+    pub fn clone_of(&self) -> Self {
+        let retained = unsafe { CFRetain(self.raw) };
+        Self {
+            raw: if retained.is_null() { self.raw } else { retained },
+        }
+    }
+
     /// 按一下
     pub fn press(&self) -> bool {
         let a = cfstr("AXPress");

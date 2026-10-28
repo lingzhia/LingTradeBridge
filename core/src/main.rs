@@ -22,6 +22,7 @@ mod config;
 mod input;
 mod ipc;
 mod ocr;
+mod order;
 mod panel;
 mod unlock;
 

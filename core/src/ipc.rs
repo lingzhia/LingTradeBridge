@@ -24,7 +24,7 @@ use crate::panel;
 use crate::unlock::{self, UnlockGuard, UnlockOutcome};
 use crate::config;
 
-use crate::{capture, input, ocr, CoreConfig};
+use crate::{capture, input, ocr, order, CoreConfig};
 
 /// 请求
 #[derive(Debug, Deserialize)]
@@ -44,12 +44,19 @@ pub struct Request {
     /// 数量
     #[serde(default)]
     pub amount: Option<i64>,
+    /// 委托价格。用字符串而不是浮点：价格是精确的十进制，
+    /// f64 转成 "2.0690000000000004" 这种值填进券商界面会被判非法。
+    #[serde(default)]
+    pub price: Option<String>,
     /// 查询类型
     #[serde(default)]
     pub kind: Option<String>,
     /// 目标面板（buy/sell/rz_buy/...）
     #[serde(default)]
     pub action: Option<String>,
+    /// 目标账户："normal"（默认）或 "credit"
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 /// 响应
@@ -73,6 +80,9 @@ pub struct Response {
     pub unlock_fail_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unlock_tripped: Option<bool>,
+    /// 本次数据来自哪个账户（normal / credit）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
 }
@@ -90,6 +100,7 @@ impl Response {
             rows: None,
             unlock_fail_count: None,
             unlock_tripped: None,
+            account: None,
             pid: None,
         }
     }
@@ -272,6 +283,119 @@ fn fuzzy_contains(header: &str, want: &str) -> bool {
     hit * 2 > w.len()
 }
 
+/// 下单
+///
+/// 请求字段：
+///   code      证券代码（必填）
+///   price     委托价格（必填，字符串，避免浮点误差）
+///   amount    委托数量（必填，整数股）
+///   direction 1=买入 2=卖出（默认 1）
+///   account   normal / credit（默认 normal）
+///   action    下单后是否提交：不给或 "submit" 提交；"dry_run" 只填不提交
+fn do_place_order(req: &Request, shared: &Shared) -> Response {
+    let cfg = shared.cfg();
+    let (pid, win) = match panel::ensure_window(&cfg.app_path) {
+        Some(v) => v,
+        None => return Response::err(req.id, "客户端窗口不可用"),
+    };
+    if let Err(e) = ensure_unlocked(&win, pid, &cfg, shared) {
+        return Response::err(req.id, e);
+    }
+
+    let code = match req.code.as_deref() {
+        Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+        _ => return Response::err(req.id, "缺少证券代码"),
+    };
+    let price = match req.price.as_deref() {
+        Some(p) if !p.trim().is_empty() => p.trim().to_string(),
+        _ => return Response::err(req.id, "缺少委托价格"),
+    };
+    let amount = match req.amount {
+        Some(a) if a > 0 => a,
+        _ => return Response::err(req.id, "缺少委托数量，或数量不是正数"),
+    };
+
+    let side = match req.direction.unwrap_or(1) {
+        1 => order::Side::Buy,
+        2 => order::Side::Sell,
+        d => return Response::err(req.id, format!("未知买卖方向: {d}（1=买入 2=卖出）")),
+    };
+    let account = match req.account.as_deref() {
+        None | Some("normal") => panel::Account::Normal,
+        Some("credit") => panel::Account::Credit,
+        Some(o) => return Response::err(req.id, format!("未知账户类型: {o}")),
+    };
+    let dry_run = req.action.as_deref() == Some("dry_run");
+
+    let mut r = Response::ok(req.id);
+    r.account = Some(account.as_str().into());
+    match order::place_order(&win, pid, &cfg, account, side, &code, &price, amount, dry_run) {
+        order::PlaceOutcome::Accepted { order_no } => {
+            r.detail = Some(format!(
+                "{}{} {} {}股 @{} {}",
+                if dry_run { "[干跑] 仅填单，" } else { "" },
+                side.as_str(),
+                code,
+                amount,
+                price,
+                match order_no {
+                    Some(n) => format!("委托已受理，合同号 {n}"),
+                    None if dry_run => String::new(),
+                    None => "委托已提交".to_string(),
+                }
+            ));
+        }
+        order::PlaceOutcome::Rejected { reason } => {
+            r.ok = false;
+            r.error = Some(reason);
+        }
+        order::PlaceOutcome::Failed { reason } => {
+            r.ok = false;
+            r.error = Some(reason);
+        }
+    }
+    r
+}
+
+/// 切到指定账户，并回到它的下单面板
+///
+/// 「普通」和「信用」在左侧导航栏里是两个固定入口（第 5、6 个），
+/// 切过去之后再点该账户的「买入/担保品买入」回到下单面板，
+/// 这样底部那排页签（持仓/委托/成交/资金明细）才是对应账户的。
+fn switch_account(
+    win: &capture::WindowInfo,
+    cfg: &CoreConfig,
+    want: panel::Account,
+) -> Result<(), String> {
+    let rail_y = match want {
+        panel::Account::Normal => panel::RAIL_Y[4],
+        panel::Account::Credit => panel::RAIL_Y[5],
+    };
+    panel::click_in_window(win, panel::RAIL_X + panel::RAIL_W / 2.0, rail_y, cfg.settle);
+    panel::click_in_window(win, want.entry_x(), panel::TAB_Y, cfg.settle);
+
+    // 切完立刻自检：界面顶部菜单是否真的对应目标账户。
+    // 只点不验的话，一旦某次点击没生效，后面读到的就是另一个账户的数据。
+    let words = ocr::ocr_window(win.number, None);
+    let top: Vec<String> = words
+        .iter()
+        .filter(|w| (w.y - panel::TAB_Y).abs() < 12.0)
+        .map(|w| w.trimmed().to_string())
+        .collect();
+    let actual = panel::Account::detect(&top);
+    if actual != want {
+        return Err(format!(
+            "切换到{}账户失败，当前顶部菜单是：{}",
+            match want {
+                panel::Account::Normal => "普通",
+                panel::Account::Credit => "信用",
+            },
+            top.join(" ")
+        ));
+    }
+    Ok(())
+}
+
 /// 操作前确保交易界面处于解锁态
 ///
 /// 设计取舍：**不做后台守护线程**。定时轮询会在用户离开电脑时不停尝试输密码，
@@ -363,6 +487,7 @@ fn dispatch(req: &Request, shared: &Shared) -> Response {
                 rows: Some(rows),
                 unlock_fail_count: None,
                 unlock_tripped: None,
+                account: None,
                 pid: Some(pid),
             };
         }
@@ -399,13 +524,7 @@ fn dispatch(req: &Request, shared: &Shared) -> Response {
         }
         "query" => do_query(req, shared),
 
-        "place_order" => {
-            // 下单链路在 order 模块，这里先明确拒绝，避免"看起来能下单其实没实现"
-            Response::err(
-                req.id,
-                "下单链路尚未实装：当前版本只完成核心骨架与查询能力",
-            )
-        }
+        "place_order" => do_place_order(req, shared),
 
         other => Response::err(req.id, format!("未知操作: {other}")),
     }
@@ -517,25 +636,51 @@ fn do_query(req: &Request, shared: &Shared) -> Response {
         return Response::err(req.id, e);
     }
 
-    // 回到交易面板。
+    // 先切到目标账户，再回该账户的「买入」面板。
     //
-    // 底部那几个页签（持仓/委托/成交/资金明细）只在交易面板里存在。
-    // 如果上一次操作把界面留在了行情、银证转账或别的页，直接点页签会点空，
-    // 然后读到的就是完全不相干的表 —— 表现出来像"表头不对"，
-    // 实际是页面根本没切过去。先点「买入」回面板，成本很低。
-    panel::click_in_window(&win, panel::TAB_TRADE_X, panel::TAB_Y, cfg.settle);
+    // 信用区和普通交易是两套**平行的界面**：顶部菜单不同（担保品/融资融券 vs
+    // 买入/卖出），账户号和股东代码不同，持仓和委托也完全是各自的。
+    // 之前不区分账户，在信用区发起"查询持仓"会把信用账户的持仓当普通账户返回，
+    // 调用方从返回值里看不出任何区别 —— 这在真钱场景下是危险的。
+    let want = match req.account.as_deref() {
+        None | Some("normal") => panel::Account::Normal,
+        Some("credit") => panel::Account::Credit,
+        Some(other) => {
+            return Response::err(
+                req.id,
+                format!("未知账户类型: {other}（只支持 normal / credit）"),
+            )
+        }
+    };
+    if let Err(e) = switch_account(&win, &cfg, want) {
+        return Response::err(req.id, e);
+    }
 
     let kind = req.kind.as_deref().unwrap_or("");
 
     // 资金明细不是一个表格页签，它是独立的按钮，读数方式也不同
     if kind == "funds" {
-        return do_query_funds(req, &win, &cfg);
+        let mut r = do_query_funds(req, &win, &cfg);
+        r.account = Some(want.as_str().into());
+        return r;
     }
 
-    let (tab, must_have): (&str, &[&str]) = match kind {
-        "positions" => ("持仓", &["证券代码", "证券名称"]),
-        "orders" => ("当日委托", &["证券代码", "委托价格"]),
-        "deals" => ("当日成交", &["证券代码", "成交价格"]),
+    // 校验「这是不是我要的那类表」。
+    //
+    // 注意信用区的委托表列名和普通区**不一样**：普通区有「委托价格」，
+    // 信用区换成了「成交价格」「委托状态」「申请编号」。
+    // 只认「委托价格」会把信用区一张完整的委托表判成"不是委托表"。
+    // 所以每组给多个候选，只要命中其一就算对。
+    let (tab, must_have_alts): (&str, &[&[&str]]) = match kind {
+        "positions" => ("持仓", &[&["证券代码"], &["证券名称", "最新市值", "股份余额"]]),
+        "orders" => (
+            "当日委托",
+            &[
+                &["委托价格", "委托状态", "申请编号", "委托类型"],
+                &["证券代码"],
+            ],
+        ),
+        "deals" => ("当日成交", &[&["成交价格", "成交金额"], &["证券代码"]]),
         _ => return Response::err(req.id, format!("未知查询类型: {kind}")),
     };
 
@@ -559,10 +704,10 @@ fn do_query(req: &Request, shared: &Shared) -> Response {
     // 精确 contains 就会把一整个好好的页签判成"不在交易面板"。
     // 要求这么严是为了防止读错页签，但正确做法是容忍单字差异，
     // 而不是因为一个错字就否掉整张表。
-    let missing: Vec<&str> = must_have
+    let missing: Vec<String> = must_have_alts
         .iter()
-        .filter(|h| !headers.iter().any(|x| fuzzy_contains(x, h)))
-        .copied()
+        .filter(|alts| !alts.iter().any(|h| headers.iter().any(|x| fuzzy_contains(x, h))))
+        .map(|alts| alts.join("或"))
         .collect();
     if !missing.is_empty() {
         let mut r = Response::err(
@@ -570,10 +715,12 @@ fn do_query(req: &Request, shared: &Shared) -> Response {
             format!("表头不像「{tab}」（缺少 {}），当前表头: {}", missing.join("/"), headers.join("|")),
         );
         r.total = Some(rows.len());
+        r.account = Some(want.as_str().into());
         return r;
     }
 
     let mut r = Response::ok(req.id);
+    r.account = Some(want.as_str().into());
     r.total = Some(rows.len());
     r.detail = Some(match total {
         // 「共N条」和实际解析行数对不上，说明解析漏了，不能假装正常

@@ -52,6 +52,59 @@ pub const TAB_Y: f64 = 41.0;
 
 /// 「买入」页签的 x —— 它是回到交易面板最可靠的入口
 pub const TAB_TRADE_X: f64 = 89.0;
+
+/// 信用账户顶部菜单（y 同样是 TAB_Y）
+///
+/// 信用区是一整套平行的界面，不是普通交易的一个页签：
+/// 顶部菜单换成了担保品/融资融券相关项，账户和股东代码也完全不同。
+/// 进信用区的入口（担保品买入），等同于普通区的「买入」
+pub const TAB_CREDIT_X: f64 = 69.0;
+
+/// 下单表单的「重置」按钮（窗口内坐标）
+///
+/// 这个按钮**不在 AX 树里** —— 整个下单面板是自绘的，只有文本框和
+/// 「买入下单」等少数控件暴露给了 AX。重置只能按坐标点。
+/// 不重置的后果很实际：上一次填的证券代码会留着，代码框变成只读的
+/// 静态文本，新代码写不进去，接着写价格就写到了价格框，
+/// 界面看着"填好了"，实际证券还是上一只。
+pub const RESET_X: f64 = 69.0;
+pub const RESET_Y: f64 = 391.0;
+
+/// 区分两套界面：普通交易 vs 信用交易
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Account {
+    Normal,
+    Credit,
+}
+
+impl Account {
+    /// 顶部菜单里出现「担保品买入」就是信用区。
+    ///
+    /// 不能靠账户号或股东代码判断 —— 那两个值每次登录都可能变，
+    /// 而菜单文字是界面结构的一部分，稳定得多。
+    pub fn detect(headers_or_words: &[String]) -> Account {
+        if headers_or_words.iter().any(|w| w.contains("担保品") || w.contains("融资融券")) {
+            Account::Credit
+        } else {
+            Account::Normal
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Account::Normal => "normal",
+            Account::Credit => "credit",
+        }
+    }
+
+    /// 该账户「买入」入口的 x
+    pub fn entry_x(&self) -> f64 {
+        match self {
+            Account::Normal => TAB_TRADE_X,
+            Account::Credit => TAB_CREDIT_X,
+        }
+    }
+}
 pub const TAB_TRADE: &[(&str, f64)] = &[
     ("买入", 92.0),
     ("卖出", 186.0),
