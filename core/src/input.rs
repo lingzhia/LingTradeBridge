@@ -628,6 +628,66 @@ impl AxElement {
         }
     }
 
+    /// 读一个「元素数组」类型的属性（如 AXRows / AXColumns）
+    ///
+    /// children() 只能拿 AXChildren，表格行在 AXRows 里，两者不是同一批。
+    pub fn text_array(&self, name: &str) -> Vec<AxElement> {
+        let a = cfstr(name);
+        if a.is_null() {
+            return Vec::new();
+        }
+        let mut v: CFTypeRef = std::ptr::null();
+        let rc = unsafe { AXUIElementCopyAttributeValue(self.raw, a, &mut v) };
+        unsafe { CFRelease(a) };
+        if rc != 0 || v.is_null() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        unsafe {
+            let count = CFArrayGetCount(v);
+            for i in 0..count {
+                let p = CFArrayGetValueAtIndex(v, i) as CFTypeRef;
+                if !p.is_null() {
+                    out.push(AxElement {
+                        raw: CFRetain(p),
+                    });
+                }
+            }
+            CFRelease(v);
+        }
+        out
+    }
+
+    /// 设置该元素为选中状态
+    ///
+    /// 表格行用这个来"勾选"：通达信的表格单元格读不到内容，但**行对象是可写的**，
+    /// 于是撤单可以完全不依赖 OCR —— 按结构定位到行，直接选中它。
+    pub fn set_selected(&self, on: bool) -> bool {
+        let a = cfstr("AXSelected");
+        if a.is_null() {
+            return false;
+        }
+        extern "C" {
+            static kCFBooleanTrue: CFTypeRef;
+            static kCFBooleanFalse: CFTypeRef;
+        }
+        let v = unsafe {
+            if on {
+                kCFBooleanTrue
+            } else {
+                kCFBooleanFalse
+            }
+        };
+        let rc = unsafe { AXUIElementSetAttributeValue(self.raw, a, v) };
+        unsafe { CFRelease(a) };
+        rc == 0
+    }
+
+    /// 是否已选中
+    pub fn is_selected(&self) -> bool {
+        self.text("AXSelected").map(|v| v == "1").unwrap_or(false)
+    }
+
     /// 按一下
     pub fn press(&self) -> bool {
         let a = cfstr("AXPress");

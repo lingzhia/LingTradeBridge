@@ -24,7 +24,7 @@ use crate::panel;
 use crate::unlock::{self, UnlockGuard, UnlockOutcome};
 use crate::config;
 
-use crate::{capture, follow, http, input, ocr, order, CoreConfig};
+use crate::{cancel, capture, follow, http, input, ocr, order, CoreConfig};
 
 /// 请求
 #[derive(Debug, Deserialize)]
@@ -57,6 +57,9 @@ pub struct Request {
     /// 目标账户："normal"（默认）或 "credit"
     #[serde(default)]
     pub account: Option<String>,
+    /// 撤单用：委托编号
+    #[serde(default)]
+    pub order_no: Option<String>,
 }
 
 /// 响应
@@ -303,6 +306,108 @@ fn fuzzy_contains(header: &str, want: &str) -> bool {
     hit * 2 > w.len()
 }
 
+/// 列出当前可撤的委托
+fn do_cancel_list(req: &Request, shared: &Shared) -> Response {
+    let cfg = shared.cfg();
+    let (pid, win) = match panel::ensure_window(&cfg.app_path) {
+        Some(v) => v,
+        None => return Response::err(req.id, "客户端未运行"),
+    };
+    if let Err(e) = ensure_unlocked(&win, pid, &cfg, shared) {
+        return Response::err(req.id, e);
+    }
+    let account = match req.account.as_deref() {
+        Some("credit") => panel::Account::Credit,
+        Some("normal") | None => panel::Account::Normal,
+        Some(other) => return Response::err(req.id, format!("未知账户类型: {other}")),
+    };
+    match cancel::list_pending(&win, pid, &cfg, account) {
+        Ok(rows) => {
+            let n = rows.len();
+            let js: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "index": r.index,
+                        "code": r.code,
+                        "order_no": r.order_no,
+                        "y": r.y,
+                    })
+                })
+                .collect();
+            let mut resp = Response::ok(req.id);
+            resp.detail = Some(if n == 0 {
+                "撤单页没有可撤的委托".to_string()
+            } else {
+                format!("共 {n} 笔可撤")
+            });
+            resp.total = Some(n);
+            resp.rows = Some(js);
+            resp.account = Some(account.as_str().to_string());
+            resp
+        }
+        Err(e) => Response::err(req.id, e),
+    }
+}
+
+/// 撤单
+///
+/// 请求字段：code（证券代码，可选）、order_no（委托编号，可选），两者至少给一个；
+/// 两个都给时要求同时匹配，避免撤错同代码的其他委托。
+fn do_cancel(req: &Request, shared: &Shared) -> Response {
+    let cfg = shared.cfg();
+    let code = req.code.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let order_no = req.order_no.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if code.is_none() && order_no.is_none() {
+        return Response::err(req.id, "必须提供 code 或 order_no，否则不知道该撤哪一笔");
+    }
+    if let Some(c) = code {
+        if !c.chars().all(|ch| ch.is_ascii_digit()) || c.len() != 6 {
+            return Response::err(req.id, format!("证券代码不合法: {c}"));
+        }
+    }
+
+    let (pid, win) = match panel::ensure_window(&cfg.app_path) {
+        Some(v) => v,
+        None => return Response::err(req.id, "客户端未运行"),
+    };
+    if let Err(e) = ensure_unlocked(&win, pid, &cfg, shared) {
+        return Response::err(req.id, e);
+    }
+    let account = match req.account.as_deref() {
+        Some("credit") => panel::Account::Credit,
+        Some("normal") | None => panel::Account::Normal,
+        Some(other) => return Response::err(req.id, format!("未知账户类型: {other}")),
+    };
+    // action=dry_run 时只看会撤哪一笔，不真点
+    let dry_run = req.action.as_deref() == Some("dry_run");
+
+    match cancel::cancel_one(&win, pid, &cfg, account, code, order_no, dry_run) {
+        cancel::CancelOutcome::Cancelled { code, order_no } => {
+            let mut r = Response::ok(req.id);
+            r.detail = Some(format!("已撤销 {code} {order_no}"));
+            r.state = Some("cancelled".into());
+            r.account = Some(account.as_str().to_string());
+            r
+        }
+        cancel::CancelOutcome::NotFound { reason } => {
+            let mut r = Response::err(req.id, reason);
+            r.state = Some("not_found".into());
+            r
+        }
+        cancel::CancelOutcome::WrongState { reason } => {
+            let mut r = Response::err(req.id, reason);
+            r.state = Some("wrong_state".into());
+            r
+        }
+        cancel::CancelOutcome::Failed { reason } => {
+            let mut r = Response::err(req.id, reason);
+            r.state = Some("failed".into());
+            r
+        }
+    }
+}
+
 /// 启动跟单：拉起 HTTP 信号服务
 fn do_follow_start(req: &Request, shared: &Shared) -> Response {
     let cfg = shared.cfg();
@@ -344,6 +449,7 @@ fn do_follow_start(req: &Request, shared: &Shared) -> Response {
             kind: Some(k.to_string()),
             action: None,
             account: Some(app_account_str(&shared3.cfg())),
+            order_no: None,
         };
         let r = do_query(&req, shared3);
         if r.ok {
@@ -800,6 +906,25 @@ fn dispatch(req: &Request, shared: &Shared) -> Response {
                 pid: Some(pid),
             };
         }
+        // 调试用：在窗口坐标上点一下（x/y 来自请求的 seq/ts 两个数值字段不好读，
+        // 这里用 code 传 "x,y" 字符串）
+        "dbg_click" => {
+            let (pid, win) = match panel::ensure_window(&shared.cfg().app_path) {
+                Some(v) => v,
+                None => return Response::err(req.id, "客户端未运行"),
+            };
+            let spec = req.code.clone().unwrap_or_default();
+            let mut it = spec.split(',');
+            let x: f64 = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(-1.0);
+            let y: f64 = it.next().and_then(|v| v.trim().parse().ok()).unwrap_or(-1.0);
+            if x < 0.0 || y < 0.0 {
+                return Response::err(req.id, "用法: code=\"x,y\"（窗口坐标）");
+            }
+            panel::click_in_window(&win, x, y, shared.cfg().settle);
+            let mut r = Response::ok(req.id);
+            r.detail = Some(format!("已点击窗口坐标 ({x}, {y})"));
+            r
+        }
         // 调试用：分别报告 AX 预筛、裁切 OCR、最终结论
         "lock_probe" => {
             let (pid, win) = match panel::ensure_window(&shared.cfg().app_path) {
@@ -834,6 +959,9 @@ fn dispatch(req: &Request, shared: &Shared) -> Response {
         "query" => do_query(req, shared),
 
         "place_order" => do_place_order(req, shared),
+
+        "cancel" => do_cancel(req, shared),
+        "cancel_list" => do_cancel_list(req, shared),
 
         "follow_start" => do_follow_start(req, shared),
         "follow_stop" => do_follow_stop(req, shared),

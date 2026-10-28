@@ -17,6 +17,7 @@
 //! - 解锁失败达阈值后永久停手，需人工重置（券商对连错有锁定策略）
 //! - 下单必须经「当日委托」交叉核对才算成功
 
+mod cancel;
 mod capture;
 mod config;
 mod follow;

@@ -103,6 +103,20 @@ fn field_at(pid: u32, row: f64) -> Option<AxElement> {
         .find(|e| e.frame().map(|(_, y, _, _)| (y - row).abs() < 6.0).unwrap_or(false))
 }
 
+/// 按行读 AX 里显示的值（价格 / 数量）
+///
+/// 这是**首选**读取方式：AXTextField 的 AXValue 是客户端自己维护的字段值，
+/// 不需要截图和识别，零误读、零延迟。
+///
+/// 之前踩过的坑是按"第几个 AXTextField"读 —— 填完证券代码后控件会重排，
+/// 序号语义就变了。改成按固定屏幕行（价格 213 / 数量 249）找框，重排无影响。
+fn ax_value_at(pid: u32, row: f64) -> Option<String> {
+    let f = field_at(pid, row)?;
+    let v = f.value()?;
+    let v = v.trim().to_string();
+    if v.is_empty() { None } else { Some(v) }
+}
+
 /// 在 AX 树里按标题找按钮，并限定纵向范围（避免跨面板误取）
 fn find_button(pid: u32, title: &str, y_min: f64, y_max: f64) -> Option<AxElement> {
     let app = input::ax_app(pid)?;
@@ -152,9 +166,41 @@ fn fill_field(pid: u32, row: f64, label: &str, value: &str) -> Result<(), String
 
 /// 读下单面板上实际显示的内容：(证券名称, 价格, 数量)
 ///
-/// 这是填单是否成功的**唯一可信判据**：AX 的 value 读回不可靠，
-/// 而屏幕上显示的就是券商界面认下的值。
-fn read_order_form(win: &capture::WindowInfo) -> (String, String, String) {
+/// 优先级：AX 优先，OCR 只在 AX 读不到时兜底。
+///
+/// 价格和数量是 AXTextField，AXValue 直接可读 —— 没有任何理由去截图识别它们。
+/// 只有「证券 代码+名称」那一行是自绘的 AXStaticText（AXValue 恒为空），
+/// 那才必须 OCR。
+fn read_order_form(win: &capture::WindowInfo, pid: u32) -> (String, String, String) {
+    let ax_price = ax_value_at(pid, ROW_PRICE);
+    let ax_amount = ax_value_at(pid, ROW_AMOUNT);
+    let name = read_security_row(win);
+
+    // 两个都读到了就不必碰 OCR
+    let price = ax_price.unwrap_or_default();
+    let amount = ax_amount.unwrap_or_default();
+    (name, price, amount)
+}
+
+/// 只读「证券」那一行的代码+名称
+///
+/// 这一行是自绘静态文本，AXValue 恒为空，是**整个下单流程里唯一必须 OCR 的地方**。
+/// 所以这里裁切到那一小块再识别：全窗口 170+ 个词，噪声大、慢，裁切后只剩几个词。
+fn read_security_row(win: &capture::WindowInfo) -> String {
+    let crop = capture::CGRect::new(100.0, 104.0, 260.0, 34.0);
+    let words = ocr::ocr_window(win.number, Some(crop));
+    let mut name = String::new();
+    for w in &words {
+        let t = w.trimmed();
+        if !t.is_empty() {
+            name.push_str(t);
+        }
+    }
+    name
+}
+
+#[allow(dead_code)]
+fn read_order_form_full_ocr(win: &capture::WindowInfo) -> (String, String, String) {
     let words = ocr::ocr_window(win.number, None);
     // 面板纵向位置：证券 y≈117、价格 y≈189、数量 y≈226
     let mut name = String::new();
@@ -164,7 +210,12 @@ fn read_order_form(win: &capture::WindowInfo) -> (String, String, String) {
         let t = w.trimmed();
         let y = w.y;
         // 证券行：右侧是「代码 名称」
-        if (108.0..132.0).contains(&y) && w.x > 140.0 {
+        //
+        // x 门槛必须放在输入区左边界（约 113）之外一点点，不能取 140：
+        // OCR 有时把「513290 纳指生物科技ETF汇添富」整串识别成**一个词**，
+        // 该词的起点在 x≈125，用 140 当门槛会把它整个滤掉，name 变空，
+        // 于是误判成"代码没填进去"。实测踩过这个坑。
+        if (108.0..132.0).contains(&y) && w.x > 100.0 && w.x < 340.0 {
             name.push_str(t);
         }
         // 价格行：输入框内是纯数字，右侧单位「元」要排除
@@ -294,8 +345,31 @@ pub fn place_order(
     // 直接往里写新代码**不会生效**，而后续按行写价格反而写进了价格框 ——
     // 表面看"填单成功"，实际证券还是上一只。必须先把表单清空。
     // 「重置」按钮不在 AX 树里（自绘控件），只能按坐标点。
-    panel::click_in_window(win, panel::RESET_X, panel::RESET_Y, cfg.settle);
-    sleep(Duration::from_millis(300));
+    // 重置必须真的清掉上一笔的证券，否则新代码写不进去，会把单下成上一只票。
+    // 但客户端重绘是**异步**的：点完立刻读，读到的还是旧画面（实测踩过，
+    // 400ms 仍可能读到旧值）。所以这里轮询等待，而不是睡固定时长。
+    let (rx, ry) = panel::find_reset_button(win).unwrap_or((panel::RESET_X, panel::RESET_Y));
+    let mut cleared = false;
+    for attempt in 0..6 {
+        panel::click_in_window(win, rx, ry, cfg.settle);
+        // 首次点击后多等一些，重绘有延迟
+        sleep(Duration::from_millis(if attempt == 0 { 500 } else { 350 }));
+        let cur = read_security_row(win);
+        if cur.trim().is_empty() || cur.contains(code) {
+            cleared = true;
+            break;
+        }
+        if attempt >= 2 {
+            return PlaceOutcome::Failed {
+                reason: format!("重置后表单里仍残留「{cur}」，拒绝继续填单"),
+            };
+        }
+    }
+    if !cleared {
+        return PlaceOutcome::Failed {
+            reason: "重置表单失败，无法清空上一笔证券".into(),
+        };
+    }
 
     // ── 1. 填代码。填完客户端会自动带出名称和市价，也是校验点
     if let Err(e) = fill_field(pid, ROW_CODE, "证券代码", code) {
@@ -303,11 +377,20 @@ pub fn place_order(
     }
     sleep(Duration::from_millis(600)); // 等行情联动刷新
 
-    let (name, _, _) = read_order_form(win);
-    if name.trim().is_empty() || !name.contains(code) {
-        return PlaceOutcome::Failed {
-            reason: format!("填完代码 {code} 后界面上没出现该代码/名称，可能代码无效或界面未刷新"),
-        };
+    // 校验代码确实填进去了。优先看 AX 里代码框的值（可读、精确），
+    // 读不到才回落到 OCR 的「代码 名称」行。
+    let code_ok = ax_value_at(pid, ROW_CODE)
+        .map(|v| v.contains(code))
+        .unwrap_or(false);
+    if !code_ok {
+        let name = read_security_row(win);
+        if name.trim().is_empty() || !name.contains(code) {
+            return PlaceOutcome::Failed {
+                reason: format!(
+                    "填完代码 {code} 后界面上没出现该代码/名称，可能代码无效或界面未刷新"
+                ),
+            };
+        }
     }
 
     // ── 2. 填价格。代码填好后控件序号会变，重新枚举
@@ -322,7 +405,7 @@ pub fn place_order(
 
     // 端到端复核：界面显示的价格和数量必须就是我们要的。
     // 这是防止"填到别的框去了"的唯一可靠手段 —— 实测过价格跑进数量框。
-    let (_, shown_price, shown_amount) = read_order_form(win);
+    let (_, shown_price, shown_amount) = read_order_form(win, pid);
     let norm = |x: &str| x.trim().trim_end_matches('0').trim_end_matches('.').to_string();
     if !shown_price.is_empty() && norm(&shown_price) != norm(price) {
         return PlaceOutcome::Failed {
