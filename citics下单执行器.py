@@ -235,53 +235,79 @@ class KeyOrderExecutor:
 
         进程活着但窗口不见了 (最小化 / 被隐藏) 是常见情况 —— 此时 pgrep 还能
         找到 pid, 但 list_windows 里没有它的窗口, 截图和点击全部失败。
-        所以要自动把它唤到前台再重试一次。
+        所以先按缓存找, 不行就扫, 扫到 pid 但没窗口就唤起一次。
         """
-        if self.ths_hwnd:
-            if cx.find_main_window(self.ths_hwnd):
-                return self.ths_hwnd
-            # 进程还在但窗口不可见: 唤起来
-            if self._wake_app():
-                return self.ths_hwnd
-            self.ths_hwnd = None
+        if self.ths_hwnd and cx.find_main_window(self.ths_hwnd):
+            return self.ths_hwnd
+
+        pids = self._scan_pids()
+        if not pids:
+            return None
+
+        # 有 pid: 挑窗口面积最大的; 全都没窗口就先唤一次再挑
+        best = self._pick_by_area(pids)
+        if best:
+            self.ths_hwnd = best
+            return best
+
+        if self._wake_app():
+            best = self._pick_by_area(pids)
+            if best:
+                self.ths_hwnd = best
+                return best
+        return None
+
+    def _scan_pids(self):
+        """按进程名扫 pid 列表 (可能为空)"""
         import subprocess
-        names = (self._app_name(), "中信证券网上交易", "citics")
-        for nm in names:
+        seen = []
+        for nm in (self._app_name(), "中信证券网上交易", "citics"):
             if not nm:
                 continue
             try:
                 proc = subprocess.run(["pgrep", "-f", nm],
                                       capture_output=True, text=True, timeout=5)
-                pids = [int(x) for x in proc.stdout.split() if x.isdigit()]
-                if pids:
-                    best, best_area = None, -1
-                    for pid in pids:
-                        win = cx.find_main_window(pid)
-                        if not win:
-                            continue
-                        area = win["w"] * win["h"]
-                        if area > best_area:
-                            best, best_area = pid, area
-                    if best:
-                        self.ths_hwnd = best
-                        return best
+                for x in proc.stdout.split():
+                    if x.isdigit() and int(x) not in seen:
+                        seen.append(int(x))
             except Exception:
                 continue
-        return None
+        return seen
+
+    def _pick_by_area(self, pids):
+        """从候选 pid 里挑窗口面积最大的那个; 都没有可见窗口返回 None"""
+        best, best_area = None, -1
+        for pid in pids:
+            win = cx.find_main_window(pid)
+            if not win:
+                continue
+            area = win["w"] * win["h"]
+            if area > best_area:
+                best, best_area = pid, area
+        return best
 
     def _wake_app(self):
         """把最小化/隐藏的客户端唤到前台。成功返回 True。"""
         import subprocess
-        try:
-            subprocess.run(["open", "-a", self._app_path()],
-                           capture_output=True, timeout=10)
-            time.sleep(2.0)
-            if self.ths_hwnd and cx.find_main_window(self.ths_hwnd):
-                self._activate(self.ths_hwnd)
-                time.sleep(0.3)
-                return True
-        except Exception as exc:
-            _log("唤不起中信客户端: %s" % exc, "WARN")
+        for path in (self._app_path(), "中信证券网上交易"):
+            if not path:
+                continue
+            try:
+                subprocess.run(["open", "-a", path], capture_output=True, timeout=10)
+            except Exception as exc:
+                _log("唤不起中信客户端 (%s): %s" % (path, exc), "WARN")
+                continue
+            # open 是异步的, 给它一点时间把窗口画出来
+            for _ in range(10):
+                time.sleep(0.4)
+                if self._scan_pids() and self._pick_by_area(self._scan_pids()):
+                    pid = self._pick_by_area(self._scan_pids())
+                    try:
+                        self._activate(pid)
+                    except Exception:
+                        pass
+                    _log("中信客户端窗口已恢复", "OK")
+                    return True
         return False
 
     def _win(self, pid=None):
@@ -593,36 +619,151 @@ class KeyOrderExecutor:
         return False
 
     # -- 解锁 -------------------------------------------------------------
-    def unlock_trade(self, password):
-        """交易界面被密码锁挡住时, 填密码并点确定。返回是否解锁成功。"""
+    def unlock_trade(self, password, attempts=2):
+        """交易界面被密码锁挡住时, 填密码并点确定。返回是否解锁成功。
+
+        密码框是安全文本栏, AXValue 写入不生效, 必须点击后走真实键盘。
+        可能连解两次: 客户端偶尔要点完「确定」才真正把表单画出来。
+        """
         if not password:
             return False
-        panel = self._read_panel()
-        if not panel:
+
+        for attempt in range(max(1, attempts)):
+            panel = self._read_panel()
+            if not panel:
+                return False
+            if panel["in_trade"]:
+                return True      # 已经解锁了
+
+            pwd_tf = None
+            for tf in panel["textfields"]:
+                if abs(tf["y"] - LOCK_PWD_TF_Y) < 12:
+                    pwd_tf = tf
+                    break
+            if pwd_tf is None and panel["textfields"]:
+                pwd_tf = panel["textfields"][0]
+            if pwd_tf is None:
+                # 连密码框都没有, 不是锁定界面
+                return False
+
+            # 先把窗口唤到前台, 否则按键可能落到别的窗口
+            self._activate(panel["pid"])
+            time.sleep(0.2)
+
+            self._click_local(pwd_tf["x"] + pwd_tf["w"] / 2.0,
+                              pwd_tf["y"] + pwd_tf["h"] / 2.0, settle=0.4)
+            time.sleep(0.2)
+            # 先清空 (上一次可能残留)
+            cx.press_hotkey(["cmd"], "a", settle=0.08)
+            cx.press_key("delete", settle=0.05)
+            cx.type_text(str(password), settle=0.35)
+            time.sleep(0.25)
+
+            if not self._click_text("确定", exact=True, settle=1.0):
+                cx.press_key("return")
+                time.sleep(1.0)
+
+            panel2 = self._read_panel()
+            if panel2 and panel2["in_trade"]:
+                _log("交易界面已自动解锁", "OK")
+                return True
+            _log("第 %d 次解锁未成功, %s" % (
+                attempt + 1, "重试" if attempt + 1 < attempts else "放弃"), "WARN")
+
+        return False
+
+    # -- 自动解锁守护 -----------------------------------------------------
+    # 客户端静置十几分钟就会自己弹密码框把交易界面锁上。跟单过程中一旦被锁,
+    # 下一次下单就会失败。所以起一个守护线程定期探一次, 发现锁了就自动解。
+    def start_autounlock(self):
+        """启动自动解锁守护线程 (幂等: 重复调用不会起第二个)"""
+        if getattr(self, "_unlock_thread", None) and self._unlock_thread.is_alive():
+            return True
+        if not str(self.config.get("trade_password", "") or ""):
+            _log("没有配置交易密码, 无法自动解锁 (请在界面「交易密码」里填上)", "WARN")
             return False
-        if panel["in_trade"]:
-            return True      # 已经解锁了
+        self._unlock_stop = threading.Event()
+        self._unlock_thread = threading.Thread(
+            target=self._autounlock_loop, name="citics-autounlock", daemon=True)
+        self._unlock_thread.start()
+        _log("自动解锁守护已启动 (每 %s 秒检查一次)"
+             % self._unlock_interval(), "OK")
+        return True
 
-        pwd_tf = None
-        for tf in panel["textfields"]:
-            if abs(tf["y"] - LOCK_PWD_TF_Y) < 12:
-                pwd_tf = tf
-                break
-        if pwd_tf is None and panel["textfields"]:
-            pwd_tf = panel["textfields"][0]
+    def stop_autounlock(self):
+        ev = getattr(self, "_unlock_stop", None)
+        if ev:
+            ev.set()
+        thr = getattr(self, "_unlock_thread", None)
+        if thr and thr.is_alive():
+            thr.join(timeout=2.0)
+        self._unlock_thread = None
+        self._unlock_stop = None
 
-        # 密码框要用真实键盘输入 (AXValue 写进去不生效, 它是安全文本栏)
-        self._click_local(pwd_tf["x"] + pwd_tf["w"] / 2.0,
-                          pwd_tf["y"] + pwd_tf["h"] / 2.0) if pwd_tf else None
-        time.sleep(0.2)
-        cx.type_text(str(password), settle=0.2)
-        time.sleep(0.15)
-        if not self._click_text("确定", exact=True, settle=0.9):
-            cx.press_key("return")
-            time.sleep(0.9)
+    def _unlock_interval(self):
+        try:
+            return max(5.0, float(self.config.get("citics_unlock_interval", 20) or 20))
+        except Exception:
+            return 20.0
 
-        panel2 = self._read_panel()
-        return bool(panel2 and panel2["in_trade"])
+    def _autounlock_loop(self):
+        stop = self._unlock_stop
+        # 启动后先歇一个周期, 别和用户手动操作抢
+        if stop.wait(self._unlock_interval()):
+            return
+        while not stop.is_set():
+            try:
+                self._autounlock_once()
+            except Exception as exc:
+                _log("自动解锁检查异常: %s" % exc, "WARN")
+            if stop.wait(self._unlock_interval()):
+                return
+
+    def _autounlock_once(self):
+        """探一次; 锁着就解。返回 True 表示这次真的解了锁。
+
+        重要: 密码输错时中信会把解锁框关掉并退回行情界面。券商对密码连续
+        错误通常有锁定策略(几次就锁账户), 所以这里必须有熔断 —— 连续失败
+        到阈值就彻底停下来, 等人工介入, 绝不能傻乎乎地一直重试。
+        """
+        if not bool(self.config.get("citics_auto_unlock", True)):
+            return False
+        pwd = str(self.config.get("trade_password", "") or "")
+        if not pwd:
+            return False
+        # 熔断: 已经判定密码有问题就不再碰, 避免把券商户锁死
+        if getattr(self, "_unlock_gave_up", False):
+            return False
+        # 窗口不可见时不去干扰 (用户可能把客户端最小化了, 这时不该弹出来)
+        pid = self.ths_hwnd or self._find_pid()
+        if not pid or not cx.find_main_window(pid):
+            return False
+        state = self.detect_panel_state()
+        if state.get("state") != "locked":
+            return False
+
+        _log("检测到交易界面被锁, 自动解锁...", "INFO")
+        with self._lock:
+            ok = self.unlock_trade(pwd, attempts=1)
+
+        if ok:
+            self._unlock_ok_count = getattr(self, "_unlock_ok_count", 0) + 1
+            self._unlock_fail_count = 0     # 成功一次就清零
+            return True
+
+        self._unlock_fail_count = getattr(self, "_unlock_fail_count", 0) + 1
+        limit = int(self.config.get("citics_unlock_max_fail", 3) or 3)
+        if self._unlock_fail_count >= limit:
+            self._unlock_gave_up = True
+            _log("!! 自动解锁连续失败 %d 次, 已停止自动解锁。\n"
+                 "   密码输错时中信会退回行情界面, 继续重试有锁账户的风险。\n"
+                 "   请手动解锁一次确认密码, 再到界面改成正确的交易密码。"
+                 % self._unlock_fail_count, "ERROR")
+        else:
+            _log("自动解锁失败 (%d/%d), 稍后重试"
+                 % (self._unlock_fail_count, limit), "WARN")
+        return False
+
 
     # -- 下单面板导航 ---------------------------------------------------
     # 普通交易 (左侧「交易」) 与信用交易 (左侧「信用」) 是两套不同布局。
@@ -1103,6 +1244,53 @@ class KeyOrderExecutor:
                 _log(traceback.format_exc(), "ERROR")
                 return False
 
+    def ensure_ready(self, quiet=False):
+        """确保「可以下单」: 窗口在、交易界面已解锁。需要时自动解锁。
+
+        跟单主循环每轮都该先调它 —— 客户端随时可能自己锁上。
+        返回 True 表示现在能下单。
+        """
+        pid = self.ths_hwnd or self._find_pid()
+        if not pid:
+            if not quiet:
+                _log("没找到中信客户端, 请先启动并登录", "ERROR")
+            return False
+        self.ths_hwnd = pid
+
+        state = self.detect_panel_state()
+        if state.get("state") == "trade":
+            return True
+
+        if state.get("state") == "locked":
+            pwd = str(self.config.get("trade_password", "") or "")
+            if not pwd:
+                if not quiet:
+                    _log("交易界面已锁定, 但没配置交易密码 —— 请到界面「交易密码」里填上",
+                         "ERROR")
+                return False
+            if not quiet:
+                _log("交易界面已锁定, 自动解锁...", "INFO")
+            if self.unlock_trade(pwd):
+                return True
+            if not quiet:
+                _log("自动解锁失败, 请手动输入一次交易密码", "ERROR")
+            return False
+
+        # 其它界面: 试着切回交易面板
+        if bool(self.config.get("auto_goto_panel", True)):
+            self._goto_trade()
+            time.sleep(0.8)
+            st2 = self.detect_panel_state()
+            if st2.get("state") == "locked":
+                pwd = str(self.config.get("trade_password", "") or "")
+                if pwd and self.unlock_trade(pwd):
+                    return True
+            if st2.get("state") == "trade":
+                return True
+        if not quiet:
+            _log("中信客户端当前不在可下单状态: %s" % state.get("message"), "WARN")
+        return False
+
     def _place_order_locked(self, stock_code, direction, amount):
         operate = "买入" if direction == 1 else "卖出"
         pid = self.ths_hwnd or self._find_pid()
@@ -1111,24 +1299,19 @@ class KeyOrderExecutor:
             return False
         self.ths_hwnd = pid
 
+        # 统一的前置检查: 窗口在不在、锁没锁、要不要切换面板
+        if not self.ensure_ready():
+            return False
+
         panel = self._read_panel(pid)
         if not panel:
             _log("下单失败: 读不到中信客户端窗口", "ERROR")
             return False
 
-        # 不在交易面板就自己切过去
-        if not panel["in_trade"]:
-            _log("中信客户端不在交易面板, 尝试自动切过去", "INFO")
-            self._goto_trade()
-            time.sleep(0.6)
-            panel = self._read_panel(pid)
-            if not panel or not panel["in_trade"]:
-                pwd = str(self.config.get("trade_password", "") or "")
-                if pwd and self.unlock_trade(pwd):
-                    panel = self._read_panel(pid)
-                if not panel or not panel["in_trade"]:
-                    _log("下单失败: 交易面板不可用 (可能需要交易密码解锁)", "ERROR")
-                    return False
+        # 下单前切到 买入 / 卖出 面板 (下单面板可能是上一次操作留下的别的页签)
+        if not self.open_panel("buy" if direction == 1 else "sell"):
+            _log("下单失败: 切不到「%s」下单面板" % operate, "ERROR")
+            return False
 
         code = str(stock_code)
         qty = int(amount)

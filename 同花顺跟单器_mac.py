@@ -123,6 +123,17 @@ def _migrate_user_data():
 DEFAULT_CONFIG = {
     # macOS 版: 这里填「同花顺.app」的路径(Windows 版原来是 xiadan.exe)
     "ths_exe_path": "/Applications/同花顺.app",
+    # --- 下单客户端选择: ths=同花顺 / citics=中信证券 ---
+    # 两套执行器对外接口一致, 切换后上层逻辑不用改。
+    "client_type": "ths",
+    # --- 中信证券客户端 ---
+    "citics_app_path": "/Applications/中信证券网上交易.app",
+    "citics_app_name": "中信证券网上交易",   # pgrep 用的进程名
+    "citics_settle": 0.45,                   # 每次点击后的等待(客户端反应比同花顺慢)
+    # 中信静置会自动锁交易界面, 这些键控制自动解锁
+    "citics_auto_unlock": True,
+    "citics_unlock_interval": 20,            # 每隔几秒检查一次
+    "citics_unlock_max_fail": 3,             # 连错几次就放弃(防止把券商户锁死)
     # --- 券商账户(预热时若检测到未登录, 自动填入并点登录) ---
     # 多账户: 每个账户 {broker, account, trade_password}。UI 的「券商」下拉框
     # 列出这里所有的 broker, 选中后自动带出对应的 account / trade_password。
@@ -359,6 +370,44 @@ import mac下单执行器 as _mac_order
 _mac_order.set_log(gui_log)
 KeyOrderExecutor = _mac_order.KeyOrderExecutor
 
+# 中信证券执行器: 截图 + OCR + 合成鼠标键盘, 对外接口与同花顺版一致。
+# 用 importlib 延迟导入 —— 它依赖 tools/ocr 编译产物, 走同花顺模式时不必存在。
+_citics_mod = None
+_citics_import_error = None
+
+
+def _load_citics_executor():
+    """按需导入中信执行器。返回 (类, 错误信息)"""
+    global _citics_mod, _citics_import_error
+    if _citics_mod is not None:
+        return _citics_mod.KeyOrderExecutor, None
+    if _citics_import_error is not None:
+        return None, _citics_import_error
+    try:
+        import importlib
+        _citics_mod = importlib.import_module("citics下单执行器")
+        _citics_mod.set_log(gui_log)
+        return _citics_mod.KeyOrderExecutor, None
+    except Exception as exc:
+        _citics_import_error = str(exc)
+        return None, _citics_import_error
+
+
+def make_order_executor(cfg):
+    """按配置里的 client_type 造执行器。
+
+    两个执行器的构造签名和对外方法一致, 上层代码不用区分。
+    """
+    client = str((cfg or {}).get("client_type", "ths") or "ths").lower()
+    if client == "citics":
+        cls, err = _load_citics_executor()
+        if cls is None:
+            gui_log("加载中信执行器失败: %s —— 回退到同花顺执行器" % err, "ERROR")
+            return KeyOrderExecutor(cfg)
+        gui_log("下单客户端: 中信证券", "INFO")
+        return cls(cfg)
+    return KeyOrderExecutor(cfg)
+
 
 # ===========================================================================
 # 自动跟单引擎: Redis 实时接收 tools_ths_redis.py 信号 -> 模拟键盘在同花顺下单
@@ -463,6 +512,12 @@ class FollowerEngine:
         self.state = "following"
         self.config["http_enabled"] = source in ("http", "both")
         self._start_http_server()
+        # 中信客户端静置会自己锁交易界面, 跟单期间必须有人盯着把它解开
+        _ex = self.order_executor
+        if _ex is not None and hasattr(_ex, "start_autounlock"):
+            if bool(self.config.get("citics_auto_unlock", True)):
+                if not _ex.start_autounlock():
+                    gui_log("自动解锁未启用 —— 若客户端锁了交易界面, 下单会失败", "WARN")
         if source in ("redis", "both"):
             self._follow_thread = threading.Thread(target=self._redis_follow_loop, daemon=True)
             self._follow_thread.start()
@@ -484,6 +539,13 @@ class FollowerEngine:
         self.state = "idle"
         if self._stop_event:
             self._stop_event.set()
+        # 停掉自动解锁守护: 不跟单了就不该再动客户端窗口
+        _ex = self.order_executor
+        if _ex is not None and hasattr(_ex, "stop_autounlock"):
+            try:
+                _ex.stop_autounlock()
+            except Exception:
+                pass
         _had_http = self._http_server is not None
         self._stop_http_server()          # 释放端口, 外部再也推不进来
         if _had_http:
@@ -1053,7 +1115,7 @@ class ControlPanel:
         self.cfg = load_config()
         self.engine = None
         self._launch_done = False
-        self.order_executor = KeyOrderExecutor(self.cfg)
+        self.order_executor = make_order_executor(self.cfg)
         self.pos_mgr = PositionManager(BASE_DIR)
         self.vars = {}
         # ---- 定时预热状态(测试版新增) ----
@@ -1411,8 +1473,9 @@ class ControlPanel:
                                    font=(self._FONT_NAME, 9), anchor="w",
                                    text="🔒 跟单运行中，左侧配置已锁定（点[停止跟单]后可修改）")
 
-        self._build_group_ths(left)     # ① 同花顺客户端
+        self._build_group_client(left)  # ① 下单客户端(同花顺 / 中信证券)
         self._build_group_account(left) # ② 券商账户
+        self._build_group_unlock(left)  # ②b 交易密码自动解锁
         self._build_group_redis(left)   # ③ 信号源 · Redis
         self._build_group_params(left)  # ④ 跟单规则
         self._build_group_activate(left) # ⑤ 定时预热
@@ -1564,14 +1627,93 @@ class ControlPanel:
 
     # ---- 窗口激活(预热/手动) ----
 
+    def _do_activate_citics(self, reason):
+        """中信版预热: 找窗口 → 自动解锁 → 报当前面板/账号状态。"""
+        t0 = time.time()
+        ex = self.order_executor
+        try:
+            if not ex._lock.acquire(blocking=False):
+                gui_log("预热(%s): 当前有下单进行中, 跳过本次触发" % reason, "INFO")
+                return
+            try:
+                pid = ex._find_pid()
+                if not pid:
+                    gui_log("预热(%s) 失败: 没找到中信客户端, 请先点[打开]启动并登录"
+                            % reason, "WARN")
+                    self._act_last = (time.strftime("%H:%M"), False)
+                    return
+                ex.ths_hwnd = pid
+                state = ex.detect_panel_state()
+                st = state.get("state")
+                gui_log("  客户端状态: %s%s" % (
+                    st, (" — " + state.get("message", "")) if state.get("message") else ""),
+                    "INFO")
+
+                if st == "locked":
+                    pwd = self._current_trade_password()
+                    if not pwd:
+                        gui_log("  交易界面已锁定, 但没有交易密码 —— 请到「② 券商账户」"
+                                "填好密码并保存", "ERROR")
+                        self._act_last = (time.strftime("%H:%M"), False)
+                        return
+                    gui_log("  交易界面已锁定, 自动解锁...", "INFO")
+                    if not ex.unlock_trade(pwd):
+                        gui_log("  自动解锁失败, 请手动输一次交易密码核对是否正确", "ERROR")
+                        self._act_last = (time.strftime("%H:%M"), False)
+                        return
+                    gui_log("  已解锁", "OK")
+                elif st != "trade":
+                    gui_log("  不在交易面板, 尝试切过去...", "INFO")
+                    if not ex.ensure_ready():
+                        gui_log("  切不过去, 请手动点一下左侧「交易」", "WARN")
+                        self._act_last = (time.strftime("%H:%M"), False)
+                        return
+
+                # 报一下当前面板里有什么, 让用户确认真的连上了
+                try:
+                    vals = ex.current_panel_values()
+                    if vals:
+                        gui_log("  当前面板: %s" % vals, "INFO")
+                except Exception:
+                    pass
+                try:
+                    acct = ex._read_account()
+                    if acct:
+                        _items = ", ".join("%s=%s" % (k, v) for k, v in list(acct.items())[:4])
+                        gui_log("  账户: %s" % _items, "OK")
+                except Exception:
+                    pass
+
+                # 预热成功就顺手把守护挂上, 免得后面静置被锁
+                if bool(self.cfg.get("citics_auto_unlock", True)):
+                    ex.start_autounlock()
+
+                self._act_last = (time.strftime("%H:%M"), True)
+                gui_log("预热(%s) 成功 (进程=%s, 耗时 %.3f 秒)" % (
+                    reason, pid, time.time() - t0), "OK")
+            finally:
+                try:
+                    ex._lock.release()
+                except Exception:
+                    pass
+        except Exception as e:
+            gui_log("预热(%s) 异常: %s" % (reason, e), "ERROR")
+            self._act_last = (time.strftime("%H:%M"), False)
+
     def _do_activate_window(self, reason):
-        """执行"预热": 确保同花顺已经在交易下单面板上待命, 不在就自己切过去。
+        """执行"预热": 确保下单客户端已经在交易面板上待命, 不在就自己切过去。
         下单进行中(拿不到锁)就跳过本次。
 
         被三处共用: Redis 预热信号(action=preheat)、①[预热]按钮、定时预热。
         原来还有个单独的[测试连接]按钮做的是同一件事, 已经并到这里 ——
         所以这里把当时的体检信息(定位耗时、面板里现在装着什么)一并打出来。
+
+        中信客户端走单独分支: 它没有「登录面板」概念, 关心的是「交易界面锁没锁」,
+        所以预热 = 找到窗口 + 自动解锁 + 确认能下单。
         """
+        if str((getattr(self, "cfg", {}) or {}).get("client_type", "ths")).lower() == "citics":
+            return self._do_activate_citics(reason)
+
         t0 = time.time()
         try:
             if not self.order_executor._lock.acquire(blocking=False):
@@ -1826,6 +1968,201 @@ class ControlPanel:
     def _card_hairline(self, parent):
         """卡片内细分隔线 (iOS 分组行分隔)。"""
         tk.Frame(parent, bg=UI.HAIRLINE, height=1).pack(fill="x", padx=6, pady=3)
+
+    def _build_group_client(self, parent):
+        """① 下单客户端: 选同花顺还是中信证券。两套执行器接口一致, 只是底层通道不同。"""
+        g = self._build_collapsible_card(parent, "① 下单客户端", initially_expanded=True)
+
+        # ---- 客户端选择 ----
+        row_c = ttk.Frame(g); row_c.pack(fill="x", pady=2)
+        ttk.Label(row_c, text="使用的客户端:", width=14, anchor="w").pack(side="left")
+        _CLIENT_LABELS = {"ths": "同花顺", "citics": "中信证券"}
+        _cur_client = str(self.cfg.get("client_type", "ths") or "ths").lower()
+        if _cur_client not in _CLIENT_LABELS:
+            _cur_client = "ths"
+        self.vars["client_type_display"] = tk.StringVar(
+            value=_CLIENT_LABELS[_cur_client])
+        self._client_label_by_key = {v: k for k, v in _CLIENT_LABELS.items()}
+        self._client_key_by_label = dict(_CLIENT_LABELS)
+        cb = ttk.Combobox(row_c, textvariable=self.vars["client_type_display"],
+                          width=12, state="readonly",
+                          values=tuple(_CLIENT_LABELS.values()))
+        cb.pack(side="right", padx=(4, 2))
+        self._client_combo = cb
+
+        self._card_hairline(g)
+        # 两套客户端的路径/名称各自一组, 切换客户端时自动显示对应那组
+        self._client_paths_box = tk.Frame(g)
+        self._client_paths_box.pack(fill="x")
+
+        self._ths_paths_box = tk.Frame(self._client_paths_box)
+        self._citics_paths_box = tk.Frame(self._client_paths_box)
+
+        # ---- 同花顺那组 ----
+        row = ttk.Frame(self._ths_paths_box); row.pack(fill="x", pady=2)
+        ttk.Label(row, text="同花顺程序:", width=14, anchor="w").pack(side="left")
+        self.vars["ths_exe_path"] = tk.StringVar(value=self.cfg["ths_exe_path"])
+        ttk.Entry(row, textvariable=self.vars["ths_exe_path"], width=9).pack(side="left", padx=6)
+        RoundButton(row, text="浏览...", kind="soft", font=(self._FONT_NAME, 9),
+                    height=24, radius=6, padx=8, parent_bg=UI.SURFACE,
+                    command=self._browse_ths).pack(side="left", padx=(0, 4))
+
+        rowk = ttk.Frame(self._ths_paths_box); rowk.pack(fill="x", pady=2)
+        ttk.Label(rowk, text="窗口关键词:", width=14, anchor="w").pack(side="left")
+        self.vars["window_title_keyword"] = tk.StringVar(value=str(self.cfg["window_title_keyword"]))
+        ttk.Entry(rowk, textvariable=self.vars["window_title_keyword"], width=12).pack(side="left", padx=4)
+
+        # ---- 中信那组 ----
+        _citics_default_path = str(self.cfg.get("citics_app_path",
+                                                "/Applications/中信证券网上交易.app") or "")
+        r1 = ttk.Frame(self._citics_paths_box); r1.pack(fill="x", pady=2)
+        ttk.Label(r1, text="中信客户端:", width=14, anchor="w").pack(side="left")
+        self.vars["citics_app_path"] = tk.StringVar(value=_citics_default_path)
+        ttk.Entry(r1, textvariable=self.vars["citics_app_path"], width=9).pack(side="left", padx=6)
+        RoundButton(r1, text="浏览...", kind="soft", font=(self._FONT_NAME, 9),
+                    height=24, radius=6, padx=8, parent_bg=UI.SURFACE,
+                    command=self._browse_citics).pack(side="left", padx=(0, 4))
+
+        r2 = ttk.Frame(self._citics_paths_box); r2.pack(fill="x", pady=2)
+        ttk.Label(r2, text="进程名:", width=14, anchor="w").pack(side="left")
+        self.vars["citics_app_name"] = tk.StringVar(
+            value=str(self.cfg.get("citics_app_name", "中信证券网上交易") or ""))
+        ttk.Entry(r2, textvariable=self.vars["citics_app_name"], width=12).pack(side="left", padx=4)
+
+        self._card_hairline(g)
+        rowb = ttk.Frame(g); rowb.pack(fill="x", pady=2)
+        for _txt, _cmd in (("打开", self.on_open_client), ("预热", self.on_preheat_activate),
+                           ("列出", self.on_list_windows)):
+            RoundButton(rowb, text=_txt, kind="ghost", font=(self._FONT_NAME, 9),
+                        height=26, radius=7, padx=11, parent_bg=UI.SURFACE,
+                        command=_cmd).pack(side="left", padx=(0, 6))
+
+        # 初始显示 + 切换联动
+        def _apply_client_visibility(*_):
+            key = self._client_label_by_key.get(self.vars["client_type_display"].get(), "ths")
+            self._ths_paths_box.pack_forget()
+            self._citics_paths_box.pack_forget()
+            (self._citics_paths_box if key == "citics" else self._ths_paths_box).pack(fill="x")
+        self.vars["client_type_display"].trace_add("write", _apply_client_visibility)
+        _apply_client_visibility()
+
+    def _browse_citics(self):
+        """[浏览...]: 选择 中信证券网上交易.app"""
+        p = filedialog.askdirectory(title="选择 中信证券网上交易.app")
+        if not p:
+            return
+        if not p.endswith(".app"):
+            cand = os.path.join(p, "中信证券网上交易.app")
+            if os.path.isdir(cand):
+                p = cand
+        self.vars["citics_app_path"].set(p)
+        gui_log("已选择中信客户端: %s" % p)
+
+    def _build_group_unlock(self, parent):
+        """②b 交易密码自动解锁: 中信客户端静置会自己锁交易界面, 锁了下单就废。
+
+        密码本身填在上面的「② 券商账户 → 交易密码」里(按券商户分开存),
+        这里只管自动解锁的行为开关。
+        """
+        g = self._build_collapsible_card(parent, "②b 交易密码自动解锁", initially_expanded=False)
+
+        ttk.Label(g, text="中信客户端静置会自己锁住交易界面，这里控制自动解锁行为。\n"
+                          "密码从上方「交易密码」读取（按券商分开存），无需重复填写。\n"
+                          "⚠ 密码输错时中信会退回行情界面，且券商多半有连错锁定策略，\n"
+                          "   所以连续失败到上限后会自动放弃，必须人工核对密码。",
+                  foreground=UI.TEXT_MUTED, font=(self._FONT_NAME, 8),
+                  justify="left", wraplength=300).pack(fill="x", pady=(0, 3))
+
+        self._card_hairline(g)
+        row1 = ttk.Frame(g); row1.pack(fill="x", pady=2)
+        self.vars["citics_auto_unlock"] = tk.BooleanVar(
+            value=bool(self.cfg.get("citics_auto_unlock", True)))
+        ttk.Checkbutton(row1, text="自动检测锁并解锁",
+                        variable=self.vars["citics_auto_unlock"]).pack(side="left", padx=4)
+
+        self._card_hairline(g)
+        row2 = ttk.Frame(g); row2.pack(fill="x", pady=2)
+        ttk.Label(row2, text="检查间隔(秒):", width=20, anchor="w").pack(side="left")
+        self.vars["citics_unlock_interval"] = tk.StringVar(
+            value=str(self.cfg.get("citics_unlock_interval", 20)))
+        ttk.Entry(row2, textvariable=self.vars["citics_unlock_interval"],
+                  width=6).pack(side="right", padx=(4, 2))
+
+        self._card_hairline(g)
+        row2b = ttk.Frame(g); row2b.pack(fill="x", pady=2)
+        ttk.Label(row2b, text="连错放弃次数:", width=20, anchor="w").pack(side="left")
+        self.vars["citics_unlock_max_fail"] = tk.StringVar(
+            value=str(self.cfg.get("citics_unlock_max_fail", 3)))
+        ttk.Entry(row2b, textvariable=self.vars["citics_unlock_max_fail"],
+                  width=6).pack(side="right", padx=(4, 2))
+
+        self._card_hairline(g)
+        row3 = ttk.Frame(g); row3.pack(fill="x", pady=2)
+        ttk.Label(row3, text="点击间隔(秒):", width=20, anchor="w").pack(side="left")
+        self.vars["citics_settle"] = tk.StringVar(
+            value=str(self.cfg.get("citics_settle", 0.45)))
+        ttk.Entry(row3, textvariable=self.vars["citics_settle"],
+                  width=6).pack(side="right", padx=(4, 2))
+
+        self._card_hairline(g)
+        row4 = ttk.Frame(g); row4.pack(fill="x", pady=2)
+        ttk.Label(row4, text="面板就绪后确认一次:").pack(side="left", padx=2)
+        RoundButton(row4, text="立即解锁测试", kind="ghost", font=(self._FONT_NAME, 9),
+                    height=26, radius=7, padx=11, parent_bg=UI.SURFACE,
+                    command=self.on_test_unlock).pack(side="right", padx=(0, 2))
+
+    def on_test_unlock(self):
+        """[立即解锁测试]: 探一次状态, 锁了就解, 并把结果写进日志。"""
+        ex = getattr(self, "order_executor", None)
+        if ex is None or not hasattr(ex, "detect_panel_state"):
+            gui_log("当前执行器不支持自动解锁测试(只对中信客户端有效)", "WARN")
+            return
+        try:
+            self.order_executor.config = self._collect_config()
+        except Exception as e:
+            gui_log("读取配置失败: %s" % e, "ERROR")
+            return
+
+        def _work():
+            try:
+                state = ex.detect_panel_state()
+                gui_log("当前客户端状态: %s (%s)" % (
+                    state.get("state"), state.get("message", "")), "INFO")
+                if state.get("state") == "trade":
+                    gui_log("交易界面本来就是解锁状态, 不用解", "OK")
+                    return
+                if state.get("state") != "locked":
+                    gui_log("不是锁定状态, 无法测试解锁", "WARN")
+                    return
+                pwd = str(self.cfg.get("accounts") and
+                          self._current_trade_password() or "")
+                if not pwd:
+                    gui_log("没有交易密码, 请先在「② 券商账户」里填好密码并保存", "ERROR")
+                    return
+                ok = ex.unlock_trade(pwd)
+                gui_log("解锁%s" % ("成功" if ok else "失败, 请检查密码是否正确"),
+                        "OK" if ok else "ERROR")
+            except Exception as e:
+                gui_log("解锁测试异常: %s" % e, "ERROR")
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _current_trade_password(self):
+        """取当前选中券商的交易密码 (界面输入框优先, 回退到配置)"""
+        try:
+            v = self.vars.get("trade_password")
+            if v is not None:
+                p = v.get()
+                if p:
+                    return p
+        except Exception:
+            pass
+        b = ""
+        try:
+            b = self.vars["broker"].get().strip()
+        except Exception:
+            pass
+        info = self._lookup_account(b, self.cfg.get("accounts") or [])
+        return str(info.get("trade_password", "") or "")
 
     def _build_group_ths(self, parent):
         g = self._build_collapsible_card(parent, "① 同花顺客户端", initially_expanded=True)
@@ -2752,6 +3089,25 @@ class ControlPanel:
         cfg["trade_password"] = ""
         cfg["key_delay"] = float(self.vars["key_delay"].get().strip())
         cfg["window_title_keyword"] = self.vars["window_title_keyword"].get().strip()
+        # --- 客户端选择: ths(同花顺) / citics(中信证券) ---
+        _client_label = self.vars["client_type_display"].get()
+        cfg["client_type"] = self._client_label_by_key.get(_client_label, "ths")
+        # 中信客户端相关
+        cfg["citics_app_path"] = self.vars["citics_app_path"].get().strip()
+        cfg["citics_app_name"] = self.vars["citics_app_name"].get().strip()
+        cfg["citics_auto_unlock"] = bool(self.vars["citics_auto_unlock"].get())
+        _ui = float(self.vars["citics_unlock_interval"].get().strip() or 20)
+        if _ui < 5:
+            raise ValueError("自动解锁检查间隔不能小于 5 秒")
+        cfg["citics_unlock_interval"] = _ui
+        _cs = float(self.vars["citics_settle"].get().strip() or 0.45)
+        if _cs < 0.1:
+            raise ValueError("点击间隔不能小于 0.1 秒")
+        cfg["citics_settle"] = _cs
+        _mf = int(self.vars["citics_unlock_max_fail"].get().strip() or 3)
+        if _mf < 1 or _mf > 10:
+            raise ValueError("连错放弃次数必须在 1~10 之间")
+        cfg["citics_unlock_max_fail"] = _mf
         cfg["follow_ratio_buy"] = float(self.vars["follow_ratio_buy"].get().strip())
         cfg["follow_ratio_sell"] = float(self.vars["follow_ratio_sell"].get().strip())
         cfg["min_amount"] = int(self.vars["min_amount"].get().strip())
@@ -2813,6 +3169,25 @@ class ControlPanel:
         cfg["ths_rail_index"] = _prev.get("ths_rail_index")
         return cfg
 
+    def on_open_client(self):
+        """[打开]: 按当前选中的客户端启动对应程序。"""
+        client = self._client_label_by_key.get(
+            self.vars.get("client_type_display", tk.StringVar(value="同花顺")).get(), "ths")
+        if client != "citics":
+            return self.on_open_ths()
+        try:
+            path = self.vars["citics_app_path"].get().strip()
+            if not path or not os.path.exists(path):
+                messagebox.showerror(
+                    "错误", "中信客户端不存在, 请点击[浏览...]选择 中信证券网上交易.app")
+                return
+            subprocess.Popen(["open", "-a", path])
+            gui_log("已启动中信客户端: %s" % path, "OK")
+            gui_log("请在中信客户端里登录账户, 并解锁交易界面(之后可交给自动解锁)", "INFO")
+        except Exception as e:
+            gui_log("启动中信客户端失败: %s" % e, "ERROR")
+            messagebox.showerror("错误", "启动中信客户端失败:\n%s" % e)
+
     def on_open_ths(self):
         """[打开同花顺]: macOS 版用系统命令 `open -a` 启动同花顺应用。
         (Windows 版是 subprocess.Popen 直接跑 exe; macOS 不能直接跑 .app 里的
@@ -2844,10 +3219,42 @@ class ControlPanel:
             gui_log("预热前收集配置失败(用上一次的配置继续): %s" % e, "WARN")
         threading.Thread(target=self._do_activate_window, args=("手动",), daemon=True).start()
 
+    def _maybe_rebuild_executor(self, cfg):
+        """客户端类型变了就把执行器换掉。返回 True 表示换过。
+
+        两套执行器接口一致, 但底层通道完全不同, 不能混用。切换前先停掉旧的
+        自动解锁守护, 免得旧执行器还在后台点窗口。
+        """
+        old_client = str((getattr(self, "cfg", {}) or {}).get("client_type", "ths")).lower()
+        new_client = str((cfg or {}).get("client_type", "ths")).lower()
+        cur_client = ("citics" if hasattr(self.order_executor, "in_credit_zone") else "ths")
+        if new_client == cur_client and old_client == new_client:
+            self.order_executor.config = cfg
+            return False
+
+        if self.engine and self.engine.state in ("browser_open", "following"):
+            gui_log("客户端类型变了, 但正在跟单 —— 请先停止跟单再切换", "WARN")
+            self.order_executor.config = cfg
+            return False
+
+        try:
+            if hasattr(self.order_executor, "stop_autounlock"):
+                self.order_executor.stop_autounlock()
+        except Exception:
+            pass
+
+        self.order_executor = make_order_executor(cfg)
+        if getattr(self, "engine", None):
+            self.engine.order_executor = self.order_executor
+        gui_log("已切换下单客户端: %s" % ("中信证券" if new_client == "citics" else "同花顺"),
+                "OK")
+        return True
+
     def _ensure_engine(self):
         if self.engine is None:
             cfg = self._collect_config()
             self.cfg = cfg
+            self._maybe_rebuild_executor(cfg)
             self.order_executor.config = cfg
             save_config(cfg)
             self._set_config_dirty(False)
@@ -2862,6 +3269,7 @@ class ControlPanel:
         """
         cfg = self._collect_config()
         self.cfg = cfg
+        self._maybe_rebuild_executor(cfg)
         self.order_executor.config = cfg
         self.engine.config = cfg
         if self._config_dirty:
