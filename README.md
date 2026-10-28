@@ -102,12 +102,41 @@ cd core && CARGO_HOME=.cargo ./target/release/citics-core --check
 {"id":3,"op":"unlock"}                    // 用配置里的密码解锁
 {"id":4,"op":"unlock","password":"..."}   // 指定密码
 {"id":5,"op":"reset_unlock"}              // 手动重置熔断
-{"id":6,"op":"query","kind":"positions"}  // positions|orders|deals|funds
-{"id":7,"op":"shutdown"}                  // 让内核自行退出（GUI 停止外部内核用）
+{"id":6,"op":"shutdown"}                  // 让内核自行退出（GUI 停止外部内核用）
 ```
 
 响应带同一个 `id`，`ok` 表示成败，`error` 说明原因。
 密码经本机 socket 传输，不落盘、不回显、不写日志。
+
+### 交易接口按账户分命名空间
+
+普通账户和信用账户是**两套平行的界面**：顶部菜单不同（买入/卖出 vs 担保品买入/
+担保品卖出）、持仓委托各自独立、信用区还多出一批普通区没有的动作（融资买入、
+融券卖出、还款还券）。所以交易类接口不是一个 `account` 参数，而是两套命名空间：
+
+| 普通账户 | 信用账户 | 说明 |
+|---|---|---|
+| `normal.query` | `credit.query` | `kind`: positions / orders / deals / funds |
+| `normal.buy` | `credit.buy` | 下单买入 |
+| `normal.sell` | `credit.sell` | 下单卖出 |
+| `normal.cancel` | `credit.cancel` | 撤销指定委托 |
+| `normal.cancel_list` | `credit.cancel_list` | 读可撤列表 |
+
+```jsonc
+{"id":8,"op":"credit.query","kind":"positions"}
+{"id":9,"op":"credit.buy","code":"600000","price":"10.00","amount":100}
+```
+
+方向编进动作名（`buy` / `sell`），不再单独传 `direction` —— 少一个能传错的字段。
+响应里的 `account` 字段回显本次实际用的账户，**要核对它而不是只看 `ok`**。
+
+信用账户尚未实现的动作会明确报「尚未实现」而不是「未知操作」，说明这些名字是
+预留的：`credit.margin_buy`（融资买入）、`credit.short_sell`（融券卖出）、
+`credit.repay_cash`（现金还款）、`credit.repay_stock`（卖券还款）、
+`credit.buy_to_repay`（买券还券）、`credit.return_stock`（现券还券）。
+
+旧写法 `{"op":"query","kind":"positions","account":"credit"}` 仍然可用
+（HTTP 跟单链路内部就是这么调的），新代码请用命名空间。
 
 ## 内核生命周期
 

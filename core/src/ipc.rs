@@ -27,7 +27,7 @@ use crate::config;
 use crate::{cancel, capture, follow, http, input, ocr, order, CoreConfig};
 
 /// 请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Request {
     #[serde(default)]
     pub id: u64,
@@ -906,8 +906,101 @@ fn ensure_unlocked(
     }
 }
 
+/// 解析账户命名空间：`normal.xxx` / `credit.xxx`
+///
+/// 两套账户是**平行的两套界面**（顶部菜单、持仓、委托全不同），信用区还
+/// 有一批普通区根本没有的动作（融资买入、融券卖出、还款还券）。用一个
+/// `account` 字段去区分，调用方永远分不清「这个 op 在信用账户下是什么意思」，
+/// 也没地方挂只有信用账户才有的动作。所以直接按账户分命名空间。
+fn parse_namespace(op: &str) -> Option<(panel::Account, &str)> {
+    let (ns, rest) = op.split_once('.')?;
+    if rest.is_empty() {
+        return None;
+    }
+    let acc = match ns {
+        "normal" => panel::Account::Normal,
+        "credit" => panel::Account::Credit,
+        _ => return None,
+    };
+    Some((acc, rest))
+}
+
+/// 命名空间里的动作名 → 实际 op + 固定方向
+///
+/// `normal.buy` / `credit.sell` 这种写法把方向编进名字里，调用方不用再传
+/// `direction`，也就不会出现「在卖出面板下了买单」这种错。
+fn namespace_action(rest: &str) -> Option<(&'static str, Option<i32>)> {
+    match rest {
+        "buy" => Some(("place_order", Some(1))),
+        "sell" => Some(("place_order", Some(2))),
+        "query" => Some(("query", None)),
+        "cancel" => Some(("cancel", None)),
+        "cancel_list" => Some(("cancel_list", None)),
+        // 兼容直接写 op 名的调用方
+        "place_order" => Some(("place_order", None)),
+        _ => None,
+    }
+}
+
+/// 信用账户独有、但尚未实现的动作
+///
+/// 名字先定下来，实现前明确报「待开发」—— 总比让调用方以为名字拼错要好，
+/// 也让这些动作有地方落。这些动作对应信用委托的二级标签（融资买入 /
+/// 融券卖出 / 现金还款 / 卖券还款 / 买券还券 / 现券还券），面板布局与
+/// 普通下单面板完全不同（见 panel::LAYOUT_CREDIT），没在实盘验证过不放出。
+fn credit_pending(action: &str, id: u64) -> Response {
+    const PENDING: &[(&str, &str)] = &[
+        ("margin_buy", "融资买入"),
+        ("short_sell", "融券卖出"),
+        ("repay_cash", "现金还款"),
+        ("repay_stock", "卖券还款"),
+        ("buy_to_repay", "买券还券"),
+        ("return_stock", "现券还券"),
+    ];
+    match PENDING.iter().find(|(k, _)| *k == action) {
+        Some((_, cn)) => Response::err(
+            id,
+            format!(
+                "credit.{action}（{cn}）尚未实现：需要信用委托二级标签面板的填单与复核，未在实盘验证，暂不放出"
+            ),
+        ),
+        None => Response::err(
+            id,
+            format!(
+                "未知操作: credit.{action}（信用账户已有 query / buy / sell / cancel / cancel_list，\
+                 待开发: margin_buy / short_sell / repay_cash / repay_stock / buy_to_repay / return_stock）"
+            ),
+        ),
+    }
+}
+
 /// 分发请求
 fn dispatch(req: &Request, shared: &Shared) -> Response {
+    // 账户命名空间优先。没写前缀的走老路径（`query` + account 字段），
+    // 这样 HTTP 跟单链路和已有脚本不用改。
+    if let Some((acc, rest)) = parse_namespace(&req.op) {
+        let mut inner = req.clone();
+        inner.account = Some(acc.as_str().to_string());
+        return match namespace_action(rest) {
+            Some((op, dir)) => {
+                inner.op = op.to_string();
+                if let Some(d) = dir {
+                    inner.direction = Some(d);
+                }
+                dispatch_account(&inner, shared)
+            }
+            None if acc == panel::Account::Credit => credit_pending(rest, req.id),
+            None => Response::err(
+                req.id,
+                format!("未知操作: {}（普通账户支持 buy / sell / query / cancel / cancel_list）", req.op),
+            ),
+        };
+    }
+    dispatch_account(req, shared)
+}
+
+/// 按账户执行具体动作（老接口与命名空间接口共用这一层）
+fn dispatch_account(req: &Request, shared: &Shared) -> Response {
     match req.op.as_str() {
         "ping" => {
             // 最轻的存活探测：不碰客户端、不截图、不做 OCR。
@@ -1362,3 +1455,50 @@ pub fn ax_ready() -> bool {
     input::accessibility_allowed()
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 命名空间能解析账户和动作() {
+        assert_eq!(
+            parse_namespace("credit.query"),
+            Some((panel::Account::Credit, "query"))
+        );
+        assert_eq!(
+            parse_namespace("normal.buy"),
+            Some((panel::Account::Normal, "buy"))
+        );
+        // 老的扁平 op 不能被当成命名空间
+        assert_eq!(parse_namespace("query"), None);
+        assert_eq!(parse_namespace("follow_start"), None);
+        // 未知前缀不当命名空间，让它走老路径报「未知操作」
+        assert_eq!(parse_namespace("foo.bar"), None);
+        // 只有前缀没动作，不算合法命名空间
+        assert_eq!(parse_namespace("credit."), None);
+    }
+
+    #[test]
+    fn 买卖方向编进动作名() {
+        assert_eq!(namespace_action("buy"), Some(("place_order", Some(1))));
+        assert_eq!(namespace_action("sell"), Some(("place_order", Some(2))));
+        assert_eq!(namespace_action("query"), Some(("query", None)));
+        assert_eq!(namespace_action("cancel_list"), Some(("cancel_list", None)));
+        // 信用独有的动作不走老路径
+        assert_eq!(namespace_action("margin_buy"), None);
+    }
+
+    #[test]
+    fn 信用待开发动作不返回未知操作() {
+        let r = credit_pending("margin_buy", 7);
+        assert!(!r.ok);
+        let e = r.error.unwrap_or_default();
+        assert!(e.contains("融资买入"), "错误信息里要带上中文动作名: {e}");
+        assert!(e.contains("尚未实现"), "要明确说是未实现而不是拼错: {e}");
+
+        let r2 = credit_pending("no_such_thing", 8);
+        assert!(!r2.ok);
+        assert!(r2.error.unwrap_or_default().contains("未知操作"));
+    }
+}

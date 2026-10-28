@@ -72,6 +72,10 @@ DEFAULT_CONFIG = {
     "follow_ratio": 1.0,
 }
 
+# 账户命名空间 → 中文名。op 前缀直接用 key（normal / credit），界面显示中文。
+ACCOUNT_NAMES = {"normal": "普通账户", "credit": "信用账户"}
+ACCOUNT_KEY = {v: k for k, v in ACCOUNT_NAMES.items()}
+
 # 查询类型 → 中文名
 QUERY_KINDS = {
     "positions": "持仓",
@@ -535,13 +539,14 @@ class App:
         row = ttk.Frame(tab)
         row.pack(fill="x", padx=8, pady=(12, 4))
         ttk.Label(row, text="账户").pack(side="left")
-        self.trade_account_var = tk.StringVar(value="credit")
-        ttk.Combobox(row, textvariable=self.trade_account_var, width=8,
+        # 界面显示中文，请求里用 normal / credit 前缀
+        self.trade_account_var = tk.StringVar(value="信用账户")
+        ttk.Combobox(row, textvariable=self.trade_account_var, width=10,
                      state="readonly",
-                     values=["normal", "credit"]).pack(side="left", padx=(4, 8))
+                     values=list(ACCOUNT_NAMES.values())).pack(side="left", padx=(4, 8))
         ttk.Label(
             row,
-            text="普通/信用是两套并行界面，持仓委托互不相通",
+            text="普通/信用是两套并行界面，持仓委托互不相通；接口按账户分命名空间",
             foreground="#888",
         ).pack(side="left")
 
@@ -606,10 +611,10 @@ class App:
         ttk.Entry(row, textvariable=self.ord_price_var, width=10).pack(
             side="left", padx=(0, 10))
         ttk.Label(row, text="账户").pack(side="left")
-        self.ord_account_var = tk.StringVar(value="credit")
-        ttk.Combobox(row, textvariable=self.ord_account_var, width=8,
+        self.ord_account_var = tk.StringVar(value="信用账户")
+        ttk.Combobox(row, textvariable=self.ord_account_var, width=10,
                      state="readonly",
-                     values=["normal", "credit"]).pack(side="left", padx=(4, 0))
+                     values=list(ACCOUNT_NAMES.values())).pack(side="left", padx=(4, 0))
 
         row = ttk.Frame(od)
         row.pack(fill="x", padx=8, pady=(6, 4))
@@ -999,23 +1004,26 @@ class App:
 
     def on_query(self, kind):
         name = QUERY_KINDS.get(kind, kind)
-        account = self.trade_account_var.get()
-        self.view_title.set(f"{name}（{account}）读取中…")
+        account = ACCOUNT_KEY.get(self.trade_account_var.get(), "credit")
+        self.view_title.set(f"{name}（{ACCOUNT_NAMES[account]}）读取中…")
 
         def work():
-            r = self.core.call("query", kind=kind, account=account, timeout=180)
+            # 走账户命名空间（credit.query / normal.query）。两个账户是两套
+            # 平行界面，用前缀表达比多传一个 account 字段更难搞错。
+            r = self.core.call(f"{account}.query", kind=kind, timeout=180)
             self.root.after(0, lambda: self._after_query(name, account, r))
         threading.Thread(target=work, daemon=True).start()
-        self.log(f"查询{name}（{account}）…")
+        self.log(f"查询{name}（{ACCOUNT_NAMES[account]}）…")
 
     def _after_query(self, name, account, r):
+        acc_cn = ACCOUNT_NAMES.get(account, account)
         if not r.get("ok"):
-            self.view_title.set(f"{name}（{account}）失败")
+            self.view_title.set(f"{name}（{acc_cn}）失败")
             self.table.show([])
             self.log(f"✗ 查询{name}失败：{r.get('error')}", "ERROR")
             return
         rows = r.get("rows") or []
-        self._show_rows(f"{name}（{account}）· {len(rows)} 条", rows)
+        self._show_rows(f"{name}（{acc_cn}）· {len(rows)} 条", rows)
         self.log(f"✓ {name} {len(rows)} 条 · {r.get('detail') or ''}", "OK")
 
     def on_raw_ocr(self):
@@ -1037,18 +1045,19 @@ class App:
     # ------------------------------------------------------------------
 
     def on_cancel_refresh(self):
-        account = self.trade_account_var.get()
-        self.view_title.set(f"可撤委托（{account}）读取中…")
+        account = ACCOUNT_KEY.get(self.trade_account_var.get(), "credit")
+        self.view_title.set(f"可撤委托（{ACCOUNT_NAMES[account]}）读取中…")
 
         def work():
-            r = self.core.call("cancel_list", account=account, timeout=180)
+            r = self.core.call(f"{account}.cancel_list", timeout=180)
             self.root.after(0, lambda: self._after_cancel_list(account, r))
         threading.Thread(target=work, daemon=True).start()
-        self.log(f"刷新可撤列表（{account}）…")
+        self.log(f"刷新可撤列表（{ACCOUNT_NAMES[account]}）…")
 
     def _after_cancel_list(self, account, r):
+        acc_cn = ACCOUNT_NAMES.get(account, account)
         if not r.get("ok"):
-            self.view_title.set(f"可撤委托（{account}）失败")
+            self.view_title.set(f"可撤委托（{acc_cn}）失败")
             self.table.show([])
             self.log(f"✗ 读取可撤列表失败：{r.get('error')}", "ERROR")
             return
@@ -1060,7 +1069,7 @@ class App:
             "证券代码": row.get("code", ""),
             "委托编号": row.get("order_no", ""),
         } for i, row in enumerate(rows, 1)]
-        self._show_rows(f"可撤委托（{account}）· {len(rows)} 笔", view)
+        self._show_rows(f"可撤委托（{acc_cn}）· {len(rows)} 笔", view)
         self.log(f"✓ 可撤 {len(rows)} 笔 · {r.get('detail') or ''}",
                  "OK" if rows else "INFO")
 
@@ -1075,7 +1084,7 @@ class App:
         row = self._cancel_snapshot[idx]
         code = row.get("code") or ""
         order_no = row.get("order_no") or ""
-        account = self.trade_account_var.get()
+        account = ACCOUNT_KEY.get(self.trade_account_var.get(), "credit")
         dry = self.cancel_dry_var.get()
 
         if not order_no and not code:
@@ -1085,19 +1094,18 @@ class App:
         if not dry:
             if not messagebox.askyesno(
                     "确认撤单",
-                    f"确认撤销？\n\n账户：{account}\n证券代码：{code or '—'}\n"
+                    f"确认撤销？\n\n账户：{ACCOUNT_NAMES[account]}\n证券代码：{code or '—'}\n"
                     f"委托编号：{order_no or '—'}\n\n真实操作，撤掉后不可恢复。"):
                 return
 
         def work():
-            r = self.core.call("cancel", code=code or None,
+            r = self.core.call(f"{account}.cancel", code=code or None,
                                order_no=order_no or None,
-                               account=account,
                                action="dry_run" if dry else None,
                                timeout=180)
             self.root.after(0, lambda: self._after_cancel(r, dry))
         threading.Thread(target=work, daemon=True).start()
-        self.log(f"{'干跑' if dry else '撤销'} {code} {order_no}（{account}）…")
+        self.log(f"{'干跑' if dry else '撤销'} {code} {order_no}（{ACCOUNT_NAMES[account]}）…")
 
     def _after_cancel(self, r, dry):
         if r.get("ok"):
@@ -1115,7 +1123,7 @@ class App:
     def on_place(self, direction):
         code = self.ord_code_var.get().strip()
         price = self.ord_price_var.get().strip()
-        account = self.ord_account_var.get()
+        account = ACCOUNT_KEY.get(self.ord_account_var.get(), "credit")
         dry = self.ord_dry_var.get()
 
         if not code:
@@ -1136,14 +1144,15 @@ class App:
         if not dry:
             if not messagebox.askyesno(
                     "确认下单",
-                    f"确认{side}？\n\n账户：{account}\n证券代码：{code}\n"
+                    f"确认{side}？\n\n账户：{ACCOUNT_NAMES[account]}\n证券代码：{code}\n"
                     f"价格：{price}\n数量：{amount}\n\n真实委托，会占用资金。"):
                 return
 
         def work():
-            r = self.core.call("place_order", code=code, price=price,
-                               amount=amount, direction=direction,
-                               account=account,
+            # 方向编进 op 名（credit.buy / credit.sell），不再单独传 direction，
+            # 从根上排除「在卖出面板递了买单」这种错。
+            r = self.core.call(f"{account}.{'buy' if direction == 1 else 'sell'}",
+                               code=code, price=price, amount=amount,
                                action="dry_run" if dry else None,
                                timeout=180)
             self.root.after(0, lambda: self._after_place(r))
