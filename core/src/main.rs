@@ -18,6 +18,7 @@
 //! - 下单必须经「当日委托」交叉核对才算成功
 
 mod capture;
+mod config;
 mod input;
 mod ipc;
 mod ocr;
@@ -35,12 +36,18 @@ pub struct CoreConfig {
     pub app_path: String,
     /// 每次点击后等待多久（秒）。中信比同花顺慢，实测 0.45 够用
     pub settle: f64,
-    /// 自动解锁开关
-    pub auto_unlock: bool,
     /// 解锁失败几次后永久停手
     pub unlock_max_fail: u32,
     /// IPC socket 路径
     pub socket_path: PathBuf,
+    /// 交易密码（从配置文件读入，仅存内存）
+    pub trade_password: String,
+    /// 自动解锁守护线程是否启用
+    pub auto_unlock: bool,
+    /// 守护线程检查间隔（秒）
+    pub unlock_interval: u64,
+    /// 配置文件路径
+    pub config_path: PathBuf,
 }
 
 impl Default for CoreConfig {
@@ -49,9 +56,12 @@ impl Default for CoreConfig {
             app_name: "中信证券网上交易".to_string(),
             app_path: "/Applications/中信证券网上交易.app".to_string(),
             settle: 0.45,
-            auto_unlock: true,
             unlock_max_fail: 3,
             socket_path: PathBuf::from("/tmp/citics-core.sock"),
+            trade_password: String::new(),
+            auto_unlock: true,
+            unlock_interval: 20,
+            config_path: config::default_config_path(),
         }
     }
 }
@@ -82,6 +92,16 @@ fn main() {
             _ => {}
         }
     }
+
+    // 用配置文件覆盖默认值。命令行仍可再覆盖 socket。
+    let saved = config::AppConfig::load(&cfg.config_path);
+    cfg.app_name = saved.app_name.clone();
+    cfg.app_path = saved.app_path.clone();
+    cfg.settle = saved.settle;
+    cfg.trade_password = saved.trade_password.clone();
+    cfg.auto_unlock = saved.auto_unlock;
+    cfg.unlock_interval = saved.unlock_interval.max(5);
+    cfg.unlock_max_fail = saved.unlock_max_fail.max(1);
 
     if let Err(e) = ipc::serve(cfg) {
         eprintln!("核心启动失败: {e}");

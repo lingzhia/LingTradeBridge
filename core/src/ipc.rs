@@ -135,6 +135,14 @@ pub fn serve(cfg: CoreConfig) -> std::io::Result<()> {
 
     eprintln!("中信自动化核心已就绪，socket: {}", path.display());
 
+    // 自动解锁守护线程
+    if shared.cfg.auto_unlock {
+        let bg = Arc::clone(&shared);
+        std::thread::spawn(move || autounlock_loop(bg));
+    } else {
+        eprintln!("自动解锁: 已关闭");
+    }
+
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -288,9 +296,17 @@ fn do_unlock(req: &Request, shared: &Shared) -> Response {
         None => return Response::err(req.id, "客户端窗口不可用"),
     };
 
-    let pwd = match req.password.as_deref() {
-        Some(p) => p,
-        None => return Response::err(req.id, "缺少密码"),
+    // 请求里没带密码就用配置文件里的。GUI 的"立即解锁"按钮走这条路径。
+    let pwd_owned;
+    let pwd: &str = match req.password.as_deref() {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            if cfg.trade_password.is_empty() {
+                return Response::err(req.id, "未配置交易密码，请先在界面里填写并保存");
+            }
+            pwd_owned = cfg.trade_password.clone();
+            &pwd_owned
+        }
     };
 
     let mut g = shared.guard.lock().unwrap();
@@ -377,4 +393,83 @@ pub fn ocr_ready() -> bool {
 /// 让外部能确认辅助功能权限
 pub fn ax_ready() -> bool {
     input::accessibility_allowed()
+}
+
+
+/// 自动解锁守护线程
+///
+/// # 设计取舍
+///
+/// 它只做一件事：发现锁了就去解。但有两道闸门：
+///   1. 熔断打开就整个线程退出，不再尝试（券商连错会锁账户）
+///   2. 没配密码就空转等待，不做无用功
+///
+/// 日志只写状态变化，不写"每次检查" —— 否则盘后一直挂着会刷爆日志。
+fn autounlock_loop(shared: Arc<Shared>) {
+    let cfg = &shared.cfg;
+    if cfg.trade_password.is_empty() {
+        eprintln!("自动解锁: 未配置交易密码，守护线程待命");
+    }
+
+    let mut last_state: Option<bool> = None;
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(cfg.unlock_interval));
+
+        // 熔断检查
+        {
+            let g = shared.guard.lock().unwrap();
+            if g.tripped {
+                eprintln!("自动解锁: 熔断已打开，守护线程退出。请手动解锁并重置");
+                return;
+            }
+        }
+
+        // 没密码就等着
+        if cfg.trade_password.is_empty() {
+            continue;
+        }
+
+        let (pid, win) = match panel::ensure_window(&cfg.app_path) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let locked = unlock::is_locked(pid, win.number);
+        match last_state {
+            Some(prev) if prev == locked => continue, // 状态没变，不重复干活
+            _ => {
+                if locked {
+                    eprintln!("检测到交易界面已锁定，尝试自动解锁");
+                }
+                last_state = Some(locked);
+            }
+        }
+
+        if !locked {
+            continue;
+        }
+
+        let mut g = shared.guard.lock().unwrap();
+        let out = unlock::unlock_guarded(
+            &win,
+            &cfg.trade_password,
+            cfg.settle,
+            pid,
+            &mut g,
+            cfg.unlock_max_fail,
+        );
+        match out {
+            UnlockOutcome::Success => eprintln!("自动解锁成功"),
+            UnlockOutcome::Failed => eprintln!(
+                "自动解锁失败（连续第 {} 次，上限 {}）",
+                g.fail_count, cfg.unlock_max_fail
+            ),
+            UnlockOutcome::CircuitOpen => {
+                eprintln!("自动解锁已熔断，停止尝试");
+                return;
+            }
+            _ => {}
+        }
+    }
 }

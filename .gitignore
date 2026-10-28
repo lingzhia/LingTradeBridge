@@ -16,3 +16,4 @@ logs/
 status.json
 *.sock
 .workbuddy/
+citics配置.json
