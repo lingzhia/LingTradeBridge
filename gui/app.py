@@ -212,7 +212,7 @@ class App:
 
         row = ttk.Frame(auto)
         row.pack(fill="x", padx=10, pady=(0, 8))
-        ttk.Label(row, text="检查间隔(秒)").pack(side="left")
+        ttk.Label(row, text="检查间隔（秒）").pack(side="left")
         self.interval_var = tk.StringVar(
             value=str(self.cfg.get("unlock_interval", 20)))
         ttk.Spinbox(row, from_=5, to=300, width=6,
