@@ -95,6 +95,12 @@ impl Default for AppConfig {
 impl AppConfig {
     /// 从文件加载。文件不存在或解析失败时返回默认配置
     pub fn load(path: &Path) -> Self {
+        // 配置里有交易密码。用编辑器改过之后权限会变宽，这里每次读都纠正回来。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         match std::fs::read_to_string(path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
             Err(_) => Self::default(),
@@ -107,20 +113,71 @@ impl AppConfig {
     }
 }
 
-/// 默认配置路径：仓库根目录下的 citics配置.json
+/// 用户数据目录
+///
+/// 配置、运行状态都放这里，**不放进项目仓库** —— 里面有交易密码，
+/// 放进仓库目录早晚会误提交，而且换工作副本就丢配置。
+/// 约定沿用同花顺版本的思路（`~/.lingtradebridge`），
+/// 但用独立目录，两个客户端的配置互不干扰。
+pub fn user_data_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".lingtradebridge-citics")
+}
+
+/// 默认配置路径
 pub fn default_config_path() -> PathBuf {
-    // 从当前目录向上找仓库根（含 core/ 的那一层）
-    let mut dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    user_data_dir().join("config.json")
+}
+
+/// 旧版配置位置（项目根），启动时一次性迁移走
+pub fn legacy_config_path() -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
     for _ in 0..4 {
-        if dir.join("core").is_dir() {
-            return dir.join("citics配置.json");
+        let cand = dir.join("citics配置.json");
+        if cand.is_file() {
+            return Some(cand);
         }
-        match dir.parent() {
-            Some(p) => dir = p.to_path_buf(),
-            None => break,
+        if dir.join("core").is_dir() {
+            let c2 = dir.join("citics配置.json");
+            if c2.is_file() {
+                return Some(c2);
+            }
+            break;
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
+}
+
+/// 确保用户目录存在，并把旧的仓库内配置搬过来
+///
+/// 只搬一次：目标存在就不动，避免覆盖用户后来改过的配置。
+pub fn ensure_user_data_dir() -> Result<(), String> {
+    let dir = user_data_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建用户目录失败: {e}"))?;
+
+    let target = dir.join("config.json");
+    if !target.exists() {
+        if let Some(old) = legacy_config_path() {
+            if let Ok(body) = std::fs::read(&old) {
+                if std::fs::write(&target, body).is_ok() {
+                    // 里面有密码，收紧到只有本人可读
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &target,
+                            std::fs::Permissions::from_mode(0o600),
+                        );
+                    }
+                    // 搬完就把仓库里的删掉，别留个含密码的文件在项目里
+                    let _ = std::fs::remove_file(&old);
+                    eprintln!("配置已迁移到 {}", target.display());
+                }
+            }
         }
     }
-    PathBuf::from("citics配置.json")
+    Ok(())
 }
 
 #[cfg(test)]

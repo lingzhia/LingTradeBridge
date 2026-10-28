@@ -32,7 +32,17 @@ from tkinter import filedialog, messagebox, ttk
 # ---------------------------------------------------------------------------
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONFIG_PATH = os.path.join(ROOT, "citics配置.json")
+
+# 用户数据目录：配置、日志、状态都放这里，**不放进项目仓库**。
+# 配置里有交易密码，放仓库目录早晚误提交，换个工作副本也会丢配置。
+# 约定沿用同花顺版本的思路，但用独立目录，两个客户端的配置互不干扰。
+USER_DATA_DIR = os.path.join(os.path.expanduser("~"), ".lingtradebridge-citics")
+CONFIG_PATH = os.path.join(USER_DATA_DIR, "config.json")
+LOG_DIR = os.path.join(USER_DATA_DIR, "logs")
+
+# 旧版：配置直接躺在项目根。启动时一次性搬走，别在仓库里留含密码的文件。
+LEGACY_CONFIG_PATH = os.path.join(ROOT, "citics配置.json")
+
 SOCKET_PATH = "/tmp/citics-core.sock"
 CORE_BIN = os.path.join(ROOT, "core", "target", "release", "citics-core")
 CORE_BIN_DEBUG = os.path.join(ROOT, "core", "target", "debug", "citics-core")
@@ -100,6 +110,28 @@ class CoreClient:
 # 配置读写
 # ---------------------------------------------------------------------------
 
+def ensure_user_data_dir():
+    """建用户目录，顺手把仓库里的旧配置搬过来。
+
+    只搬一次：目标已存在就不动，免得覆盖用户后来改过的配置。
+    """
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    if not os.path.exists(CONFIG_PATH) and os.path.exists(LEGACY_CONFIG_PATH):
+        try:
+            os.replace(LEGACY_CONFIG_PATH, CONFIG_PATH)
+        except OSError:
+            # 跨设备或权限问题时退回复制
+            try:
+                with open(LEGACY_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    body = f.read()
+                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                    f.write(body)
+                os.remove(LEGACY_CONFIG_PATH)
+            except OSError:
+                pass
+
+
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     if os.path.exists(CONFIG_PATH):
@@ -128,6 +160,7 @@ def save_config(cfg):
 class App:
     def __init__(self, root):
         self.root = root
+        ensure_user_data_dir()
         self.cfg = load_config()
         self.core = CoreClient()
         self.core_proc = None
@@ -466,6 +499,7 @@ class App:
 
 
 def main():
+    ensure_user_data_dir()
     root = tk.Tk()
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)

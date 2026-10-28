@@ -93,6 +93,11 @@ fn main() {
         }
     }
 
+    // 先把用户目录准备好（含旧配置迁移），否则读不到任何东西
+    if let Err(e) = config::ensure_user_data_dir() {
+        eprintln!("警告: {e}");
+    }
+
     // 用配置文件覆盖默认值。命令行仍可再覆盖 socket。
     let saved = config::AppConfig::load(&cfg.config_path);
     cfg.app_name = saved.app_name.clone();

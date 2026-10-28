@@ -240,8 +240,11 @@ pub fn unlock_guarded(
 }
 
 /// 熔断状态文件默认位置
+///
+/// 放用户目录而不是 /tmp：/tmp 重启就清空，而熔断状态**必须跨重启保留** ——
+/// 否则重启程序就等于自动绕过了熔断，那这个保护形同虚设。
 pub fn default_state_path() -> PathBuf {
-    PathBuf::from("/tmp/citics-unlock-state.txt")
+    crate::config::user_data_dir().join("unlock_state.txt")
 }
 
 #[allow(dead_code)]
