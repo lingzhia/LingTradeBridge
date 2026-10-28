@@ -166,10 +166,10 @@ pub const LAYOUT_CREDIT: PanelLayout = PanelLayout {
 
 /// 解锁对话框里密码框的 y。锁定状态下窗口只有一个 AXTextField，
 /// 位置约 (889.5, 425.6, 198, 32)
-pub const LOCK_PWD_X: f64 = 889.5;
-pub const LOCK_PWD_Y: f64 = 425.6;
-pub const LOCK_PWD_W: f64 = 198.0;
-pub const LOCK_PWD_H: f64 = 32.0;
+pub const LOCK_PWD_X: f64 = 890.0;
+pub const LOCK_PWD_Y: f64 = 398.0;
+pub const LOCK_PWD_W: f64 = 197.0;
+pub const LOCK_PWD_H: f64 = 27.0;
 
 /// 判断界面上的文字里有没有锁定提示
 pub fn looks_locked(words: &[Word]) -> bool {
@@ -519,11 +519,19 @@ fn parse_total(text: &str) -> Option<u32> {
 ///
 /// 注意：OCR 给的是窗口内坐标，CGEvent 要屏幕全局坐标，所以要加窗口原点。
 pub fn click_in_window(win: &capture::WindowInfo, x: f64, y: f64, settle: f64) {
+    // 必须先把目标 App 提到前台。
+    //
+    // CGEvent 的点击是打在**屏幕上那个坐标**，谁在最前面就归谁。
+    // 实测踩过：中信和别的窗口坐标完全一致（都是 1920x956 @ (0,30)），
+    // 没激活的话点击全打到了前台那个窗口上，中信这边毫无反应，
+    // 而我们还以为点成功了，接着去读界面就读到一堆不相干的东西。
+    crate::input::activate_app(win.pid);
     crate::input::click(win.x + x, win.y + y, settle);
 }
 
 /// 在窗口内某点双击
 pub fn double_click_in_window(win: &capture::WindowInfo, x: f64, y: f64, settle: f64) {
+    crate::input::activate_app(win.pid);
     crate::input::double_click(win.x + x, win.y + y, settle);
 }
 

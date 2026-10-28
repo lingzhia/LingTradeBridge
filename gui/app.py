@@ -384,12 +384,28 @@ class App:
         save_config(cfg)
         self.cfg = cfg
         self.log(f"配置已保存到 {CONFIG_PATH}")
-        self.log("提示：核心需要重启才能读到新配置")
-        self.unlock_hint.configure(text="已保存")
+        self.log("「立即解锁一次」会直接用输入框里的密码，不必重启核心")
+        self.unlock_hint.configure(text="已保存", foreground="#1e8449")
 
     def on_unlock_once(self):
+        # 直接把输入框里的密码发给核心，不走配置文件。
+        #
+        # 之前这里只发 {"op":"unlock"}，核心去读配置文件 —— 于是"填了密码但没点保存"
+        # 或者"保存了但没重启核心"都解不了锁，而且报错说的是"未配置密码"，
+        # 看着像没填过，实际是没生效。现在输入框里是什么就用什么，
+        # 顺手存一份到配置，下次自动解锁也能用上。
+        pwd = self.pwd_var.get()
+        if not pwd:
+            self.log("密码框是空的，先填交易密码", "ERROR")
+            self.unlock_hint.configure(text="未填密码", foreground="#c0392b")
+            return
+
+        # 先落盘，别让"填了但没保存"再坑一次
+        self.cfg = self._collect()
+        save_config(self.cfg)
+
         def work():
-            r = self.core.call("unlock", timeout=180)
+            r = self.core.call("unlock", password=pwd, timeout=180)
             self.root.after(0, lambda: self._after_unlock(r))
         threading.Thread(target=work, daemon=True).start()
         self.log("正在尝试解锁…")

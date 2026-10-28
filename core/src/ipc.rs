@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::panel;
 use crate::unlock::{self, UnlockGuard, UnlockOutcome};
-use crate::{input, ocr, CoreConfig};
+use crate::{capture, input, ocr, CoreConfig};
 
 /// 请求
 #[derive(Debug, Deserialize)]
@@ -385,20 +385,65 @@ fn do_query(req: &Request, shared: &Shared) -> Response {
         None => return Response::err(req.id, "客户端窗口不可用"),
     };
 
+    // 锁着的时候读出来的是锁屏提示，不是表格。先说清楚，别让人以为是空仓
+    if unlock::is_locked(_pid, win.number) {
+        return Response::err(req.id, "交易界面已锁定，请先解锁再查询");
+    }
+
     let kind = req.kind.as_deref().unwrap_or("");
-    // 表头由 panel::read_table 自己从界面全量识别，这里只需要判断页签对不对
-    let headers: &[&str] = match kind {
-        "positions" => &["证券代码", "证券名称", "股份余额", "可用股份", "成本价", "当前价"],
-        "orders" => &["委托时间", "证券代码", "证券名称", "买卖标志", "委托价格", "委托数量"],
-        "deals" => &["成交时间", "证券代码", "证券名称", "买卖标志", "成交价格", "成交数量"],
-        "funds" => &["资金余额", "可用金额", "可取金额"],
+
+    // 资金明细不是一个表格页签，它是独立的按钮，读数方式也不同
+    if kind == "funds" {
+        return do_query_funds(req, &win, cfg);
+    }
+
+    let (tab, must_have): (&str, &[&str]) = match kind {
+        "positions" => ("持仓", &["证券代码", "证券名称"]),
+        "orders" => ("当日委托", &["证券代码", "委托价格"]),
+        "deals" => ("当日成交", &["证券代码", "成交价格"]),
         _ => return Response::err(req.id, format!("未知查询类型: {kind}")),
     };
 
-    let rows = panel::read_table(win.number, headers, panel::TABLE_Y_MIN, None);
+    // 切到对应页签。持仓/委托/成交共用底部同一个表格区域，
+    // 查询会互相影响界面显示 —— 这点要在文档里说清楚。
+    if let Some(x) = panel::BOTTOM_TABS
+        .iter()
+        .find(|(name, _)| *name == tab)
+        .map(|(_, x)| *x)
+    {
+        panel::click_in_window(&win, x, panel::BOTTOM_Y, cfg.settle);
+    }
+
+    let (headers, rows, total) = panel::read_table_full(win.number, panel::TABLE_Y_MIN, None);
+
+    // 表头对不上就不是这个页签，返回明确错误而不是空结果
+    if headers.is_empty() {
+        return Response::err(req.id, "没读到表头，可能不在交易面板或截图失败");
+    }
+    let missing: Vec<&str> = must_have
+        .iter()
+        .filter(|h| !headers.iter().any(|x| x.contains(**h)))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        let mut r = Response::err(
+            req.id,
+            format!("表头不像「{tab}」（缺少 {}），当前表头: {}", missing.join("/"), headers.join("|")),
+        );
+        r.total = Some(rows.len());
+        return r;
+    }
 
     let mut r = Response::ok(req.id);
     r.total = Some(rows.len());
+    r.detail = Some(match total {
+        // 「共N条」和实际解析行数对不上，说明解析漏了，不能假装正常
+        Some(n) if n as usize != rows.len() => {
+            format!("界面显示共{n}条，实际解析出{}条，可能漏读", rows.len())
+        }
+        Some(n) => format!("共{n}条，全部读取"),
+        None => format!("读取{}条（界面未显示总数）", rows.len()),
+    });
     r.rows = Some(
         rows.iter()
             .map(|row| {
@@ -410,9 +455,71 @@ fn do_query(req: &Request, shared: &Shared) -> Response {
             })
             .collect(),
     );
-    if rows.is_empty() {
-        r.detail = Some("没读到表格数据（可能不在对应面板，或截图/OCR 失败）".into());
+    r
+}
+
+/// 读资金账户
+///
+/// 资金明细不是表格，是「资金余额 / 可用资金 / 可取资金」这类
+/// 标签-数值对。数值在标签右侧，用 OCR 的行内位置配对。
+fn do_query_funds(
+    req: &Request,
+    win: &capture::WindowInfo,
+    cfg: &crate::CoreConfig,
+) -> Response {
+    // 「资金明细」是底部工具栏右侧的按钮，不在页签行上
+    panel::click_in_window(win, 483.0, panel::BOTTOM_Y + 0.0, cfg.settle);
+
+    let words = ocr::ocr_window(win.number, None);
+    if words.is_empty() {
+        return Response::err(req.id, "OCR 无结果，可能截图失败");
     }
+
+    let labels = [
+        "资金余额", "可用资金", "可取资金", "冻结资金",
+        "总资产", "证券市值", "可用金额", "可取金额",
+    ];
+
+    let mut found: Vec<(String, String)> = Vec::new();
+    for w in &words {
+        let t = w.trimmed();
+        if !labels.contains(&t) {
+            continue;
+        }
+        // 在同一行、位于标签右侧的最近一个数字
+        let mut best: Option<&ocr::Word> = None;
+        let mut best_dx = f64::INFINITY;
+        for other in &words {
+            if (other.cy() - w.cy()).abs() > 10.0 {
+                continue;
+            }
+            let dx = other.cx() - w.cx();
+            if dx <= 0.0 {
+                continue;
+            }
+            if other.trimmed().chars().any(|c| c.is_ascii_digit()) && dx < best_dx {
+                best_dx = dx;
+                best = Some(other);
+            }
+        }
+        if let Some(b) = best {
+            found.push((t.to_string(), b.trimmed().to_string()));
+        }
+    }
+
+    if found.is_empty() {
+        return Response::err(req.id, "没读到资金字段，可能不在交易面板");
+    }
+
+    let mut r = Response::ok(req.id);
+    r.total = Some(found.len());
+    r.detail = Some(format!("读到 {} 个资金字段", found.len()));
+    r.rows = Some(
+        found
+            .iter()
+            .map(|(k, v)| serde_json::json!({ k.clone(): v.clone() }))
+            .collect(),
+    );
     r
 }
 

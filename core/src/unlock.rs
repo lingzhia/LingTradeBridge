@@ -111,9 +111,14 @@ impl UnlockGuard {
 /// 真正的判据必须是 OCR 读到锁屏文字 —— 那是像素层面的直接证据。
 pub fn ax_suspects_lock(pid: u32) -> bool {
     let elems = input::collect_ax_tree(pid, 20);
+    ax_suspects_lock_from(&elems)
+}
+
+/// 从已取得的 AX 树里找密码框特征
+fn ax_suspects_lock_from(elems: &[input::AxElement]) -> bool {
     let mut text_fields = 0;
     let mut at_lock_pos = false;
-    for e in &elems {
+    for e in elems {
         if e.role().as_deref() == Some("AXTextField") {
             text_fields += 1;
             if let Some((_x, y, w, _h)) = e.frame() {
@@ -142,8 +147,9 @@ pub fn detect_locked_by_ocr(win_number: u32) -> bool {
 ///
 /// 覆盖密码框与其下方的按钮区。只 OCR 这一条，比整窗快一倍以上。
 /// 解锁对话框"确定"按钮中心（窗口内坐标，OCR 实测）
-pub const LOCK_OK_X: f64 = 920.0;
-pub const LOCK_OK_Y: f64 = 453.0;
+/// 解锁对话框「确定」按钮中心（像素实测，按钮矩形 x 888..1087、y 437..466）
+pub const LOCK_OK_X: f64 = 987.0;
+pub const LOCK_OK_Y: f64 = 451.0;
 
 const LOCK_BAND_X: f64 = 700.0;
 const LOCK_BAND_Y: f64 = 340.0;
@@ -158,10 +164,28 @@ const LOCK_BAND_H: f64 = 260.0;
 ///
 /// 反过来（AX 命中就认定锁）会导致行情界面误判、密码明文进搜索框。
 pub fn is_locked(pid: u32, win_number: u32) -> bool {
-    if !ax_suspects_lock(pid) {
+    // AX 只用来**提前排除**：如果明确看到输入框，说明很可能是行情界面的搜索框，
+    // 但即便如此也要 OCR 确认（真锁屏时 AX 常常一个节点都取不到）。
+    //
+    // 早前写成 `if !ax_suspects_lock { return false }`，等于要求 AX 先命中，
+    // 结果真锁屏时 AX 为空、直接返回"未锁定"，自动解锁形同虚设。
+    // 现在 AX 只在"确定不是密码框"时才否决，其余一律以 OCR 为准。
+    if ax_definitely_not_lock(pid) {
         return false;
     }
     detect_locked_by_ocr(win_number)
+}
+
+/// AX 是否能明确断定"这不是锁屏"
+///
+/// 只有在**同时**满足：拿得到 AX 树、且树里有足够的控件、且找不到密码框特征时，
+/// 才敢说不是锁屏。拿不到 AX（真锁屏的常见情况）一律不下结论。
+fn ax_definitely_not_lock(pid: u32) -> bool {
+    let nodes = crate::input::collect_ax_tree(pid, 5);
+    if nodes.is_empty() {
+        return false; // 拿不到就别乱判断
+    }
+    !ax_suspects_lock_from(&nodes)
 }
 
 /// 执行一次解锁
