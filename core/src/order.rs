@@ -310,11 +310,17 @@ pub fn place_order(
     // ── 0. 清干净现场：先关掉可能残留的弹窗，再切账户、回下单面板
     dismiss_dialogs(pid);
 
-    let rail_y = match account {
-        Account::Normal => panel::RAIL_Y[4],
-        Account::Credit => panel::RAIL_Y[5],
-    };
-    panel::click_in_window(win, panel::RAIL_X + panel::RAIL_W / 2.0, rail_y, cfg.settle);
+    // 切到目标账户的左栏。
+    //
+    // 左栏这 6 个按钮是客户端里少数真的暴露给 AX 的控件，用 AXPress 切
+    // **全程不抢前台**；只有 AX 找不到它们（界面没画完、换版本）时才退回坐标点击。
+    if !panel::press_rail(win, account) {
+        let rail_y = match account {
+            Account::Normal => panel::RAIL_Y[4],
+            Account::Credit => panel::RAIL_Y[5],
+        };
+        panel::click_in_window(win, panel::RAIL_X + panel::RAIL_W / 2.0, rail_y, cfg.settle);
+    }
 
     // 买入/担保品买入 tab
     let tab_x = match (account, side) {

@@ -870,11 +870,14 @@ fn switch_account(
     cfg: &CoreConfig,
     want: panel::Account,
 ) -> Result<(), String> {
-    let rail_y = match want {
-        panel::Account::Normal => panel::RAIL_Y[4],
-        panel::Account::Credit => panel::RAIL_Y[5],
-    };
-    panel::click_in_window(win, panel::RAIL_X + panel::RAIL_W / 2.0, rail_y, cfg.settle);
+    // 左栏切账户走 AXPress（不抢前台）；AX 找不到才退回坐标点击
+    if !panel::press_rail(win, want) {
+        let rail_y = match want {
+            panel::Account::Normal => panel::RAIL_Y[4],
+            panel::Account::Credit => panel::RAIL_Y[5],
+        };
+        panel::click_in_window(win, panel::RAIL_X + panel::RAIL_W / 2.0, rail_y, cfg.settle);
+    }
     panel::click_in_window(win, want.entry_x(), panel::TAB_Y, cfg.settle);
 
     // 切完立刻自检：界面顶部菜单是否真的对应目标账户。

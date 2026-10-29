@@ -77,12 +77,14 @@ pub fn list_pending(
     cfg: &CoreConfig,
     account: panel::Account,
 ) -> Result<Vec<PendingRow>, String> {
-    // 1. 切到对应账户区
-    let rail_y = match account {
-        panel::Account::Normal => panel::RAIL_Y[4],
-        panel::Account::Credit => panel::RAIL_Y[5],
-    };
-    panel::click_in_window(win, panel::RAIL_X + panel::RAIL_W / 2.0, rail_y, cfg.settle);
+    // 1. 切到对应账户区（AXPress，不抢前台；失败才退回坐标点击）
+    if !panel::press_rail(win, account) {
+        let rail_y = match account {
+            panel::Account::Normal => panel::RAIL_Y[4],
+            panel::Account::Credit => panel::RAIL_Y[5],
+        };
+        panel::click_in_window(win, panel::RAIL_X + panel::RAIL_W / 2.0, rail_y, cfg.settle);
+    }
 
     // 2. 点底部「撤单」标签
     panel::click_in_window(win, CANCEL_TAB_X, panel::BOTTOM_Y, cfg.settle);

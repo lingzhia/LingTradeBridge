@@ -201,9 +201,14 @@ pub fn unlock_once(
     }
 
     // 点密码输入框（窗口内坐标 → 屏幕坐标）
+    //
+    // 从这里开始到解锁结束，客户端**必须一直占着前台**：密码是逐位发物理按键
+    // 打进去的（安全输入框拒收粘贴），而后台进程发的键盘事件只会送到前台 App。
+    // 所以先记下原来是谁在前台，解锁完再还回去。
+    let prev_front = input::frontmost_pid();
     let cx = panel::LOCK_PWD_X + panel::LOCK_PWD_W / 2.0;
     let cy = panel::LOCK_PWD_Y + panel::LOCK_PWD_H / 2.0;
-    panel::click_in_window(win, cx, cy, settle);
+    panel::click_in_window_front(win, cx, cy, settle);
 
     // 逐位按键输入，**不能用剪贴板粘贴**。
     //
@@ -224,11 +229,19 @@ pub fn unlock_once(
 
     // 点"确定"。坐标实测自 OCR：密码框正下方偏左，28×16 的小按钮。
     // 同时补一次回车 —— 这两个动作任一都能提交，双保险且成本极低。
-    panel::click_in_window(win, LOCK_OK_X, LOCK_OK_Y, settle * 0.6);
+    panel::click_in_window_front(win, LOCK_OK_X, LOCK_OK_Y, settle * 0.6);
     input::press_key(input::KEY_RETURN, settle);
 
     // 给客户端一点反应时间，然后重新判断
     std::thread::sleep(std::time::Duration::from_millis(700));
+
+    // 解锁完把前台还回去。解锁期间抢前台是**没法避免**的：密码框只收物理按键，
+    // 键盘事件只发给前台 App。但至少别让客户端一直赖在上面。
+    if let Some(prev) = prev_front {
+        if prev != pid {
+            input::set_frontmost(prev, true);
+        }
+    }
 
     if is_locked(pid, win.number) {
         UnlockOutcome::Failed

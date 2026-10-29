@@ -668,21 +668,97 @@ fn parse_total(text: &str) -> Option<u32> {
 /// 把一次点击送到窗口内坐标处
 ///
 /// 注意：OCR 给的是窗口内坐标，CGEvent 要屏幕全局坐标，所以要加窗口原点。
+///
+/// 走的是「瞬时借前台」路径：抢过来 40ms、点一下、立刻还回去。
+/// 合成鼠标事件只会落到前台窗口上（postToPid、窗口号字段、Carbon PSN
+/// 三条后台通道全试过，一律无效），所以前台必须短暂借一下；
+/// 但借完立刻还，用户几乎感知不到。详见 `input::click_flashing`。
 pub fn click_in_window(win: &capture::WindowInfo, x: f64, y: f64, settle: f64) {
-    // 必须先把目标 App 提到前台。
-    //
-    // CGEvent 的点击是打在**屏幕上那个坐标**，谁在最前面就归谁。
-    // 实测踩过：中信和别的窗口坐标完全一致（都是 1920x956 @ (0,30)），
-    // 没激活的话点击全打到了前台那个窗口上，中信这边毫无反应，
-    // 而我们还以为点成功了，接着去读界面就读到一堆不相干的东西。
-    crate::input::activate_app(win.pid);
-    crate::input::click(win.x + x, win.y + y, settle);
+    crate::input::click_flashing(win.pid, win.x + x, win.y + y, settle);
 }
 
 /// 在窗口内某点双击
 pub fn double_click_in_window(win: &capture::WindowInfo, x: f64, y: f64, settle: f64) {
     crate::input::activate_app(win.pid);
     crate::input::double_click(win.x + x, win.y + y, settle);
+}
+
+/// 在窗口内某点点一下，并**让客户端保持在前台**
+///
+/// 只有解锁流程该用它。默认的 `click_in_window` 是"点完立刻还前台"，
+/// 但解锁要往安全输入框里逐位打**物理按键** —— 键盘事件同样只发给前台 App，
+/// 前台一还回去，密码就打进了用户正在用的窗口。所以解锁期间必须一直占着前台，
+/// 解锁结束（`unlock.rs` 收尾）再还。
+pub fn click_in_window_front(win: &capture::WindowInfo, x: f64, y: f64, settle: f64) {
+    crate::input::activate_app(win.pid);
+    crate::input::click(win.x + x, win.y + y, settle);
+}
+
+// ---------------------------------------------------------------------------
+// 纯后台操作（AXPress，完全不碰前台）
+// ---------------------------------------------------------------------------
+
+/// 左侧栏按钮的几何特征：x≈1、58×72 的一列无名 AXButton
+const RAIL_AX_W: f64 = 58.0;
+const RAIL_AX_H: f64 = 72.0;
+const RAIL_AX_X_MAX: f64 = 10.0;
+
+/// 用 AXPress 点左侧栏，**全程不抢前台**
+///
+/// # 为什么这条能后台而坐标点击不能
+///
+/// 左栏这 6 个按钮是客户端里少数真的暴露给 AX 的控件（带 AXPress 动作），
+/// 实测 `AXPress` 可以在前台是别的 App 的情况下完成账户切换，
+/// 而任何形式的合成鼠标事件（HID / postToPid / 带窗口号）都必须前台。
+///
+/// 所以能走 AX 的步骤一律走 AX —— 这是"不影响用户用电脑"的最优路径。
+/// AX 找不到（换版本、界面还没画出来）时返回 false，由调用方决定是否退回坐标点击。
+pub fn press_rail(win: &capture::WindowInfo, account: Account) -> bool {
+    let idx = match account {
+        Account::Normal => 4, // 交易
+        Account::Credit => 5, // 信用
+    };
+    let Some(btn) = rail_button(win.pid, idx) else {
+        return false;
+    };
+    btn.press()
+}
+
+/// 取左栏第 idx 个按钮（0=市场 … 4=交易 5=信用）
+fn rail_button(pid: u32, idx: usize) -> Option<crate::input::AxElement> {
+    let app = crate::input::ax_app(pid)?;
+    let mut found: Vec<(f64, crate::input::AxElement)> = Vec::new();
+    collect_rail(&app, 0, &mut found);
+    found.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // 必须是完整的 6 个，否则说明界面没画全，按序号取会取错栏
+    if found.len() != RAIL_Y.len() {
+        return None;
+    }
+    found.into_iter().nth(idx).map(|(_, e)| e)
+}
+
+fn collect_rail(
+    el: &crate::input::AxElement,
+    depth: usize,
+    out: &mut Vec<(f64, crate::input::AxElement)>,
+) {
+    if depth > 20 || out.len() >= RAIL_Y.len() {
+        return;
+    }
+    if el.role().as_deref() == Some("AXButton") {
+        if let Some((x, y, w, h)) = el.frame() {
+            if x < RAIL_AX_X_MAX
+                && (w - RAIL_AX_W).abs() < 2.0
+                && (h - RAIL_AX_H).abs() < 2.0
+            {
+                out.push((y, el.clone_of()));
+                return;
+            }
+        }
+    }
+    for c in el.children() {
+        collect_rail(&c, depth + 1, out);
+    }
 }
 
 #[cfg(test)]

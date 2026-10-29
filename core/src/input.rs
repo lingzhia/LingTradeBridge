@@ -93,6 +93,9 @@ extern "C" {
     fn CGEventKeyboardSetUnicodeString(event: CGEventRef, length: usize, string: *const u16);
     fn CGEventSourceCreate(state_id: u32) -> CGEventSourceRef;
     fn CGEventSourceSetLocalEventsSuppressionInterval(source: CGEventSourceRef, seconds: f64);
+    fn CGEventGetLocation(event: CGEventRef) -> CGPoint2;
+    fn CGWarpMouseCursorPosition(new_position: CGPoint2) -> i32;
+    fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
 
     fn AXIsProcessTrusted() -> bool;
     fn AXIsProcessTrustedWithOptions(options: CFTypeRef) -> bool;
@@ -167,10 +170,45 @@ fn new_source() -> CGEventSourceRef {
     }
 }
 
+/// 当前光标的屏幕坐标
+///
+/// CGEventGetLocation 要一个事件对象，传空指针会有符号问题，
+/// 所以正正经经造一个空事件来问位置。
+fn cursor_position() -> CGPoint2 {
+    unsafe {
+        let ev = CGEventCreate(std::ptr::null_mut());
+        if ev.is_null() {
+            return CGPoint2 { x: 0.0, y: 0.0 };
+        }
+        let p = CGEventGetLocation(ev);
+        core_foundation::base::CFRelease(ev as CFTypeRef);
+        p
+    }
+}
+
+/// 把光标硬挪到指定屏幕坐标（不发事件，不动窗口）
+fn warp_cursor(pt: CGPoint2) {
+    unsafe {
+        CGWarpMouseCursorPosition(pt);
+        // 挪完要立刻重新关联，否则系统会有一小段"光标与鼠标脱钩"的状态
+        CGAssociateMouseAndMouseCursorPosition(1);
+    }
+}
+
 /// 把光标移到屏幕坐标 (x, y) 并单击
 ///
 /// 坐标是**屏幕全局坐标**，不是窗口内坐标。窗口内坐标要加上窗口原点。
 pub fn click(x: f64, y: f64, settle: f64) {
+    click_raw(x, y);
+    sleep(Duration::from_secs_f64(settle));
+}
+
+/// 单击，但**不等 settle** 就返回
+///
+/// 拆出来是为了「瞬时激活」路径：那里点击之后要立刻把前台还原，
+/// 如果先傻等 settle 再还原，用户会在这段时间里看着别人的窗口。
+/// 等待交给调用方在还原之后再睡。
+pub fn click_raw(x: f64, y: f64) {
     let src = new_source();
     let pt = CGPoint2 { x, y };
     unsafe {
@@ -199,7 +237,6 @@ pub fn click(x: f64, y: f64, settle: f64) {
             core_foundation::base::CFRelease(src as CFTypeRef);
         }
     }
-    sleep(Duration::from_secs_f64(settle));
 }
 
 /// 双击。用于"当日委托里点开某一行的撤单详情"
@@ -381,11 +418,11 @@ pub fn scroll(x: f64, y: f64, lines: i32, settle: f64) {
     sleep(Duration::from_secs_f64(settle));
 }
 
-/// 把窗口提到最前
+/// 把某个进程设/取消前台（不等它真的切过去）
 ///
 /// 用 AX 的 AXFrontmost 而不是 `open -a`，因为后者会重启已经在跑的实例。
 /// 实测这个调用有时返回 -25202（参数错），但窗口照样被提到前面，所以忽略返回值。
-pub fn activate_app(pid: u32) {
+pub fn set_frontmost(pid: u32, on: bool) {
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn AXUIElementCreateApplication(pid: i32) -> CFTypeRef;
@@ -397,6 +434,7 @@ pub fn activate_app(pid: u32) {
         fn CFBooleanGetValue(b: CFTypeRef) -> bool;
         fn CFRelease(o: CFTypeRef);
         static kCFBooleanTrue: CFTypeRef;
+        static kCFBooleanFalse: CFTypeRef;
     }
     let _ = CFBooleanGetValue; // 仅为确保符号存在
 
@@ -409,12 +447,89 @@ pub fn activate_app(pid: u32) {
         let a = CFStringCreateWithCString(std::ptr::null(), attr.as_ptr(), 0x0800_0100);
         if !a.is_null() {
             // 失败也没关系：实测返回 -25202 时窗口照样被提到前面
-            let _ = AXUIElementSetAttributeValue(app, a, kCFBooleanTrue);
+            let _ = AXUIElementSetAttributeValue(
+                app,
+                a,
+                if on { kCFBooleanTrue } else { kCFBooleanFalse },
+            );
             CFRelease(a);
         }
         CFRelease(app);
     }
+}
+
+/// 当前前台 App 的 pid
+///
+/// 为什么要知道这个：瞬时点击必须把前台**还回原来那个 App**，
+/// 而不是写死还给 DeepSeek Harness —— 内核是后台守护进程，
+/// 用户可能正忙着用别的程序，还错人比不还更糟。
+pub fn frontmost_pid() -> Option<u32> {
+    use objc2_app_kit::NSWorkspace;
+    unsafe {
+        let ws = NSWorkspace::sharedWorkspace();
+        let app = ws.frontmostApplication()?;
+        Some(app.processIdentifier() as u32)
+    }
+}
+
+/// 把窗口提到最前，并等它真的到前台
+///
+/// 解锁流程必须用它：安全输入框只对前台 App 响物理按键。
+pub fn activate_app(pid: u32) {
+    set_frontmost(pid, true);
     sleep(Duration::from_millis(350));
+}
+
+/// 瞬时点击：抢前台 → 点一下 → 立刻把前台还给原来那个 App
+///
+/// # 为什么要这么绕
+///
+/// 中信的底部页签行、顶部标签行都是**纯自绘**，AX 树里根本没有对应节点
+/// （`AXUIElementCopyElementAtPosition` 打过去只拿到 AXScrollArea），
+/// 所以只能合成鼠标事件。而合成鼠标事件只会落到**前台窗口**上 ——
+/// postToPid、窗口号字段 91/92、Carbon PSN 全都试过，后台一律无效。
+///
+/// 于是只剩"短暂借一下前台"这一条路。实测：AXFrontmost 之后 **40ms**
+/// 界面就已经能接住点击（10/20/30ms 会丢，40ms 起 8/8 稳定），
+/// 整轮 160–180ms 就还回去了，用户基本感知不到。
+///
+/// 顺带把光标挪回原处 —— 否则鼠标会停在客户端窗口上不动。
+///
+/// 光标**藏不住**：CGDisplayHideCursor / CGSHideCursor / NSCursor.hide
+/// 以及 SkyLight 的私有符号全部实测无效（返回成功但画面不变），
+/// 现代 macOS 不允许第三方进程隐藏硬件光标。所以只剩"缩短可见时长"一条路，
+/// 目前光标会在目标点停留约 100ms。别再加藏光标的代码，那是自欺欺人。
+///
+/// # 已知代价
+///
+/// 这 100–180ms 里中信是前台，键盘事件会送到它那里、鼠标点击也会落在它身上。
+/// 用户此刻若正在打字，会有输入丢失并漏进委托表单（不会下错单 —— 填完会回读
+/// 代码/价格/数量比对，对不上就中止，但会白跑一趟）。
+pub fn click_flashing(pid: u32, x: f64, y: f64, settle: f64) {
+    const PRE_MS: u64 = 40;
+    const FLASH_SETTLE_MS: u64 = 40;
+
+    let prev = frontmost_pid();
+    let saved = cursor_position();
+
+    set_frontmost(pid, true);
+    sleep(Duration::from_millis(PRE_MS));
+
+    click_raw(x, y);
+
+    // 先留一点时间让客户端处理完这次点击，再撤
+    sleep(Duration::from_millis(FLASH_SETTLE_MS));
+    if let Some(p) = prev {
+        if p != pid {
+            set_frontmost(p, true);
+        }
+    }
+
+    unsafe {
+        warp_cursor(saved);
+    }
+
+    sleep(Duration::from_secs_f64(settle));
 }
 
 
