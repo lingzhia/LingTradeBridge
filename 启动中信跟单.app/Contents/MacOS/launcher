@@ -1,0 +1,65 @@
+#!/bin/bash
+# ===========================================================================
+# 中信跟单器 · macOS 应用启动器（无终端窗口）
+# ---------------------------------------------------------------------------
+# 双击「启动中信跟单.app」即运行本脚本：Finder 交给 LaunchServices 启动，
+# 不会打开终端窗口，直接显示跟单界面。
+#
+# 与 启动中信跟单.command 的分工：
+#   .app      日常使用 —— 双击即用，无终端，输出写进 ~/.lingtradebridge-citics/logs
+#   .command  调试用   —— 保留终端，能实时看到输出
+#
+# 为什么用 exec 顶替自己：LaunchServices 认的是 .app 这个 bundle，
+# 进程启动后 exec 成 python，Dock 里显示的仍然是本应用的名字和图标，
+# 而不是通用的 Python 图标。
+# ===========================================================================
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"       # .../启动中信跟单.app/Contents/MacOS
+PROJECT="$(cd "$HERE/../../.." && pwd)"     # 项目根目录（.app 与 gui/ 同级）
+cd "$PROJECT" || exit 1
+
+LOG_DIR="$HOME/.lingtradebridge-citics/logs"
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/启动器_$(date +%F).log"
+
+alert() {
+    osascript -e "display alert \"中信跟单器\" message \"$1\" as critical" >/dev/null 2>&1
+    echo "[$(date '+%F %T')] 错误: $1" >> "$LOG"
+    exit 1
+}
+
+# 本 .app 必须和 gui/ 放在同一个目录里（靠相对位置找项目），
+# 单独把它拖到 /Applications 就跑不起来了 —— 这里给出人话提示
+[ -f "$PROJECT/gui/app.py" ] || alert "没找到主程序。「启动中信跟单.app」必须放在项目根目录（和 gui、core 同级），不能单独拖到别处。"
+
+# Finder 启动时 PATH 很干净，主动补上常见的解释器目录
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+# 挑一个带 tkinter 的解释器。顺序很关键：
+#   1) 项目自带的 .venv
+#   2) 登录 shell 里的 python3 —— 也就是用户在终端敲 python3 时用的那个
+#      (conda/homebrew 装的解释器靠 .zshrc 里的 init 才进 PATH; Finder 直接
+#       启动的进程读不到, 所以要显式问一次交互式登录 shell; 必须带 -i,
+#       否则 .zshrc 不会被 source, 拿到的会是系统自带的 /usr/bin/python3)
+#   3) PATH 里的 python3 / 常见安装路径 / 系统自带
+LOGIN_PY="$(/bin/zsh -ilc 'command -v python3' 2>/dev/null | tail -n 1)"
+PY=""
+for c in "$PROJECT/.venv/bin/python" "$LOGIN_PY" "$(command -v python3 || true)" \
+         /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+    [ -n "$c" ] && [ -x "$c" ] || continue
+    if "$c" -c 'import tkinter' >/dev/null 2>&1; then
+        PY="$c"
+        break
+    fi
+done
+
+[ -n "$PY" ] || alert "没找到带 tkinter 的 python3，请先安装后再启动。详见 $LOG"
+
+echo "[$(date '+%F %T')] 启动: $PY gui/app.py" >> "$LOG"
+
+# 只保留最近 5 个启动器日志，避免长年累积
+ls -1t "$LOG_DIR"/启动器_*.log 2>/dev/null | tail -n +6 | while read -r old; do rm -f "$old"; done
+
+exec "$PY" "gui/app.py" >> "$LOG" 2>&1

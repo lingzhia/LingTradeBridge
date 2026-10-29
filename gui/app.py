@@ -60,6 +60,9 @@ SOCKET_PATH = "/tmp/citics-core.sock"
 CORE_BIN = os.path.join(ROOT, "core", "target", "release", "citics-core")
 CORE_BIN_DEBUG = os.path.join(ROOT, "core", "target", "debug", "citics-core")
 OCR_BIN = os.path.join(ROOT, "tools", "ocr")
+# 应用图标（.app 里显示的是 bundle 的 icns，这里给直接跑 gui/app.py 的场景兜底：
+# Dock 里仍然是 Python 图标，但窗口标题栏/任务切换器上会是这个）
+ICON_PNG = os.path.join(ROOT, "assets", "AppIcon.png")
 
 DEFAULT_CONFIG = {
     "app_name": "中信证券网上交易",
@@ -1299,9 +1302,27 @@ class App:
         self.root.destroy()
 
 
+def apply_window_icon(root):
+    """给 Tk 窗口挂上应用图标。
+
+    必须在 Tk() 之后、mainloop 之前调用。Tk 只认 PNG/GIF（不认 .icns），
+    且**必须自己持住 PhotoImage 的引用** —— 局部变量被回收后图标会变空白。
+    所以把引用挂到 root 上。
+    """
+    if not os.path.exists(ICON_PNG):
+        return
+    try:
+        img = tk.PhotoImage(file=ICON_PNG)
+    except tk.TclError:
+        return
+    root.iconphoto(True, img)
+    root._icon_image = img   # 防 GC
+
+
 def main():
     ensure_user_data_dir()
     root = tk.Tk()
+    apply_window_icon(root)
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()

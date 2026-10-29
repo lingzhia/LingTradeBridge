@@ -73,11 +73,19 @@ tools/build_ocr.sh   编译脚本
 cd core && CARGO_HOME=.cargo cargo build --release
 ```
 
-启动界面：
+启动界面（二选一）：
 
 ```bash
+# 日常使用：双击 启动中信跟单.app —— 无终端窗口，Dock 里显示本应用的名字和图标
+open 启动中信跟单.app
+
+# 调试：保留终端，能实时看到输出和报错
 python3 gui/app.py
 ```
+
+`.app` 必须和 `gui/`、`core/` 放在同一级目录里（它靠相对路径找项目根）。
+单独把它拖到 `/Applications` 会导致 `gui/app.py` 找不到。
+启动器的输出写在 `~/.lingtradebridge-citics/logs/启动器_日期.log`。
 
 在界面上填交易密码 → 保存 → 启动核心，可用「立即解锁一次」验证密码。
 核心必须重启才能读到新保存的配置。
