@@ -26,32 +26,12 @@ use crate::config;
 
 use crate::{cancel, capture, follow, http, input, ocr, order, CoreConfig};
 
-/// 请求从哪条通道进来
-///
-/// 存在的唯一理由是「真下单」这道闸门必须分通道：本地 socket 是人在界面上
-/// 按按钮（前面有二次确认框），HTTP 是外部程序打来的、看不见对面是谁。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Channel {
-    /// 本地 unix socket：界面自己发起的动作
-    #[default]
-    Local,
-    /// HTTP 接口：外部程序发起的动作
-    Http,
-}
-
 /// 请求
 #[derive(Debug, Clone, Deserialize)]
 pub struct Request {
     #[serde(default)]
     pub id: u64,
     pub op: String,
-    /// 这条请求从哪条通道来。
-    ///
-    /// **不从 JSON 反序列化**（`skip`）：只由内核按实际通道填。
-    /// 若允许请求体自己填，外部写个 `"via":"Local"` 就把闸门绕过去了 ——
-    /// 那这道闸门从一开始就不该存在。
-    #[serde(skip)]
-    pub via: Channel,
     /// 解锁密码
     #[serde(default)]
     pub password: Option<String>,
@@ -126,6 +106,13 @@ pub struct Response {
     /// 否则「记录」和「丢弃」在界面上长得一模一样。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub follow_skipped: Option<u64>,
+    /// 这一单到底有没有真的提交给券商。
+    ///
+    /// 只在「下单类请求」上出现，`false` = 测试模式（开关关着），
+    /// 请求本身是成功的、参数也没问题，只是钱没动。
+    /// 有了这个字段，调用方不必靠猜「没报错是不是就下成了」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placed: Option<bool>,
 }
 
 impl Response {
@@ -148,6 +135,7 @@ impl Response {
             follow_count: None,
             follow_addr: None,
             follow_skipped: None,
+            placed: None,
         }
     }
     fn err(id: u64, msg: impl Into<String>) -> Self {
@@ -387,7 +375,6 @@ fn start_http(shared: &Arc<Shared>) -> Result<http::HttpServer, String> {
         let req = Request {
             id: 0,
             op: "query".into(),
-            via: Channel::Http,
             password: None,
             code: None,
             direction: None,
@@ -447,7 +434,6 @@ fn start_http(shared: &Arc<Shared>) -> Result<http::HttpServer, String> {
             let req = Request {
                 id: 0,
                 op: op.to_string(),
-                via: Channel::Http,
                 password: text("password"),
                 code: text("code"),
                 direction,
@@ -478,9 +464,9 @@ fn start_http(shared: &Arc<Shared>) -> Result<http::HttpServer, String> {
                 200
             } else {
                 match r.state.as_deref() {
-                    // follow_stopped 也归 409：请求本身合法、参数没错，
-                    // 只是当前状态不允许 —— 用 400 会让人怀疑是不是传错了参数。
-                    Some("wrong_state") | Some("failed") | Some("follow_stopped") => 409,
+                    // 这两个归 409：请求本身合法、参数没错，只是当前状态不允许 ——
+                    // 用 400 会让人怀疑是不是传错了参数。
+                    Some("wrong_state") | Some("failed") => 409,
                     _ => 400,
                 }
             };
@@ -665,13 +651,23 @@ fn do_cancel(req: &Request, shared: &Shared) -> Response {
         Some("normal") | None => panel::Account::Normal,
         Some(other) => return Response::err(req.id, format!("未知账户类型: {other}")),
     };
-    // action=dry_run 时只看会撤哪一笔，不真点
-    let dry_run = req.action.as_deref() == Some("dry_run");
+    // 撤单也走同一个总开关：关着时只走完「定位到哪一笔」，不真的点撤销。
+    //
+    // 撤单是在动真钱（撤掉就没了），漏掉它等于开关只关了一半。
+    // 换句话说，开关关着 = 这个内核不碰真实委托，无论买卖还是撤。
+    let gate_open = shared.follow.lock().unwrap().is_some();
+    let asked_dry_run = req.action.as_deref() == Some("dry_run");
+    let dry_run = effective_dry_run(asked_dry_run, gate_open);
 
     match cancel::cancel_one(&win, pid, &cfg, account, code, order_no, dry_run) {
         cancel::CancelOutcome::Cancelled { code, order_no } => {
             let mut r = Response::ok(req.id);
-            r.detail = Some(format!("已撤销 {code} {order_no}"));
+            r.placed = Some(!dry_run);
+            r.detail = Some(if gate_open {
+                format!("已撤销 {code} {order_no}")
+            } else {
+                format!("（测试模式，未实际撤单）定位到可撤委托 {code} {order_no}")
+            });
             r.state = Some("cancelled".into());
             r.account = Some(account.as_str().to_string());
             r
@@ -997,8 +993,12 @@ fn handle_signal(
                 "跟单未开启，信号只记录不下单", &acct_name,
             ),
         );
+        // ok 为 true：信号确实收到了、也确实记下来了。
+        // 「没真下单」这件事用 `placed: false` 说，而不是用错误码说 ——
+        // 否则策略方会以为是自己推错了，反复重推。
         return serde_json::json!({
-            "ok": false,
+            "ok": true,
+            "placed": false,
             "status": "recorded_not_placed",
             "reason": "跟单未开启，信号已记录但未下单",
             "recorded": true,
@@ -1153,17 +1153,19 @@ fn now_str() -> String {
     follow::now_string()
 }
 
-/// HTTP 渠道的真下单要不要被拦住
+/// 「这一单到底要不要真的提交给券商」的唯一判定
 ///
 /// 抽成纯函数是为了能测：`do_place_order` 一进门就要窗口和界面，
-/// 测试里跑不动，而「哪几种组合该拦」恰恰是这道闸门唯一容易写错的地方。
+/// 测试里跑不动，而这道判断恰恰是最容易写歪的地方。
 ///
-/// 只有「HTTP + 真提交 + 闸门关」这一种组合被拦：
-/// - 本地 socket 放行 —— 那条路是人在按按钮，前面有二次确认框；
-/// - dry_run 放行 —— 只填单不提交，不花钱；
-/// - 闸门开着放行 —— 用户明确开了闸，外部程序下单是他授权过的。
-fn http_order_blocked(via: Channel, dry_run: bool, follow_open: bool) -> bool {
-    via == Channel::Http && !dry_run && !follow_open
+/// 规则只有一条：**总开关（跟单闸门）关着，就不真提交**。
+/// 关着时仍然走完填单，所以「参数对不对、界面能不能填进去」照样能验证，
+/// 只是最后不点提交按钮 —— 钱不会动。
+///
+/// `asked_dry_run` 是调用方自己要求的只填单（老接口参数，保留兼容）。
+/// 两者取「或」：任何一方要求不提交，就不提交。
+fn effective_dry_run(asked_dry_run: bool, gate_open: bool) -> bool {
+    asked_dry_run || !gate_open
 }
 
 /// 下单
@@ -1176,35 +1178,19 @@ fn http_order_blocked(via: Channel, dry_run: bool, follow_open: bool) -> bool {
 ///   account   normal / credit（默认 normal）
 ///   action    下单后是否提交：不给或 "submit" 提交；"dry_run" 只填不提交
 ///
-/// 这里有两道闸门叠着：
-/// 1. `action == "dry_run"` → 只填单不提交（不花钱，任何通道都放行）；
-/// 2. 真提交 + `via == Http` → 必须有跟单闸门开着（见函数内注释）。
+/// 真提交与否由「开始/停止跟单」这个总开关决定，见 `effective_dry_run`。
+/// 开关关着时本函数**照常返回成功**，只是不做最后那一下点击，
+/// 并在响应里带 `placed: false` —— 调用方不会因为开关状态而收到报错，
+/// 报错留给真正的错误（代码填错、价格缺失、窗口不可用……）。
 fn do_place_order(req: &Request, shared: &Shared) -> Response {
-    // 真下单的第二道闸门：HTTP 通道来的真委托，必须有跟单闸门开着。
+    // 总开关：一个开关管所有真下单 —— 信号、接口、界面按钮，全看它。
     //
-    // 闸门原本只管信号（`/{ns}/signal`），而 `/{ns}/order` 是界面下单按钮的
-    // 镜像，一路直通 —— 结果「没开跟单就安全」是个假象：外部拿着 Token 打
-    // `POST /normal/order` 不带 dry_run 就会真下真钱单，而界面上跟单显示
-    // 「未启动」。这两件事必须是同一个开关。
-    //
-    // 为什么不挡本地 socket：那条路上是人在界面上按按钮，前面有二次确认框，
-    // 确认框本身就是「人的明确意图」；而 HTTP 对面是谁、有没有确认，内核
-    // 一无所知。所以闸门按通道区分，而不是按动作区分。
-    //
-    // 干跑（dry_run）永远放行：它只填单不提交，不花钱，而且「不真下单也能
-    // 验证接口通不通」正是这个工具存在的意义。
-    let dry_run = req.action.as_deref() == Some("dry_run");
-    if http_order_blocked(req.via, dry_run, shared.follow.lock().unwrap().is_some()) {
-        let mut r = Response::err(
-            req.id,
-            "跟单未开启，HTTP 渠道的真下单被拒绝。\
-             要真的下单请先在界面上「开始跟单」，或改用本地通道；\
-             只想验证接口传参请加 \"dry_run\": true（只填单不提交，不花钱）。",
-        );
-        r.state = Some("follow_stopped".into());
-        shared.fill_follow(&mut r);
-        return r;
-    }
+    // 关着时不是「拒绝请求」，而是「照常走完、不点提交」。原因：
+    // 这个开关是给人测功能的，用起来得像没这个开关一样；返回报错等于
+    // 逼调用方去理解一个测试用的内部状态。
+    let gate_open = shared.follow.lock().unwrap().is_some();
+    let asked_dry_run = req.action.as_deref() == Some("dry_run");
+    let dry_run = effective_dry_run(asked_dry_run, gate_open);
 
     let cfg = shared.cfg();
     let (pid, win) = match panel::ensure_window(&cfg.app_path) {
@@ -1243,9 +1229,19 @@ fn do_place_order(req: &Request, shared: &Shared) -> Response {
     r.account = Some(account.as_str().into());
     match order::place_order(&win, pid, &cfg, account, side, &code, &price, amount, dry_run) {
         order::PlaceOutcome::Accepted { order_no } => {
+            // placed 只在这条「成功」路上出现：它回答的是「这一单真的交出去了吗」。
+            // 拿不到合同号也是成功（填单成功但没提交），所以按 dry_run 判而不是按 order_no。
+            r.placed = Some(!dry_run);
+            let prefix = if !gate_open {
+                "（测试模式，未实际下单）"
+            } else if asked_dry_run {
+                "[干跑] 仅填单，"
+            } else {
+                ""
+            };
             r.detail = Some(format!(
                 "{}{} {} {}股 @{} {}",
-                if dry_run { "[干跑] 仅填单，" } else { "" },
+                prefix,
                 side.as_str(),
                 code,
                 amount,
@@ -1522,6 +1518,7 @@ fn dispatch_account(req: &Request, shared: &Shared) -> Response {
                 follow_count: None,
                 follow_addr: None,
                 follow_skipped: None,
+                placed: None,
             };
         }
         // 调试用：在窗口坐标上点一下（x/y 来自请求的 seq/ts 两个数值字段不好读，
@@ -2001,26 +1998,13 @@ mod tests {
     }
 
     #[test]
-    fn 闸门关着只拦http的真下单() {
-        // 唯一该拦的组合：HTTP + 真提交 + 闸门关
-        assert!(http_order_blocked(Channel::Http, false, false));
-        // 闸门开着 —— 用户明确开了闸，外部下单是他授权过的
-        assert!(!http_order_blocked(Channel::Http, false, true));
-        // 干跑 —— 只填单不提交，不花钱
-        assert!(!http_order_blocked(Channel::Http, true, false));
-        // 本地 socket —— 人在界面上按按钮，前面有二次确认框
-        assert!(!http_order_blocked(Channel::Local, false, false));
-        assert!(!http_order_blocked(Channel::Local, true, false));
-    }
-
-    #[test]
-    fn 通道不能被请求体伪造() {
-        // via 带 serde(skip)：请求体里写 "via":"Http" 之类也不会生效，
-        // 否则外部程序填个字段就把真下单闸门绕过去了。
-        let r: Request = serde_json::from_str(
-            r#"{"id":1,"op":"place_order","code":"600000","via":"Http"}"#,
-        )
-        .expect("请求体应能解析");
-        assert_eq!(r.via, Channel::Local, "via 只能由内核按实际通道填");
+    fn 开关关着任何真下单都不提交() {
+        // 关着：不管调用方有没有要求干跑，都不提交
+        assert!(effective_dry_run(false, false), "开关关着必须不提交");
+        assert!(effective_dry_run(true, false));
+        // 开着：不要求干跑就真提交
+        assert!(!effective_dry_run(false, true), "开关开着必须真提交");
+        // 开着时调用方自己要求干跑，仍然只填单（老接口参数保留兼容）
+        assert!(effective_dry_run(true, true));
     }
 }

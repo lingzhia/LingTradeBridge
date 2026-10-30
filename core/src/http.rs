@@ -15,6 +15,11 @@
 //!   GET  /normal/positions|orders|deals|account
 //!   GET  /credit/positions|orders|deals|account
 //!
+//! 所有「真下单」动作都受同一个开关管：界面上的「开始/停止跟单」
+//! （`POST /follow_start|/follow_stop`）。这个开关关着时请求**照常返回成功**，
+//! 只是不点最后那一下提交 —— 响应里 `placed: false` 说明钱没动。
+//! 对接口使用者来说是无感的：参数错没错、接口通不通，关着开关一样能验证。
+//!
 //! 其余动作统一走「通用投递」这一条通道（见 [`RpcHandler`]）：
 //!
 //!   POST /normal/cancel   {"code":"600000"}      撤单（可加 "dry_run":true 只看看）
