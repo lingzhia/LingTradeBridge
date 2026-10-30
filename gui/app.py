@@ -38,6 +38,8 @@ import socket
 import subprocess
 import threading
 import tkinter as tk
+import urllib.error
+import urllib.request
 from tkinter import filedialog, messagebox, ttk
 
 # ---------------------------------------------------------------------------
@@ -71,6 +73,9 @@ DEFAULT_CONFIG = {
     "trade_password": "",
     "unlock_max_fail": 3,
     "http_port": 8899,
+    # 接口通道："HTTP" 走真实 HTTP 请求，"本地" 走 unix socket。
+    # 默认 HTTP：这些按钮存在的意义就是验证 HTTP 接口本身。
+    "channel": "HTTP",
     "following": False,
     "follow_ratio": 1.0,
 }
@@ -133,6 +138,159 @@ class CoreClient:
             return {"ok": False, "error": "核心响应超时"}
         except Exception as e:
             return {"ok": False, "error": f"通信失败: {e}"}
+
+
+# 内核进程管理恒走本地 socket，不参与 HTTP 通道切换。
+#
+# 这两个 op 管的是「内核这个进程在不在」，不是交易功能，也不是这些按钮要
+# 验证的 HTTP 接口。更要紧的是：内核没起来、或 Token 没配时 HTTP 本来就
+# 不可用，用 HTTP 探活会把「内核好好跑着、只是 HTTP 没绑上」误判成
+# 「内核没跑」，进而拉起第二个内核把 socket 顶掉。
+LOCAL_ONLY_OPS = {"ping", "shutdown"}
+
+
+class HttpClient:
+    """HTTP 客户端：把界面的每个动作翻成一条真实 HTTP 请求。
+
+    这些按钮存在的意义就是验证 HTTP 接口本身，所以这里**不做任何回落**：
+    HTTP 不通就如实报错并说清怎么处理，绝不悄悄改用本地 socket ——
+    否则「HTTP 到底测到了没有」就变成不可知，测试也就白做了。
+    """
+
+    # 界面的查询类型 → HTTP 路径末段。资金在 HTTP 上叫 account（
+    # GET /normal/account，与同花顺版一致），界面里叫 funds。
+    QUERY_PATH = {
+        "positions": "positions",
+        "orders": "orders",
+        "deals": "deals",
+        "funds": "account",
+    }
+
+    def __init__(self, cfg_getter, timeout=180):
+        self.cfg = cfg_getter
+        self.timeout = timeout
+        # 必须显式绕过代理。
+        #
+        # urllib 默认读系统代理设置（本机开着 Clash 之类的 http_proxy），
+        # 于是发往 127.0.0.1 的请求也被塞进代理，代理再回什么就是什么 ——
+        # 实测拿到的是一个和内核毫无关系的 404，看着就像"内核不认识这个路由"，
+        # 排查会一路往错的方向走。内核永远在本机，这条通道不需要代理由此。
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}))
+
+    def base(self):
+        cfg = self.cfg()
+        host = (cfg.get("http_host") or "127.0.0.1").strip()
+        port = cfg.get("http_port") or 8899
+        return f"http://{host}:{port}"
+
+    def _route(self, op, kw):
+        """界面 op → (method, path, body)。None 表示 HTTP 没有这个接口。"""
+        ns, _, rest = op.partition(".")
+
+        if rest:  # 账户命名空间：normal.* / credit.*
+            if rest == "query":
+                tail = self.QUERY_PATH.get(kw.get("kind") or "")
+                if not tail:
+                    return None
+                return "GET", f"/{ns}/{tail}", None
+            if rest in ("buy", "sell"):
+                # 方向编在路径上（order 靠 direction 区分买卖），
+                # 不再单独传，从根上排除递错方向
+                return "POST", f"/{ns}/order", {
+                    "direction": 1 if rest == "buy" else 2,
+                    "code": kw.get("code"),
+                    "price": str(kw.get("price") or ""),
+                    "amount": kw.get("amount"),
+                    "action": kw.get("action") or None,
+                }
+            if rest == "cancel":
+                return "POST", f"/{ns}/cancel", {
+                    "code": kw.get("code") or None,
+                    "order_no": kw.get("order_no") or None,
+                    "action": kw.get("action") or None,
+                }
+            if rest == "cancel_list":
+                return "GET", f"/{ns}/cancel_list", None
+            return None
+
+        if op == "status":
+            return "GET", "/status", None
+        if op == "raw_ocr":
+            return "GET", "/raw_ocr", None
+        if op == "unlock":
+            return "POST", "/unlock", {"password": kw.get("password")}
+        if op == "reset_unlock":
+            return "POST", "/reset_unlock", None
+        if op == "follow_start":
+            return "POST", "/follow_start", None
+        if op == "follow_stop":
+            return "POST", "/follow_stop", None
+        if op == "follow_status":
+            return "GET", "/follow_status", None
+        if op == "ping":
+            return "GET", "/ping", None
+        return None
+
+    def call(self, op, **kwargs):
+        timeout = kwargs.pop("timeout", None) or self.timeout
+        route = self._route(op, kwargs)
+        if route is None:
+            return {"ok": False, "error": (
+                f"HTTP 接口没有对应「{op}」的路由。\n"
+                "这个动作目前只有本地 socket 通道，"
+                "要测它请把顶部「接口通道」切到「本地」。")}
+        method, path, body = route
+
+        cfg = self.cfg()
+        token = (cfg.get("http_api_token") or "").strip()
+        if not token:
+            return {"ok": False, "error": (
+                "HTTP Token 为空，请求会被 401 拒绝。\n"
+                "请在「跟单控制」页签填好 Token（或点「随机」生成）并保存配置。")}
+
+        data = None
+        headers = {"Authorization": f"Bearer {token}"}
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+
+        req = urllib.request.Request(
+            self.base() + path, data=data, headers=headers, method=method)
+        try:
+            with self._opener.open(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            # 接口回了响应但状态码非 2xx：把核心给的话原样传回去，
+            # 它比「HTTP 400」有用得多
+            raw = ""
+            try:
+                raw = e.read().decode()
+            except Exception:
+                pass
+            try:
+                out = json.loads(raw)
+            except Exception:
+                out = {"ok": False, "error": raw or f"HTTP {e.code}"}
+            out.setdefault("ok", False)
+            if e.code == 401:
+                out["error"] = ("HTTP 401：Token 对不上。"
+                                "检查界面里的 Token 与内核启动时读到的配置是否一致。")
+            elif e.code == 404:
+                out["error"] = f"HTTP 404：内核不认识 {method} {path}。" + (
+                    out.get("error") or "")
+            return out
+        except urllib.error.URLError as e:
+            why = getattr(e, "reason", e)
+            return {"ok": False, "error": (
+                f"连不上 HTTP 服务（{self.base()}）：{why}\n"
+                "可能原因：内核没启动；内核对启动时 Token 为空而没开 HTTP；"
+                "地址/端口填错。先在「内核」按钮上确认内核在跑，"
+                "再看跟单控制页签的监听地址与 Token。")}
+        except socket.timeout:
+            return {"ok": False, "error": "HTTP 请求超时"}
+        except Exception as e:
+            return {"ok": False, "error": f"HTTP 请求失败: {e}"}
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +460,9 @@ class App:
         self.root = root
         ensure_user_data_dir()
         self.cfg = load_config()
-        self.core = CoreClient()
+        # 两条通道都备着，用哪个由顶部开关决定，切换不需要重建控件。
+        self.sock = CoreClient()
+        self.http = HttpClient(lambda: self._live_cfg())
         self.core_proc = None          # 只有「本 GUI 拉起来的」内核才有句柄
         self.core_owned = False        # 内核是不是本 GUI 启动的
         self.core_pid = None           # 从 ping/status 拿到的内核 pid
@@ -310,12 +470,17 @@ class App:
         self.show_password = tk.BooleanVar(value=False)
         self._log_lock = threading.Lock()
         self._cancel_snapshot = []   # 最近一次撤单列表快照
+        # 接口通道要在 _build 之前就有值：顶部下拉框绑定它，而 _build 里
+        # 可能因为初始化提示调一次 _render_channel。
+        self.channel_var = tk.StringVar(
+            value=self.cfg.get("channel", "HTTP"))
 
         root.title("中信证券自动化跟单")
         root.geometry("1280x880")
         root.minsize(1040, 720)
 
         self._build()
+        self._render_channel()
         self._pump_log()
         # 先探内核再进入轮询：启动那一刻界面上就必须如实显示内核在不在跑，
         # 不能等三秒后的第一次轮询才给出结果。
@@ -366,6 +531,21 @@ class App:
         self.follow_dot = tk.Label(
             top, text="●", font=(FONT_UI, 11), fg="#bbb")
         self.follow_dot.pack(side="right", padx=(0, 4))
+
+        # 接口通道开关放最左边：它决定了后面每一下按钮走哪条路，
+        # 是「我在测什么」的第一前提，不能藏在页签里。
+        chan = ttk.Frame(top)
+        chan.pack(side="left", padx=(14, 0))
+        ttk.Label(chan, text="接口通道").pack(side="left")
+        self.channel_box = ttk.Combobox(
+            chan, textvariable=self.channel_var, width=6, state="readonly",
+            values=["HTTP", "本地"])
+        self.channel_box.pack(side="left", padx=4)
+        self.channel_box.bind("<<ComboboxSelected>>",
+                              lambda _e: self.on_channel_change())
+        self.channel_hint = tk.Label(
+            chan, text="", font=(FONT_UI, 10), fg="#1e8449", anchor="w")
+        self.channel_hint.pack(side="left", padx=(2, 0))
 
         # ---- 主区域：左右分栏 ----
         main = ttk.PanedWindow(self.root, orient="horizontal")
@@ -460,8 +640,17 @@ class App:
             foreground="#b9770e", wraplength=470, justify="left",
         ).pack(fill="x", padx=8, pady=(0, 8))
 
-        fol = ttk.LabelFrame(tab, text="跟单（HTTP 信号源）")
+        fol = ttk.LabelFrame(tab, text="HTTP 服务 与 跟单闸门")
         fol.pack(fill="x", padx=8, pady=6)
+
+        # HTTP 服务和跟单开关现在是两件事，界面上必须说清，
+        # 否则用户会以为「没点开始跟单 ⇒ 接口是关的」，白白以为测不到。
+        ttk.Label(
+            fol,
+            text="HTTP 服务随内核启动就在监听，查询/下单随时可用；"
+                 "「开始跟单」只决定外部信号进来后要不要真下单。",
+            foreground="#555555", wraplength=470, justify="left",
+        ).pack(anchor="w", padx=8, pady=(6, 2))
 
         r1 = ttk.Frame(fol)
         r1.pack(fill="x", padx=8, pady=(8, 2))
@@ -558,7 +747,8 @@ class App:
         ttk.Label(
             fol,
             text="⚠ 跟单会用信号自带的价格直接下单，不替你猜价格。"
-                 "信号缺 price/current_price 时会被拒绝。Token 为空时服务不会启动。",
+                 "信号缺 price/current_price 时会被拒绝。"
+                 "Token 为空时 HTTP 服务拒绝启动，修改监听地址/端口后需重启内核才生效。",
             foreground="#b9770e", wraplength=470, justify="left",
         ).pack(fill="x", padx=8, pady=(0, 8))
 
@@ -704,6 +894,62 @@ class App:
     # 日志
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # 接口通道
+    # ------------------------------------------------------------------
+    #
+    # 这些按钮不只是给自己用的，更是用来验证 HTTP 接口的 —— 所以「走哪条
+    # 通道」必须是看得见、可以选的状态，而不是藏在代码里的隐式默认。
+    #
+    # 不做自动回落：HTTP 不通就报错说清楚。要是悄悄改用 socket，界面一切
+    # 正常而 HTTP 侧压根没被调用过，测了个空还以为测过了。
+
+    def _live_cfg(self):
+        """HTTP 客户端看到的配置：界面里刚改的优先。
+
+        用户可能刚把 Token 填好就去点「开始跟单」，那时还没点保存、
+        self.cfg 里仍是旧值。用旧 Token 发请求会 401，看起来像接口坏了，
+        实际只是没保存 —— 这属于最难查的那类误导，直接从源头掐掉。
+        """
+        cfg = dict(self.cfg)
+        try:
+            cfg["http_host"] = self.http_host_var.get().strip() or "127.0.0.1"
+            cfg["http_port"] = int(self.http_port_var.get())
+            cfg["http_api_token"] = self.http_token_var.get().strip()
+        except Exception:
+            pass
+        return cfg
+
+    def _channel(self):
+        return self.channel_var.get()
+
+    def call(self, op, **kwargs):
+        """按当前通道发请求。所有业务动作都从这里走。"""
+        if op not in LOCAL_ONLY_OPS and self._channel() == "HTTP":
+            return self.http.call(op, **kwargs)
+        return self.sock.call(op, **kwargs)
+
+    def on_channel_change(self):
+        ch = self._channel()
+        self.cfg = self._collect()
+        self.cfg["channel"] = ch
+        save_config(self.cfg)
+        self._render_channel()
+        if ch == "HTTP":
+            self.log(f"接口通道：HTTP（{self.http.base()}）—— 业务动作将发真实 HTTP 请求", "OK")
+        else:
+            self.log("接口通道：本地 socket —— 业务动作走 unix socket，不验证 HTTP", "WARN")
+
+    def _render_channel(self):
+        if self._channel() == "HTTP":
+            self.channel_hint.configure(
+                text=f"业务动作发 HTTP 请求到 {self.http.base()}",
+                foreground="#1e8449")
+        else:
+            self.channel_hint.configure(
+                text="业务动作走本地 socket，绕过 HTTP 接口",
+                foreground="#b9770e")
+
     def log(self, msg, level="INFO"):
         """入队 + 落文件。
 
@@ -767,7 +1013,7 @@ class App:
 
     def _poll_status(self):
         def work():
-            r = self.core.call("status", timeout=30)
+            r = self.call("status", timeout=30)
             self.root.after(0, lambda: self._render_status(r))
         threading.Thread(target=work, daemon=True).start()
         self.root.after(3000, self._poll_status)
@@ -791,7 +1037,7 @@ class App:
         同样这条探测就绝不能顺手又起一个，那是跟用户对着干。
         """
         def work():
-            r = self.core.call("ping", timeout=5)
+            r = self.call("ping", timeout=5)
             self.root.after(0, lambda: self._render_core_probe(r, auto_start=auto_start))
         threading.Thread(target=work, daemon=True).start()
 
@@ -823,8 +1069,11 @@ class App:
         else:
             self.follow_dot.configure(fg="#bbb")
             self.follow_dot2.configure(fg="#bbb")
-            self.follow_var.set("跟单：未启动（不会接收任何信号）")
-            self.follow_var2.set("未启动 —— 点「开始跟单」后才会监听信号")
+            # 端口一直在监听，所以不能说「不会接收信号」——
+            # 信号会进来、会被明确丢弃并回 not_running。措辞含糊会让人
+            # 以为接口是关的，从而怀疑 HTTP 通道坏了。
+            self.follow_var.set("跟单：未启动（信号会收到但不下单）")
+            self.follow_var2.set("未启动 —— HTTP 在监听，信号会被丢弃")
             self.follow_label.configure(fg="#666")
             self.follow_label2.configure(fg="#666")
 
@@ -969,6 +1218,7 @@ class App:
         cfg["ignore_buy"] = bool(self.ignore_buy_var.get())
         cfg["ignore_sell"] = bool(self.ignore_sell_var.get())
         cfg["allow_reorder"] = bool(self.allow_reorder_var.get())
+        cfg["channel"] = self.channel_var.get()
         return cfg
 
     # ------------------------------------------------------------------
@@ -996,7 +1246,7 @@ class App:
         self.cfg = cfg
 
         def work():
-            r = self.core.call("follow_start")
+            r = self.call("follow_start")
             if r.get("ok"):
                 self.log("✓ " + (r.get("detail") or "跟单已启动"), "OK")
             else:
@@ -1012,7 +1262,7 @@ class App:
 
     def on_follow_stop(self):
         def work():
-            r = self.core.call("follow_stop")
+            r = self.call("follow_stop")
             self.log(("✓ " if r.get("ok") else "✗ ")
                      + (r.get("detail") or r.get("error") or ""),
                      "OK" if r.get("ok") else "ERROR")
@@ -1024,7 +1274,7 @@ class App:
 
     def on_follow_status(self):
         def work():
-            r = self.core.call("follow_status", timeout=30)
+            r = self.call("follow_status", timeout=30)
             if r.get("ok"):
                 self.log(f"跟单状态：{r.get('state')} · {r.get('detail') or ''}")
                 self.root.after(0, lambda: self._render_follow(
@@ -1068,7 +1318,7 @@ class App:
         save_config(self.cfg)
 
         def work():
-            r = self.core.call("unlock", password=pwd, timeout=180)
+            r = self.call("unlock", password=pwd, timeout=180)
             self.root.after(0, lambda: self._after_unlock(r))
         threading.Thread(target=work, daemon=True).start()
         self.log("正在尝试解锁…")
@@ -1083,7 +1333,7 @@ class App:
 
     def on_reset_breaker(self):
         def work():
-            r = self.core.call("reset_unlock", timeout=30)
+            r = self.call("reset_unlock", timeout=30)
             self.log("熔断已重置" if r.get("ok")
                      else f"重置失败：{r.get('error')}",
                      "OK" if r.get("ok") else "ERROR")
@@ -1101,7 +1351,7 @@ class App:
         def work():
             # 走账户命名空间（credit.query / normal.query）。两个账户是两套
             # 平行界面，用前缀表达比多传一个 account 字段更难搞错。
-            r = self.core.call(f"{account}.query", kind=kind, timeout=180)
+            r = self.call(f"{account}.query", kind=kind, timeout=180)
             self.root.after(0, lambda: self._after_query(name, account, r))
         threading.Thread(target=work, daemon=True).start()
         self.log(f"查询{name}（{ACCOUNT_NAMES[account]}）…")
@@ -1119,7 +1369,7 @@ class App:
 
     def on_raw_ocr(self):
         def work():
-            r = self.core.call("raw_ocr", timeout=120)
+            r = self.call("raw_ocr", timeout=120)
             if not r.get("ok"):
                 self.log(f"✗ 取原始 OCR 失败：{r.get('error')}", "ERROR")
                 return
@@ -1140,7 +1390,7 @@ class App:
         self.view_title.set(f"可撤委托（{ACCOUNT_NAMES[account]}）读取中…")
 
         def work():
-            r = self.core.call(f"{account}.cancel_list", timeout=180)
+            r = self.call(f"{account}.cancel_list", timeout=180)
             self.root.after(0, lambda: self._after_cancel_list(account, r))
         threading.Thread(target=work, daemon=True).start()
         self.log(f"刷新可撤列表（{ACCOUNT_NAMES[account]}）…")
@@ -1190,7 +1440,7 @@ class App:
                 return
 
         def work():
-            r = self.core.call(f"{account}.cancel", code=code or None,
+            r = self.call(f"{account}.cancel", code=code or None,
                                order_no=order_no or None,
                                action="dry_run" if dry else None,
                                timeout=180)
@@ -1242,7 +1492,7 @@ class App:
         def work():
             # 方向编进 op 名（credit.buy / credit.sell），不再单独传 direction，
             # 从根上排除「在卖出面板递了买单」这种错。
-            r = self.core.call(f"{account}.{'buy' if direction == 1 else 'sell'}",
+            r = self.call(f"{account}.{'buy' if direction == 1 else 'sell'}",
                                code=code, price=price, amount=amount,
                                action="dry_run" if dry else None,
                                timeout=180)
@@ -1279,7 +1529,7 @@ class App:
         # 先问 socket，而不是问 self.core_proc：内核可能是别处启动的，
         # 那种情况下 core_proc 是 None，但内核明明在跑，再起一个就会
         # 顶掉 socket 文件、把前一个变成收不到请求的僵尸进程。
-        r = self.core.call("ping", timeout=5)
+        r = self.call("ping", timeout=5)
         if r.get("ok"):
             pid = r.get("core_pid")
             who = f"pid {pid}" if pid else "未知 pid"
@@ -1348,7 +1598,7 @@ class App:
 
         # 不是本 GUI 启动的：走 IPC 让内核自己退，比按 pid 发信号干净 ——
         # 内核会自己删掉 socket 文件，不会留下残骸让下次启动误判。
-        r = self.core.call("ping", timeout=5)
+        r = self.call("ping", timeout=5)
         if not r.get("ok"):
             self.log("核心未在运行")
             self._render_core_state(False)
@@ -1361,7 +1611,7 @@ class App:
                 "停止它会让正在进行的跟单中断。确定停止吗？"):
             return
 
-        res = self.core.call("shutdown", timeout=10)
+        res = self.call("shutdown", timeout=10)
         if not res.get("ok"):
             self.log(f"停止内核失败：{res.get('error')}", "ERROR")
             return

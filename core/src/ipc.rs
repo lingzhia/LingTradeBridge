@@ -138,11 +138,18 @@ struct Shared {
     guard: Mutex<UnlockGuard>,
     /// 跟单引擎状态（惰性初始化，只有真正启动跟单时才建台账）
     follow: Mutex<Option<FollowRuntime>>,
+    /// HTTP 服务的监听地址；空串表示没起来（未配置 Token，或端口被别的进程占着）。
+    ///
+    /// HTTP 服务从**内核启动**起就监听，跟单开关只管信号要不要真下单 ——
+    /// 否则「交易查询走 HTTP」必须先武装实盘信号通道才能测，很别扭。
+    http_addr: Mutex<String>,
 }
 
 /// 跟单运行期
+///
+/// 这里**不持有 HTTP 服务**：HTTP 从内核启动就一直在监听，跟单开关只决定
+/// 「信号来了要不要真下单」。信号进来时跟单没开，就丢弃并回 `not_running`。
 struct FollowRuntime {
-    server: http::HttpServer,
     ledger: follow::Ledger,
     started_at: String,
     /// 累计跟单成功数
@@ -158,6 +165,11 @@ impl FollowRuntime {
 }
 
 impl Shared {
+    /// HTTP 服务监听地址（空串表示没监听）
+    fn http_addr(&self) -> String {
+        self.http_addr.lock().unwrap().clone()
+    }
+
     /// 把跟单三要素（在跑吗、跟了几笔、监听在哪）填进响应
     ///
     /// 抽出来是因为**五条路径**都要如实回答同一件事：ping、status、
@@ -170,7 +182,7 @@ impl Shared {
             Some(rt) => {
                 r.follow_running = Some(true);
                 r.follow_count = Some(rt.ok_count);
-                r.follow_addr = Some(rt.server.addr().to_string());
+                r.follow_addr = Some(self.http_addr());
             }
             None => {
                 r.follow_running = Some(false);
@@ -270,7 +282,27 @@ pub fn serve(cfg: CoreConfig) -> std::io::Result<()> {
         base: cfg,
         guard: Mutex::new(guard),
         follow: Mutex::new(None),
+        http_addr: Mutex::new(String::new()),
     });
+
+    // HTTP 服务从这里就起来，不等到「开始跟单」。
+    //
+    // 界面要靠它测接口：查询、下单都得能随时走 HTTP。跟单开关只决定
+    // 「信号进来了要不要真下单」，信号服务本身一直在。
+    // 起不来（没配 Token 或端口被占）不算致命 —— 本地 socket 仍然可用，
+    // 只是界面上的 HTTP 通道会如实报未监听。
+    let _http = match start_http(&shared) {
+        Ok(srv) => {
+            let addr = srv.addr().to_string();
+            *shared.http_addr.lock().unwrap() = addr.clone();
+            eprintln!("HTTP 接口已监听 {addr}");
+            Some(srv)
+        }
+        Err(e) => {
+            eprintln!("HTTP 接口未启动: {e}");
+            None
+        }
+    };
 
     eprintln!("中信自动化核心已就绪，socket: {}", path.display());
 
@@ -285,6 +317,132 @@ pub fn serve(cfg: CoreConfig) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// 组装并启动 HTTP 服务
+///
+/// 三个回调共用同一个内核状态：信号走 `handle_signal`，读接口走 `do_query`，
+/// 其余动作投到 `dispatch`。**不能为 HTTP 另写一套下单/撤单实现** —— 两套
+/// 实现早晚会不一致，而这里动的是真钱。
+fn start_http(shared: &Arc<Shared>) -> Result<http::HttpServer, String> {
+    let cfg = shared.cfg();
+    let app = config::AppConfig::load(std::path::Path::new(&cfg.config_path));
+    let token = app.http_api_token.trim().to_string();
+
+    // 三个回调各自持一份 Arc。HTTP 服务活到进程结束，Arc 也就跟着活到那时，
+    // 不存在悬垂借用，也不需要用 unsafe 把生命周期硬掰成 'static。
+    let s_signal = Arc::clone(shared);
+    let s_query = Arc::clone(shared);
+    let s_rpc = Arc::clone(shared);
+
+    let signal: http::SignalHandler =
+        std::sync::Arc::new(move |acct: Option<&str>, v: &serde_json::Value| {
+            handle_signal(v, acct, &s_signal)
+        });
+
+    let query: http::QueryHandler = std::sync::Arc::new(move |acct: Option<&str>, kind: &str| {
+        let k = if kind == "account" { "funds" } else { kind };
+        let req = Request {
+            id: 0,
+            op: "query".into(),
+            password: None,
+            code: None,
+            direction: None,
+            amount: None,
+            price: None,
+            kind: Some(k.to_string()),
+            action: None,
+            // 调用方在 URL 里指定了账户就用它（/credit/positions）。
+            // 老路径 /positions 明确默认普通账户 —— 不能用 follow_account，
+            // 那是下单用的配置，查询跟着它变会让人莫名其妙拿到另一个账户的持仓。
+            account: Some(acct.unwrap_or("normal").to_string()),
+            order_no: None,
+        };
+        let r = do_query(&req, &s_query);
+        if r.ok {
+            let mut m = serde_json::Map::new();
+            if let Some(rows) = r.rows {
+                m.insert("rows".into(), serde_json::Value::Array(rows));
+            }
+            if let Some(t) = r.total {
+                m.insert("total".into(), serde_json::Value::from(t));
+            }
+            if let Some(d) = r.detail {
+                m.insert("detail".into(), serde_json::Value::String(d));
+            }
+            Ok(serde_json::Value::Object(m))
+        } else {
+            Err(r.error.unwrap_or_else(|| "查询失败".into()))
+        }
+    });
+
+    // 通用投递：把 HTTP 的 JSON 体摊到内核的 Request 上，执行同一个 dispatch。
+    let rpc: http::RpcHandler = std::sync::Arc::new(
+        move |acct: Option<&str>, op: &str, body: &serde_json::Value| {
+            let text = |k: &str| -> Option<String> {
+                body.get(k)
+                    .and_then(|x| x.as_str())
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+            };
+            // 方向：既接受数字（1/2，-1 也当卖出，跟信号归一化一致），
+            // 也接受 "buy"/"sell" 字符串 —— 手写 curl 时后者更好记。
+            let direction = match body.get("direction") {
+                Some(serde_json::Value::Number(n)) => n.as_i64().map(|x| x as i32),
+                Some(serde_json::Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                    "buy" | "买入" => Some(1),
+                    "sell" | "卖出" => Some(2),
+                    _ => None,
+                },
+                _ => match text("action").as_deref() {
+                    Some("buy") | Some("买入") => Some(1),
+                    Some("sell") | Some("卖出") => Some(2),
+                    _ => None,
+                },
+            };
+
+            let req = Request {
+                id: 0,
+                op: op.to_string(),
+                password: text("password"),
+                code: text("code"),
+                direction,
+                // 数量允许字符串，curl 里写 "amount": 100 或 "100" 都行
+                amount: match body.get("amount") {
+                    Some(serde_json::Value::Number(n)) => n.as_i64(),
+                    Some(serde_json::Value::String(s)) => s.trim().parse().ok(),
+                    _ => None,
+                },
+                price: match body.get("price") {
+                    Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+                    Some(serde_json::Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                },
+                kind: text("kind"),
+                // 撤单：{"dry_run":true} 也是合法的干跑写法，统一收进 action。
+                action: if body.get("dry_run").and_then(|x| x.as_bool()) == Some(true) {
+                    Some("dry_run".into())
+                } else {
+                    text("action").filter(|a| a == "dry_run" || a == "submit")
+                },
+                account: Some(acct.unwrap_or("normal").to_string()),
+                order_no: text("order_no"),
+            };
+
+            let r = dispatch(&req, &s_rpc);
+            let status = if r.ok {
+                200
+            } else {
+                match r.state.as_deref() {
+                    Some("wrong_state") | Some("failed") => 409,
+                    _ => 400,
+                }
+            };
+            (status, serde_json::to_value(&r).unwrap_or_else(|_| serde_json::json!({})))
+        },
+    );
+
+    http::HttpServer::start(&app.http_host, app.http_port, &token, signal, query, rpc)
 }
 
 /// 装一个简易的退出清理
@@ -490,7 +648,11 @@ fn do_cancel(req: &Request, shared: &Shared) -> Response {
     }
 }
 
-/// 启动跟单：拉起 HTTP 信号服务
+/// 启动跟单：只开闸门，不再负责拉起 HTTP 服务
+///
+/// HTTP 服务从内核启动起就在监听（见 `serve`），跟单开关只决定「信号来了要不要
+/// 真下单」。这样拆分是因为界面要拿它测 HTTP 接口 —— 如果查询必须先把实盘信号
+/// 通道武装起来才能测，那测一次就要担一次真下单的风险，没人愿意点。
 fn do_follow_start(req: &Request, shared: &Shared) -> Response {
     let cfg = shared.cfg();
     let app = config::AppConfig::load(std::path::Path::new(&cfg.config_path));
@@ -503,6 +665,16 @@ fn do_follow_start(req: &Request, shared: &Shared) -> Response {
         );
     }
 
+    // HTTP 没起来（端口被占、或本机还没配好）时不能假装开启跟单：
+    // 那样状态灯显示「跟单中」，信号却根本进不来。
+    let addr = shared.http_addr();
+    if addr.is_empty() {
+        return Response::err(
+            req.id,
+            "HTTP 服务未监听（端口可能被占用），跟单开了也收不到信号",
+        );
+    }
+
     let mut slot = shared.follow.lock().unwrap();
     if let Some(rt) = slot.as_ref() {
         let mut r = Response::ok(req.id);
@@ -510,95 +682,43 @@ fn do_follow_start(req: &Request, shared: &Shared) -> Response {
         // 重复点「开始跟单」不该让状态灯闪一下变回 idle —— 这里如实回填。
         r.follow_running = Some(true);
         r.follow_count = Some(rt.ok_count);
-        r.follow_addr = Some(rt.server.addr().to_string());
+        r.follow_addr = Some(addr);
         return r;
     }
 
-    // 信号处理回调：完整走一遍 归一化 → 过滤 → 判重 → 下单 → 记账
-    let shared2 = unsafe { std::mem::transmute::<&Shared, &'static Shared>(shared) };
-    let signal: http::SignalHandler =
-        std::sync::Arc::new(move |acct: Option<&str>, v: &serde_json::Value| {
-            handle_signal(v, acct, shared2)
-        });
-
-    // 查询回调：复用现有 query 逻辑
-    let shared3 = unsafe { std::mem::transmute::<&Shared, &'static Shared>(shared) };
-    let query: http::QueryHandler = std::sync::Arc::new(move |acct: Option<&str>, kind: &str| {
-        let k = if kind == "account" { "funds" } else { kind };
-        let req = Request {
-            id: 0,
-            op: "query".into(),
-            password: None,
-            code: None,
-            direction: None,
-            amount: None,
-            price: None,
-            kind: Some(k.to_string()),
-            action: None,
-            // 调用方在 URL 里指定了账户就用它（/credit/positions）。
-            // 老路径 /positions 明确默认普通账户 —— 不能用 follow_account，
-            // 那是下单用的配置，查询跟着它变会让人莫名其妙拿到另一个账户的持仓。
-            account: Some(acct.unwrap_or("normal").to_string()),
-            order_no: None,
-        };
-        let r = do_query(&req, shared3);
-        if r.ok {
-            let mut m = serde_json::Map::new();
-            if let Some(rows) = r.rows {
-                m.insert("rows".into(), serde_json::Value::Array(rows));
-            }
-            if let Some(t) = r.total {
-                m.insert("total".into(), serde_json::Value::from(t));
-            }
-            if let Some(d) = r.detail {
-                m.insert("detail".into(), serde_json::Value::String(d));
-            }
-            Ok(serde_json::Value::Object(m))
+    let lan = !matches!(app.http_host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    *slot = Some(FollowRuntime {
+        ledger: follow::Ledger::load(),
+        started_at: now_str(),
+        ok_count: 0,
+        last_note: if lan {
+            format!("HTTP 已绑定 {addr}（局域网可访问）")
         } else {
-            Err(r.error.unwrap_or_else(|| "查询失败".into()))
-        }
+            format!("HTTP 已监听 {addr}")
+        },
     });
-
-    match http::HttpServer::start(&app.http_host, app.http_port, &token, signal, query) {
-        Ok(server) => {
-            let addr = server.addr().to_string();
-            let lan = !matches!(app.http_host.as_str(), "127.0.0.1" | "localhost" | "::1");
-            *slot = Some(FollowRuntime {
-                server,
-                ledger: follow::Ledger::load(),
-                started_at: now_str(),
-                ok_count: 0,
-                last_note: if lan {
-                    format!("HTTP 已绑定 {addr}（局域网可访问）")
-                } else {
-                    format!("HTTP 已监听 {addr}")
-                },
-            });
-            let mut r = Response::ok(req.id);
-            r.detail = Some(format!("跟单已启动，HTTP 信号服务监听 {addr}"));
-            // 这里不能调 shared.fill_follow()：slot 的锁还在本函数手里，
-            // 再 lock 一次就是自己等自己。刚启动必然 0 笔。
-            r.follow_running = Some(true);
-            r.follow_count = Some(0);
-            r.follow_addr = Some(addr);
-            r
-        }
-        Err(e) => Response::err(req.id, format!("启动失败: {e}")),
-    }
+    let mut r = Response::ok(req.id);
+    r.detail = Some(format!("跟单已启动，信号从这里进来：{addr}"));
+    // 这里不能调 shared.fill_follow()：slot 的锁还在本函数手里，
+    // 再 lock 一次就是自己等自己。刚启动必然 0 笔。
+    r.follow_running = Some(true);
+    r.follow_count = Some(0);
+    r.follow_addr = Some(addr);
+    r
 }
 
-/// 停止跟单：必须真的把监听关掉
+/// 停止跟单：只关闸门，HTTP 端口照常监听
+///
+/// 信号仍能打进来，但会被丢弃并回 `not_running` —— 界面要测接口时端口得一直在。
 fn do_follow_stop(req: &Request, shared: &Shared) -> Response {
     let mut slot = shared.follow.lock().unwrap();
     match slot.take() {
-        Some(mut rt) => {
-            rt.server.stop();
+        Some(rt) => {
             let mut r = Response::ok(req.id);
             r.detail = Some(format!(
-                "跟单已停止，端口已释放；本次共成交 {} 单",
+                "跟单已停止，信号将丢弃；本次共成交 {} 单",
                 rt.ok_count
             ));
-            // 端口确实关了，状态灯必须立刻转 idle，否则用户以为还在跑。
             // 笔数归零：那是「本次运行」的计数，停了就没有本次了；
             // 历史成交在台账里，想看得走 follow_status 的 detail。
             r.follow_running = Some(false);
@@ -617,6 +737,7 @@ fn do_follow_stop(req: &Request, shared: &Shared) -> Response {
 
 /// 跟单状态
 fn do_follow_status(req: &Request, shared: &Shared) -> Response {
+    let addr = shared.http_addr();
     let mut slot = shared.follow.lock().unwrap();
     let mut r = Response::ok(req.id);
     match slot.as_mut() {
@@ -624,22 +745,26 @@ fn do_follow_status(req: &Request, shared: &Shared) -> Response {
             r.state = Some("running".into());
             r.detail = Some(format!(
                 "监听 {}，启动于 {}，已跟单 {} 笔；最近：{}",
-                rt.server.addr(),
-                rt.started_at,
-                rt.ok_count,
-                rt.last_note
+                addr, rt.started_at, rt.ok_count, rt.last_note
             ));
             r.total = Some(rt.ok_count as usize);
             r.follow_running = Some(true);
             r.follow_count = Some(rt.ok_count);
-            r.follow_addr = Some(rt.server.addr().to_string());
+            r.follow_addr = Some(addr);
         }
         None => {
             r.state = Some("idle".into());
-            r.detail = Some("跟单未启动".into());
+            r.detail = Some(if addr.is_empty() {
+                "跟单未启动（HTTP 服务也没起来）".into()
+            } else {
+                format!("跟单未启动；HTTP 在 {addr} 监听，信号会被丢弃")
+            });
             r.total = Some(0);
             r.follow_running = Some(false);
             r.follow_count = Some(0);
+            if !addr.is_empty() {
+                r.follow_addr = Some(addr);
+            }
         }
     }
     r

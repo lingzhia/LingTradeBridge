@@ -14,6 +14,17 @@
 //!   GET  /normal/positions|orders|deals|account
 //!   GET  /credit/positions|orders|deals|account
 //!
+//! 其余动作统一走「通用投递」这一条通道（见 [`RpcHandler`]）：
+//!
+//!   POST /normal/cancel   {"code":"600000"}      撤单（可加 "dry_run":true 只看看）
+//!   POST /normal/order    {"code":"600000","price":"10.5","amount":100}
+//!   GET  /normal/cancel_list                     当前可撤委托
+//!   GET  /status | /raw_ocr | /lock_probe        状态 / 原始 OCR / 解锁探针
+//!   POST /unlock          {"password":"..."}     手动解锁
+//!   POST /reset_unlock                           重置解锁熔断
+//!   POST /follow_start | /follow_stop            开/关跟单闸门
+//!   GET  /follow_status                          跟单状态
+//!
 //!   信用账户独有、尚未实现的接口（明确返回未实现，不是 404）：
 //!   POST /credit/margin_buy|short_sell|repay_cash|repay_stock|buy_to_repay|return_stock
 //!
@@ -50,6 +61,23 @@ pub type SignalHandler = Arc<
 pub type QueryHandler =
     Arc<dyn Fn(Option<&str>, &str) -> Result<serde_json::Value, String> + Send + Sync>;
 
+/// 通用投递回调：(账户, 动作, 请求体) -> (HTTP 状态码, 响应体)
+///
+/// 为什么留这么一条「什么都能投」的口子：能测的东西必须齐全。查询和信号
+/// 是两套有名字的 REST 路径，但界面还要测撤单、解锁、原始 OCR、跟单开关 ——
+/// 每加一个就手写一条路由，核心很快就变成一张谁都不敢动的路由表。
+/// 这里把「有明确 REST 语义的动作」写成上面的固定路径，其余统一投到
+/// 内核已有的 dispatch 上：一条协议、一份实现，不会出现两套行为不一致。
+///
+/// 动作名与本地 socket 的 op 完全一致（`cancel_list`、`unlock`、
+/// `follow_start`……），这样同一个 bug 在两套通道里表现相同。
+pub type RpcHandler = Arc<
+    dyn Fn(Option<&str>, &str, &serde_json::Value) -> (u16, serde_json::Value) + Send + Sync,
+>;
+
+/// 有明确 REST 语义、走 `query` 回调的读接口
+const QUERY_ACTIONS: &[&str] = &["positions", "orders", "deals", "account"];
+
 pub struct HttpServer {
     stop: Arc<AtomicBool>,
     addr: String,
@@ -64,6 +92,7 @@ impl HttpServer {
         token: &str,
         signal: SignalHandler,
         query: QueryHandler,
+        rpc: RpcHandler,
     ) -> Result<Self, String> {
         if token.trim().is_empty() {
             return Err("HTTP 信号服务必须配置 Token，否则拒绝启动".into());
@@ -89,10 +118,11 @@ impl HttpServer {
                     Ok((stream, _)) => {
                         let signal = signal.clone();
                         let query = query.clone();
+                        let rpc = rpc.clone();
                         let token = token.clone();
                         // 每个连接一个线程：信号是低频的，不需要线程池
                         thread::spawn(move || {
-                            let _ = handle_conn(stream, &token, &signal, &query);
+                            let _ = handle_conn(stream, &token, &signal, &query, &rpc);
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -179,6 +209,7 @@ fn handle_conn(
     token: &str,
     signal: &SignalHandler,
     query: &QueryHandler,
+    rpc: &RpcHandler,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
@@ -209,6 +240,12 @@ fn handle_conn(
                 "POST /credit/margin_buy", "POST /credit/short_sell",
                 "POST /credit/repay_cash", "POST /credit/repay_stock",
                 "POST /credit/buy_to_repay", "POST /credit/return_stock",
+                "POST /{ns}/order", "POST /{ns}/cancel",
+                "GET /{ns}/cancel_list",
+                "GET /status", "GET /follow_status",
+                "GET /raw_ocr", "GET /lock_probe",
+                "POST /unlock", "POST /reset_unlock",
+                "POST /follow_start", "POST /follow_stop",
             ],
             "legacy": ["POST /signal",
                        "GET /account", "GET /positions",
@@ -261,7 +298,9 @@ fn handle_conn(
         return respond(&mut stream, 200, &out);
     }
 
-    if req.method == "GET" {
+    // 读接口：持仓 / 委托 / 成交 / 资金。这四个是只读查询里最常用的，
+    // 单独走 query 回调，路径和同花顺版一致，已有策略代码不用改。
+    if req.method == "GET" && QUERY_ACTIONS.contains(&action) {
         match query(ns, action) {
             Ok(v) => {
                 let mut body = serde_json::json!({"ok": true, "account": ns.unwrap_or("normal")});
@@ -281,8 +320,73 @@ fn handle_conn(
         }
     }
 
+    // 其余动作统一投到内核 dispatch，见 [`RpcHandler`] 的说明
+    if let Some(op) = rpc_op(action) {
+        let method_ok = match req.method.as_str() {
+            "POST" => RPC_POST.contains(&action),
+            "GET" => RPC_GET.contains(&action),
+            _ => false,
+        };
+        if !method_ok {
+            return respond(&mut stream, 404, &serde_json::json!({
+                // req.path 自带前导斜杠，别再补一个，否则报错里出现 //normal/order
+            "ok": false, "error": format!("not_found：{} {}", req.method, req.path)
+            }));
+        }
+        let body: serde_json::Value = if req.body.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            match serde_json::from_str(&req.body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return respond(&mut stream, 400, &serde_json::json!({
+                        "ok": false, "error": format!("JSON 解析失败: {e}")
+                    }))
+                }
+            }
+        };
+        let (status, out) = rpc(ns, op, &body);
+        return respond(&mut stream, status, &out);
+    }
+
     respond(&mut stream, 404, &serde_json::json!({"ok": false, "error": "not_found"}))
 }
+
+/// 动作名 → 内核 dispatch 的 op 名
+///
+/// 绝大多数同名（`cancel_list`、`unlock`、`follow_start`……），只有下单是
+/// 例外：路径上希望写 `order`（`POST /normal/order` 更像 REST），内核那边
+/// 的 op 叫 `place_order` 且靠 `direction` 区分买卖。
+fn rpc_op(action: &str) -> Option<&'static str> {
+    match action {
+        "order" => Some("place_order"),
+        "cancel" => Some("cancel"),
+        "cancel_list" => Some("cancel_list"),
+        "status" => Some("status"),
+        "ping" => Some("ping"),
+        "unlock" => Some("unlock"),
+        "reset_unlock" => Some("reset_unlock"),
+        "raw_ocr" => Some("raw_ocr"),
+        "lock_probe" => Some("lock_probe"),
+        "follow_start" => Some("follow_start"),
+        "follow_stop" => Some("follow_stop"),
+        "follow_status" => Some("follow_status"),
+        _ => None,
+    }
+}
+
+/// 只接受 POST 的动作（会动钱或改状态）
+const RPC_POST: &[&str] = &[
+    "order",
+    "cancel",
+    "unlock",
+    "reset_unlock",
+    "follow_start",
+    "follow_stop",
+];
+
+/// 只接受 GET 的动作（纯读取）
+const RPC_GET: &[&str] = &["cancel_list", "status", "ping", "raw_ocr", "lock_probe", "follow_status"];
 
 /// 读一个 HTTP 请求。只支持 HTTP/1.1 + Content-Length，够用。
 fn read_request(stream: &mut TcpStream) -> Option<Request> {
@@ -346,6 +450,7 @@ fn respond(stream: &mut TcpStream, status: u16, body: &serde_json::Value) -> std
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        501 => "Not Implemented",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
@@ -377,6 +482,30 @@ mod tests {
         // 名字里含 credit 但不是命名空间，不能被误拆
         assert_eq!(parse_path("/creditreport"), (None, "creditreport"));
         assert_eq!(parse_path("/credit/"), (None, "credit/"));
+    }
+
+    #[test]
+    fn 通用投递的动作表对得上() {
+        // 下单在路径上叫 order，内核里叫 place_order
+        assert_eq!(rpc_op("order"), Some("place_order"));
+        assert_eq!(rpc_op("cancel_list"), Some("cancel_list"));
+        assert_eq!(rpc_op("follow_start"), Some("follow_start"));
+        // 查询动作走 query 回调，不该再被投一遍
+        assert_eq!(rpc_op("positions"), None);
+        assert_eq!(rpc_op("signal"), None);
+        assert_eq!(rpc_op("乱写的"), None);
+    }
+
+    #[test]
+    fn 会动钱的动作只允许_post() {
+        for a in ["order", "cancel", "unlock", "reset_unlock", "follow_start", "follow_stop"] {
+            assert!(RPC_POST.contains(&a), "{a} 应该只允许 POST");
+            assert!(!RPC_GET.contains(&a), "{a} 不该出现在 GET 表里");
+        }
+        for a in ["cancel_list", "status", "raw_ocr", "follow_status"] {
+            assert!(RPC_GET.contains(&a), "{a} 应该只允许 GET");
+            assert!(!RPC_POST.contains(&a), "{a} 不该出现在 POST 表里");
+        }
     }
 
     #[test]
