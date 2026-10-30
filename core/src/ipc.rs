@@ -365,12 +365,11 @@ fn start_http(shared: &Arc<Shared>) -> Result<http::HttpServer, String> {
     let s_query = Arc::clone(shared);
     let s_rpc = Arc::clone(shared);
 
-    let signal: http::SignalHandler =
-        std::sync::Arc::new(move |acct: Option<&str>, v: &serde_json::Value| {
-            handle_signal(v, acct, &s_signal)
-        });
+    let signal: http::SignalHandler = std::sync::Arc::new(move |acct: &str, v: &serde_json::Value| {
+        handle_signal(v, acct, &s_signal)
+    });
 
-    let query: http::QueryHandler = std::sync::Arc::new(move |acct: Option<&str>, kind: &str| {
+    let query: http::QueryHandler = std::sync::Arc::new(move |acct: &str, kind: &str| {
         let k = if kind == "account" { "funds" } else { kind };
         let req = Request {
             id: 0,
@@ -382,10 +381,10 @@ fn start_http(shared: &Arc<Shared>) -> Result<http::HttpServer, String> {
             price: None,
             kind: Some(k.to_string()),
             action: None,
-            // 调用方在 URL 里指定了账户就用它（/credit/positions）。
-            // 老路径 /positions 明确默认普通账户 —— 不能用 follow_account，
-            // 那是下单用的配置，查询跟着它变会让人莫名其妙拿到另一个账户的持仓。
-            account: Some(acct.unwrap_or("normal").to_string()),
+            // 账户来自 URL（/credit/positions），http.rs 已经挡住不带账户的路径。
+            // 绝不回落到 config 里的 follow_account —— 那是下单用的配置，
+            // 查询跟着它变会让人莫名其妙拿到另一个账户的持仓。
+            account: Some(acct.to_string()),
             order_no: None,
         };
         let r = do_query(&req, &s_query);
@@ -873,22 +872,19 @@ fn do_follow_records(req: &Request, shared: &Shared) -> Response {
     r
 }
 
-/// 决定这条信号在哪个账户上下单
+/// 把路径里的账户名翻译成账户
 ///
-/// 路径里指定了账户（`/credit/signal`）就以路径为准 —— 调用方写明了要用信用
-/// 账户，再去读配置里的 `follow_account` 就是跟调用方对着干。老路径 `/signal`
-/// 没有指定，才回落配置。
-fn resolve_signal_account(
-    account_override: Option<&str>,
-    app: &config::AppConfig,
-) -> Result<panel::Account, String> {
-    match account_override {
-        Some(s) if s.eq_ignore_ascii_case("normal") => Ok(panel::Account::Normal),
-        Some(s) if s.eq_ignore_ascii_case("credit") => Ok(panel::Account::Credit),
-        Some(other) => Err(format!(
-            "未知账户类型: {other}（只支持 normal / credit）"
-        )),
-        None => Ok(follow::follow_account(app)),
+/// 只有 `normal` / `credit` 两个合法值，写错就报错 —— **不回落配置**。
+/// 曾经有个不带账户的老路径 `/signal`，账户从配置的 `follow_account` 里取；
+/// 那个设计删掉了：同一份请求体，配置一改就悄悄打到另一个账户上，调用方
+/// 看不见、事后复盘也看不出来。现在账户只有一个来源，就是路径本身。
+fn resolve_signal_account(account: &str) -> Result<panel::Account, String> {
+    if account.eq_ignore_ascii_case("normal") {
+        Ok(panel::Account::Normal)
+    } else if account.eq_ignore_ascii_case("credit") {
+        Ok(panel::Account::Credit)
+    } else {
+        Err(format!("未知账户类型: {account}（只支持 normal / credit）"))
     }
 }
 
@@ -946,22 +942,17 @@ fn signal_record(
 
 /// 处理一条信号
 ///
-/// `account_override` 是 HTTP 路径里指定的账户（`/credit/signal`）；为 None 时
-/// 用配置里的 `follow_account`。指定账户意味着调用方明确要求在这套账户上下单，
-/// 与配置不符时**以调用方为准**，但会在响应里回显实际用的账户。
-fn handle_signal(
-    v: &serde_json::Value,
-    account_override: Option<&str>,
-    shared: &Shared,
-) -> serde_json::Value {
+/// `account` 来自 HTTP 路径（`/credit/signal` → `"credit"`），是唯一的账户来源。
+/// 响应里会回显实际用的账户，让调用方能对账。
+fn handle_signal(v: &serde_json::Value, account: &str, shared: &Shared) -> serde_json::Value {
     let cfg = shared.cfg();
     let app = config::AppConfig::load(std::path::Path::new(&cfg.config_path));
 
     // 0. 这条信号打算记到哪个账户名下。先算出来只为记账用 ——
     //    解析失败也不影响记录：记录本身不该因为账户写错就丢掉。
-    let acct_name = resolve_signal_account(account_override, &app)
+    let acct_name = resolve_signal_account(account)
         .map(|a| a.as_str().to_string())
-        .unwrap_or_else(|_| account_override.unwrap_or("unknown").to_string());
+        .unwrap_or_else(|_| account.to_string());
 
     // 1. 归一化
     let order = match follow::signal_to_order(v, &app) {
@@ -1056,7 +1047,7 @@ fn handle_signal(
         return serde_json::json!({"ok": false, "status": "error", "reason": e});
     }
 
-    let account = match resolve_signal_account(account_override, &app) {
+    let account = match resolve_signal_account(account) {
         Ok(a) => a,
         Err(e) => {
             shared.ledger.lock().unwrap().unmark(&order.uid);
@@ -1969,34 +1960,24 @@ mod tests {
     }
 
     #[test]
-    fn 信号账户路径优先于配置() {
-        let mut app = config::AppConfig::default();
-        app.follow_account = "normal".into();
-        // 路径指定了账户就以路径为准，不能读配置
+    fn 账户只认路径里写的值() {
         assert_eq!(
-            resolve_signal_account(Some("credit"), &app),
+            resolve_signal_account("credit"),
+            Ok(panel::Account::Credit)
+        );
+        // 大小写不敏感：URL 里的人不会都写对
+        assert_eq!(
+            resolve_signal_account("CREDIT"),
             Ok(panel::Account::Credit)
         );
         assert_eq!(
-            resolve_signal_account(Some("CREDIT"), &app),
-            Ok(panel::Account::Credit)
-        );
-        assert_eq!(
-            resolve_signal_account(Some("normal"), &app),
+            resolve_signal_account("normal"),
             Ok(panel::Account::Normal)
         );
-        // 没指定才回落配置
-        assert_eq!(
-            resolve_signal_account(None, &app),
-            Ok(panel::Account::Normal)
-        );
-        app.follow_account = "credit".into();
-        assert_eq!(
-            resolve_signal_account(None, &app),
-            Ok(panel::Account::Credit)
-        );
-        // 拼错的账户必须报错，绝不能悄悄掉回配置里的账户
-        assert!(resolve_signal_account(Some("margin"), &app).is_err());
+        // 拼错的账户必须报错。曾经这里会回落配置里的 follow_account ——
+        // 那意味着一份写错账户的请求会悄悄在另一个账户上成交。
+        assert!(resolve_signal_account("margin").is_err());
+        assert!(resolve_signal_account("").is_err());
     }
 
     #[test]

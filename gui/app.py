@@ -147,7 +147,11 @@ class CoreClient:
 # 验证的 HTTP 接口。更要紧的是：内核没起来、或 Token 没配时 HTTP 本来就
 # 不可用，用 HTTP 探活会把「内核好好跑着、只是 HTTP 没绑上」误判成
 # 「内核没跑」，进而拉起第二个内核把 socket 顶掉。
-LOCAL_ONLY_OPS = {"ping", "shutdown"}
+# 跟单开关（follow_start / follow_stop）也在这一组：它是唯一的真下单闸门，
+# 内核刻意不允许 HTTP 开闸（否则远程调用者能自己拉开，闸门就没意义了）。
+# 界面切到 HTTP 通道时，这两个按钮仍然走 socket —— 在这里被拦一次报错
+# 对谁都没好处，闸门本来就是给本机的人用的。
+LOCAL_ONLY_OPS = {"ping", "shutdown", "follow_start", "follow_stop"}
 
 
 class HttpClient:
@@ -223,10 +227,8 @@ class HttpClient:
             return "POST", "/unlock", {"password": kw.get("password")}
         if op == "reset_unlock":
             return "POST", "/reset_unlock", None
-        if op == "follow_start":
-            return "POST", "/follow_start", None
-        if op == "follow_stop":
-            return "POST", "/follow_stop", None
+        # follow_start / follow_stop 不在这里：内核不允许 HTTP 开关闸门，
+        # 见 LOCAL_ONLY_OPS。
         if op == "follow_status":
             return "GET", "/follow_status", None
         if op == "follow_records":
@@ -674,8 +676,9 @@ class App:
         ttk.Label(
             fol,
             text="HTTP 服务随内核启动就在监听，查询随时可用；"
-                 "「开始跟单」决定外部信号要不要真下单，也决定接口上的真下单"
-                 "（POST /normal/order）放不放行。干跑（dry_run）不受闸门影响。",
+                 "「开始跟单」是唯一的真下单开关：开着才真的调动客户端下单，"
+                 "关着时信号只记账、接口来的下单/撤单直接回模拟响应、界面一点不动。"
+                 "这个开关只能在本机开关，HTTP 打不动它。",
             foreground="#555555", wraplength=470, justify="left",
         ).pack(anchor="w", padx=8, pady=(6, 2))
 
@@ -728,12 +731,9 @@ class App:
 
         r3 = ttk.Frame(fol)
         r3.pack(fill="x", padx=8, pady=2)
-        ttk.Label(r3, text="账户").pack(side="left")
-        self.follow_account_var = tk.StringVar(
-            value=self.cfg.get("follow_account", "normal"))
-        ttk.Combobox(r3, textvariable=self.follow_account_var, width=8,
-                     state="readonly",
-                     values=["normal", "credit"]).pack(side="left", padx=(4, 8))
+        # 这里原本有个「账户」下拉，配置 follow_account，给老路径 /signal 用。
+        # 老路径删掉了（账户必须写在 URL 里），内核也不再读这个字段 ——
+        # 留一个改了点用没有的下拉比没有更糟，去掉了。
         self.ignore_buy_var = tk.BooleanVar(
             value=bool(self.cfg.get("ignore_buy", False)))
         ttk.Checkbutton(r3, text="忽略买入",
@@ -1107,8 +1107,7 @@ class App:
             extra = f" · 已记 {skipped} 条未下单" if skipped else ""
             self.follow_var.set(f"跟单：未启动（信号只记录不下单）{extra}")
             self.follow_var2.set(
-                f"未启动 —— HTTP 在监听，信号会记录但不会下单，"
-                f"接口上的真下单也被拒{extra}")
+                f"未启动 —— HTTP 在监听，信号只记账；下单/撤单直接回模拟响应{extra}")
             self.follow_label.configure(fg="#666")
             self.follow_label2.configure(fg="#666")
 
@@ -1251,7 +1250,6 @@ class App:
             cfg["buy_price_max"] = float(self.buy_max_var.get() or 0)
         except ValueError:
             cfg["buy_price_max"] = 0.0
-        cfg["follow_account"] = self.follow_account_var.get()
         cfg["ignore_buy"] = bool(self.ignore_buy_var.get())
         cfg["ignore_sell"] = bool(self.ignore_sell_var.get())
         cfg["allow_reorder"] = bool(self.allow_reorder_var.get())
@@ -1576,17 +1574,16 @@ class App:
                       action="dry_run" if dry else None, timeout=180)
             # 真委托恒走本地 socket，不跟着「接口通道」切。
             #
-            # 内核那边有一道闸门：HTTP 渠道的真下单要求跟单开着。用界面下单
-            # 时人并没有开跟单，走 HTTP 只会撞上这道闸门 —— 而且更重要的是，
-            # 这条路上有二次确认框，确认的是「人要点这一单」；把真钱委托
-            # 交给一条可被外部程序复用的接口路径，风险和收益不成比例。
+            # 这条路上有二次确认框，确认的是「人要点这一单」；把真钱委托交给
+            # 一条可被外部程序复用的接口路径，风险和收益不成比例。而且真下单
+            # 本来还要跟单开关开着（内核那道闸门），走 HTTP 只会多绕一圈。
             #
             # 干跑照旧走当前通道：它不花钱，而「HTTP 能不能下单」正是要验证的事。
             if dry:
                 r = self.call(op, **kw)
             else:
                 if self._channel() == "HTTP":
-                    self.log("真实委托改走本地 socket（HTTP 渠道的真下单需要跟单开启）", "WARN")
+                    self.log("真实委托改走本地 socket（界面上的真委托不走 HTTP 通道）", "WARN")
                 r = self.sock.call(op, **kw)
             self.root.after(0, lambda: self._after_place(r))
         threading.Thread(target=work, daemon=True).start()

@@ -15,10 +15,11 @@
 //!   GET  /normal/positions|orders|deals|account
 //!   GET  /credit/positions|orders|deals|account
 //!
-//! 所有「真下单」动作都受同一个开关管：界面上的「开始/停止跟单」
-//! （`POST /follow_start|/follow_stop`）。这个开关关着时**什么都不做**，
-//! 校验完参数直接回成功响应，`placed: false` + 「（模拟下单，未真正下单）」
-//! 说明这单没真下，客户端界面也不会被动过。
+//! 所有「真下单」动作都受同一个开关管：界面上的「开始/停止跟单」。
+//! **这个开关只能在本机开关，HTTP 打不动它**（见下面第二条）。
+//! 开关关着时动作**什么都不做**：校验完参数直接回成功响应，
+//! `placed: false` + 「（模拟下单，未真正下单）」说明这单没真下，
+//! 客户端界面也不会被动过。
 //! 对接口使用者来说是无感的：参数错没错、接口通不通，关着开关一样能验证。
 //!
 //! 其余动作统一走「通用投递」这一条通道（见 [`RpcHandler`]）：
@@ -29,14 +30,23 @@
 //!   GET  /status | /raw_ocr | /lock_probe        状态 / 原始 OCR / 解锁探针
 //!   POST /unlock          {"password":"..."}     手动解锁
 //!   POST /reset_unlock                           重置解锁熔断
-//!   POST /follow_start | /follow_stop            开/关跟单闸门
-//!   GET  /follow_status                          跟单状态
+//!   GET  /follow_status                          跟单状态（只读）
+//!   GET  /follow_records                         信号台账（只读）
 //!
 //!   信用账户独有、尚未实现的接口（明确返回未实现，不是 404）：
 //!   POST /credit/margin_buy|short_sell|repay_cash|repay_stock|buy_to_repay|return_stock
 //!
-//! 兼容老路径 `/signal`、`/positions` 等（同花顺版的策略推送代码不用改）：
-//! 账户取配置里的 `follow_account`，查询默认普通账户。
+//! # 两条刻意不提供的能力
+//!
+//! **一、没有不带账户的老路径。** `/signal`、`/positions`、`/orders`、
+//! `/deals`、`/account` 曾经可用，账户从配置的 `follow_account` 里取。
+//! 删掉了：同一份请求体，配置文件一改就悄悄打到另一个账户上，调用方看不见，
+//! 事后复盘也看不出来当时打的是哪个账户。现在账户只能写进路径。
+//!
+//! **二、HTTP 不能开/关跟单闸门。** 闸门就是「真下单」的唯一开关，
+//! 如果远程调用者能自己拉开，那它对远程调用者就一点约束力都没有 ——
+//! 一个能被被保护方自己打开的保护不叫保护。开/关只走本机 socket。
+//! 想用 HTTP 触发真下单，得先在本机界面（或本地 socket）上把闸门打开。
 //!
 //! 只用 `std::net` 手写 HTTP，不引第三方 web 框架 —— 这个服务只需要处理
 //! 单机、单客户端、低频的 JSON 推送，为一个最小实现拉进 axum/hyper 一整套
@@ -53,20 +63,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-/// 信号处理回调：(指定账户, 信号 JSON) -> 响应体
+/// 信号处理回调：(账户, 信号 JSON) -> 响应体
 ///
-/// 账户 `Some("normal"|"credit")` 表示调用方在 URL 里指定了用哪个账户；
-/// `None` 表示走老路径 `/signal`，由实现取配置里的 `follow_account`。
-pub type SignalHandler = Arc<
-    dyn Fn(Option<&str>, &serde_json::Value) -> serde_json::Value + Send + Sync,
->;
+/// 账户必然是 `"normal"` 或 `"credit"` —— 路径里写死的，没有"不指定"这种情况。
+/// 曾经有过一个不带账户的老路径 `/signal`，账户从配置文件里取；那个设计被删了：
+/// 同一份请求体，配置一改就打到另一个账户上，调用方看不见，事后也复盘不出来。
+pub type SignalHandler =
+    Arc<dyn Fn(&str, &serde_json::Value) -> serde_json::Value + Send + Sync>;
 
 /// 查询回调：(账户, 查询类型) -> 返回值
 ///
-/// 账户是 `Some("normal")` / `Some("credit")`；`None` 表示走老路径，由实现
-/// 决定用什么账户（当前是普通账户）。
+/// 账户同上，必然是 `"normal"` 或 `"credit"`。
 pub type QueryHandler =
-    Arc<dyn Fn(Option<&str>, &str) -> Result<serde_json::Value, String> + Send + Sync>;
+    Arc<dyn Fn(&str, &str) -> Result<serde_json::Value, String> + Send + Sync>;
 
 /// 通用投递回调：(账户, 动作, 请求体) -> (HTTP 状态码, 响应体)
 ///
@@ -188,7 +197,8 @@ const CREDIT_PENDING: &[&str] = &[
 /// 把路径拆成 (账户命名空间, 动作)
 ///
 /// `/credit/positions` → `(Some("credit"), "positions")`
-/// `/positions`        → `(None, "positions")`（老路径，账户由实现决定）
+/// `/follow_status`    → `(None, "follow_status")`（全局接口，不分账户）
+/// `/positions`        → `(None, "positions")`（会被 [`account_scoped`] 拦成 404）
 /// `/`                 → `(None, "")`
 /// 只解 %XX，不处理 `+` —— 本接口的参数都是简单的标志位和数字，
 /// 犯不上为它引一个完整的 URL 解码依赖。
@@ -221,6 +231,15 @@ fn parse_path(path: &str) -> (Option<&'static str>, &str) {
         }
     }
     (None, rest)
+}
+
+/// 这个动作是不是「必须挂在某个账户下」
+///
+/// 拆成函数是为了让「哪些接口需要账户」这件事有个唯一出处 —— 散在
+/// 三个 if 分支里，将来加接口时漏一个，那条路径就又能从配置里偷账户了。
+fn account_scoped(action: &str) -> bool {
+    QUERY_ACTIONS.contains(&action)
+        || matches!(action, "signal" | "order" | "cancel" | "cancel_list")
 }
 
 /// 一个请求的解析结果
@@ -281,11 +300,13 @@ fn handle_conn(
                 "GET /raw_ocr", "GET /lock_probe",
                 "GET /follow_records",
                 "POST /unlock", "POST /reset_unlock",
-                "POST /follow_start", "POST /follow_stop",
             ],
-            "legacy": ["POST /signal",
-                       "GET /account", "GET /positions",
-                       "GET /orders", "GET /deals"]
+            // 这两件事不是"还没做"，是"刻意不做"：账户必须写在路径里，
+            // 闸门只能在本机开关。列出来是为了让调用方看见边界在哪。
+            "not_supported": {
+                "no_account_in_path": "不带账户的老路径 /signal、/positions 等已移除",
+                "gate_control": "POST /follow_start、/follow_stop 只能走本地 socket",
+            },
         }));
     }
 
@@ -301,8 +322,25 @@ fn handle_conn(
     }
 
     // 拆路径：/credit/positions → (Some("credit"), "positions")
-    // 老路径 /positions 没有前缀，账户给 None，由实现决定。
     let (ns, action) = parse_path(&req.path);
+
+    // 曾经 /positions、/signal 这类不带账户的路径是可用的，账户从配置
+    // `follow_account` 里取 —— 删掉了。理由见文件头「两条刻意不提供的能力」：
+    // 同一份请求体，配置一改就悄悄打到另一个账户，调用方看不见、事后复盘不出来。
+    //
+    // 这里回 404 而不是兜回普通账户：静默兜底正是那个设计最坑人的地方。
+    // 只拦「本来属于某个账户」的动作；/status、/unlock 这些全局接口不受影响。
+    let needs_account = account_scoped(&action);
+    if needs_account && ns.is_none() {
+        return respond(&mut stream, 404, &serde_json::json!({
+            "ok": false,
+            "error": format!(
+                "路径缺少账户：/{} —— 应为 /normal/{} 或 /credit/{}",
+                action, action, action
+            ),
+            "hint": "账户必须写在路径里，不再从配置文件推断",
+        }));
+    }
 
     // 信用独有、尚未实现的动作。必须先于 dispatch 拦下来 —— 否则会被
     // 当成未知路径返回 404，调用方会以为是路径拼错了。
@@ -330,16 +368,17 @@ fn handle_conn(
                 "ok": false, "error": "信号必须是 JSON 对象"
             }));
         }
-        let out = signal(ns, &v);
+        let out = signal(ns.unwrap_or("normal"), &v);
         return respond(&mut stream, 200, &out);
     }
 
     // 读接口：持仓 / 委托 / 成交 / 资金。这四个是只读查询里最常用的，
     // 单独走 query 回调，路径和同花顺版一致，已有策略代码不用改。
     if req.method == "GET" && QUERY_ACTIONS.contains(&action) {
-        match query(ns, action) {
+        let acct = ns.unwrap_or("normal");
+        match query(acct, action) {
             Ok(v) => {
-                let mut body = serde_json::json!({"ok": true, "account": ns.unwrap_or("normal")});
+                let mut body = serde_json::json!({"ok": true, "account": acct});
                 if let (Some(dst), Some(src)) = (body.as_object_mut(), v.as_object()) {
                     for (k, val) in src {
                         dst.insert(k.clone(), val.clone());
@@ -354,6 +393,20 @@ fn handle_conn(
                 }));
             }
         }
+    }
+
+    // 闸门只能在本机开关。这里单独给一条明确的拒绝，而不是让它掉进
+    // 底下的 404 —— 调用方看到 404 会以为是路径拼错，去翻文档改拼写；
+    // 看到这句话才知道是自己没有权限，改拼写没有用。
+    if matches!(action, "follow_start" | "follow_stop") {
+        return respond(&mut stream, 403, &serde_json::json!({
+            "ok": false,
+            "error": format!(
+                "不允许通过 HTTP {} 跟单：这是唯一的真下单开关，\
+                 能被远程打开就不算开关了", action
+            ),
+            "hint": "在本机界面上点「开始/停止跟单」，或连本地 socket 调同一个 op",
+        }));
     }
 
     // 其余动作统一投到内核 dispatch，见 [`RpcHandler`] 的说明
@@ -422,8 +475,6 @@ fn rpc_op(action: &str) -> Option<&'static str> {
         "reset_unlock" => Some("reset_unlock"),
         "raw_ocr" => Some("raw_ocr"),
         "lock_probe" => Some("lock_probe"),
-        "follow_start" => Some("follow_start"),
-        "follow_stop" => Some("follow_stop"),
         "follow_status" => Some("follow_status"),
         "follow_records" => Some("follow_records"),
         _ => None,
@@ -431,14 +482,10 @@ fn rpc_op(action: &str) -> Option<&'static str> {
 }
 
 /// 只接受 POST 的动作（会动钱或改状态）
-const RPC_POST: &[&str] = &[
-    "order",
-    "cancel",
-    "unlock",
-    "reset_unlock",
-    "follow_start",
-    "follow_stop",
-];
+///
+/// 注意这里**没有** `follow_start` / `follow_stop`：闸门只能在本机开关，
+/// 见文件头「两条刻意不提供的能力」第二条。
+const RPC_POST: &[&str] = &["order", "cancel", "unlock", "reset_unlock"];
 
 /// 只接受 GET 的动作（纯读取）
 const RPC_GET: &[&str] = &[
@@ -512,6 +559,7 @@ fn respond(stream: &mut TcpStream, status: u16, body: &serde_json::Value) -> std
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         501 => "Not Implemented",
         503 => "Service Unavailable",
@@ -538,9 +586,8 @@ mod tests {
         assert_eq!(parse_path("/credit/positions"), (Some("credit"), "positions"));
         assert_eq!(parse_path("/normal/signal"), (Some("normal"), "signal"));
         assert_eq!(parse_path("/credit/margin_buy"), (Some("credit"), "margin_buy"));
-        // 老路径不带命名空间
-        assert_eq!(parse_path("/positions"), (None, "positions"));
-        assert_eq!(parse_path("/signal"), (None, "signal"));
+        // 全局接口不分账户
+        assert_eq!(parse_path("/follow_status"), (None, "follow_status"));
         assert_eq!(parse_path("/"), (None, ""));
         // 名字里含 credit 但不是命名空间，不能被误拆
         assert_eq!(parse_path("/creditreport"), (None, "creditreport"));
@@ -548,11 +595,41 @@ mod tests {
     }
 
     #[test]
+    fn 不带账户的路径会被拦下() {
+        // 这些动作本来属于某个账户，路径里没写账户就是错的。
+        // 曾经它们会静默取配置里的 follow_account —— 配置一改就打到
+        // 另一个账户上，调用方看不见，这条测试钉住"不再兜底"。
+        for a in ["signal", "order", "cancel", "cancel_list", "positions", "orders", "deals", "account"] {
+            let path = format!("/{a}");
+            let (ns, action) = parse_path(&path);
+            assert_eq!(ns, None);
+            assert_eq!(action, a);
+            assert!(account_scoped(action), "{a} 必须要求账户");
+        }
+        // 全局接口不需要账户，不能被误伤
+        for a in ["status", "follow_status", "follow_records", "unlock", "ping"] {
+            assert!(!account_scoped(a), "{a} 不该要求账户");
+        }
+    }
+
+    #[test]
+    fn 闸门不能通过http开关() {
+        // 闸门是唯一的真下单开关，能被远程打开就不算开关。
+        // 这里只能测"动作表里没有它"；真正的 403 在 handle_conn 里，
+        // 要起监听才测得到，不值得为此跑一个真 socket。
+        for a in ["follow_start", "follow_stop"] {
+            assert_eq!(rpc_op(a), None, "{a} 不该出现在通用投递表里");
+            assert!(!RPC_POST.contains(&a), "{a} 不该出现在 POST 表里");
+            assert!(!RPC_GET.contains(&a), "{a} 不该出现在 GET 表里");
+        }
+    }
+
+    #[test]
     fn 通用投递的动作表对得上() {
         // 下单在路径上叫 order，内核里叫 place_order
         assert_eq!(rpc_op("order"), Some("place_order"));
         assert_eq!(rpc_op("cancel_list"), Some("cancel_list"));
-        assert_eq!(rpc_op("follow_start"), Some("follow_start"));
+        assert_eq!(rpc_op("follow_status"), Some("follow_status"));
         // 查询动作走 query 回调，不该再被投一遍
         assert_eq!(rpc_op("positions"), None);
         assert_eq!(rpc_op("signal"), None);
@@ -561,7 +638,7 @@ mod tests {
 
     #[test]
     fn 会动钱的动作只允许_post() {
-        for a in ["order", "cancel", "unlock", "reset_unlock", "follow_start", "follow_stop"] {
+        for a in ["order", "cancel", "unlock", "reset_unlock"] {
             assert!(RPC_POST.contains(&a), "{a} 应该只允许 POST");
             assert!(!RPC_GET.contains(&a), "{a} 不该出现在 GET 表里");
         }

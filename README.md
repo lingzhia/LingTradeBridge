@@ -172,9 +172,9 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
      http://127.0.0.1:8899/credit/signal
 ```
 
-**路径里的账户优先于配置**。`/credit/signal` 明确要求在信用账户下单，
-就不去看配置里的 `follow_account` —— 调用方写明了用哪套账户，再去读配置
-是跟调用方对着干。响应里回显 `account` 字段，核对它而不是只看 `ok`。
+**账户只能写在路径里**，没有别的来源。曾经有不带账户的老路径 `/signal`、
+`/positions` 等，账户从配置里取；删掉了，理由见下节。响应回显 `account`
+字段，核对它而不是只看 `ok`。
 
 信用账户尚未实现、但名字已预留的接口返回 **501**（不是 404，免得看起来
 像路径拼错）：
@@ -188,8 +188,35 @@ POST /credit/buy_to_repay   买券还券
 POST /credit/return_stock   现券还券
 ```
 
-老路径 `/signal`、`/positions` 等继续可用（同花顺版的策略推送代码不用改）：
-账户取配置里的 `follow_account`，查询默认普通账户。
+### 两条刻意不做的事
+
+**一、没有不带账户的老路径。** 以前 `/signal`、`/positions`、`/orders`、
+`/deals`、`/account` 可用，账户取配置里的 `follow_account`。删了：同一份
+请求体，配置一改就悄悄打到另一个账户上，调用方看不见，事后复盘也看不出
+当时打的是哪个账户。现在请求打错路径会明确告诉你缺账户：
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -d '{...}' \
+     http://127.0.0.1:8899/signal
+# 404 {"ok":false,"error":"路径缺少账户：/signal —— 应为 /normal/signal 或 /credit/signal",
+#      "hint":"账户必须写在路径里，不再从配置文件推断"}
+```
+
+**二、HTTP 不能开/关跟单闸门。** `POST /follow_start`、`POST /follow_stop`
+只接受本地 socket；从 HTTP 打过去是 **403**，并说明改拼写没有用：
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8899/follow_start
+# 403 {"ok":false,"error":"不允许通过 HTTP follow_start 跟单：这是唯一的真下单开关，
+#      能被远程打开就不算开关了","hint":"在本机界面上点「开始/停止跟单」，或连本地 socket 调同一个 op"}
+```
+
+理由很直接：闸门是「真下单」的唯一开关。如果远程调用者能自己拉开它，那它对
+远程调用者就一点约束力也没有 —— 一个能被被保护方自己打开的保护不叫保护。
+想用 HTTP 触发真下单，得先在本机界面或本地 socket 上把闸门打开。
+
+只读的 `GET /follow_status`、`GET /follow_records` 不受影响，远程调用者可以
+随时查看闸门状态和信号台账 —— 看得见、但动不了。
 
 ### 查版本：这份二进制是哪份源码编的
 

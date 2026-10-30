@@ -66,7 +66,15 @@ pub struct AppConfig {
     /// 允许同一信号重复下单（跳过去重）
     #[serde(default)]
     pub allow_reorder: bool,
-    /// 跟单作用在哪个账户上
+    /// **已废弃，内核不再读它。**
+    ///
+    /// 曾经是「信号默认下到哪个账户」，服务于不带账户的老路径 `/signal`。
+    /// 老路径删掉之后，账户只能由调用方在 URL 里写明（`/normal/signal` 或
+    /// `/credit/signal`）—— 让账户隐式来自配置，改一下配置就悄悄换账户，
+    /// 调用方看不见也复盘不出来。
+    ///
+    /// 字段留着是因为旧配置文件里还有它，删了会让 `serde` 反序列化出问题
+    /// （虽然 `deny_unknown_fields` 没开，但也没必要主动丢用户的数据）。
     #[serde(default = "def_account")]
     pub follow_account: String,
 }

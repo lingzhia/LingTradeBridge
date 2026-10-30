@@ -20,7 +20,6 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
-use crate::panel::Account;
 
 /// 一条归一化后的跟单订单
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -345,13 +344,10 @@ impl FollowState {
     }
 }
 
-/// 从配置取跟单账户
-pub fn follow_account(cfg: &AppConfig) -> Account {
-    match cfg.follow_account.as_str() {
-        "credit" => Account::Credit,
-        _ => Account::Normal,
-    }
-}
+// 这里原本有个 `follow_account(cfg)`：从配置里取「信号该下到哪个账户」。
+// 删掉了，连同它服务的老路径 `/signal` —— 账户现在只能由调用方在 URL 里
+// 写明白（/normal/signal 或 /credit/signal）。配置里那个 `follow_account`
+// 字段留着只是为了旧配置文件还能读，内核不再读它。
 
 /// 对外暴露的当前时间串（东八区，秒级）
 pub fn now_string() -> String {
