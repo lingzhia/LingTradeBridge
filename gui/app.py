@@ -354,6 +354,19 @@ class App:
             font=(FONT_UI, 11), fg="#666")
         self.core_label.pack(side="right")
 
+        # 跟单状态灯常驻顶部。
+        # 以前只有点「跟单状态」才知道有没有在跑，可跟单是直接花真钱的开关，
+        # 状态必须抬眼就看见 —— 不能等用户想起来去点一下。
+        self.follow_var = tk.StringVar(value="跟单：未启动")
+        self.follow_label = tk.Label(
+            top, textvariable=self.follow_var, anchor="e",
+            font=(FONT_UI, 11), fg="#666")
+        self.follow_label.pack(side="right", padx=(0, 14))
+        # 圆点单独一个控件：Label 只能整块一个颜色，灯和字得分开。
+        self.follow_dot = tk.Label(
+            top, text="●", font=(FONT_UI, 11), fg="#bbb")
+        self.follow_dot.pack(side="right", padx=(0, 4))
+
         # ---- 主区域：左右分栏 ----
         main = ttk.PanedWindow(self.root, orient="horizontal")
         main.pack(fill="both", expand=True, padx=10, pady=4)
@@ -524,8 +537,23 @@ class App:
         ttk.Button(r4, text="开始跟单", command=self.on_follow_start).pack(
             side="left", padx=6)
         ttk.Button(r4, text="停止跟单", command=self.on_follow_stop).pack(side="left")
-        ttk.Button(r4, text="跟单状态", command=self.on_follow_status).pack(
+        # 状态灯替掉了原来的「跟单状态」按钮，但详情（最近一条信号怎么处理的）
+        # 还得看日志，所以按钮留着，只是不再承担「有没有在跑」这个职责。
+        ttk.Button(r4, text="跟单详情", command=self.on_follow_status).pack(
             side="left", padx=6)
+
+        # 状态灯就放在按钮旁边 —— 用户按完按钮视线还在这块，
+        # 立刻能看到它变成什么颜色，不用另找地方确认。
+        r5 = ttk.Frame(fol)
+        r5.pack(fill="x", padx=8, pady=(2, 4))
+        self.follow_dot2 = tk.Label(
+            r5, text="●", font=(FONT_UI, 12), fg="#bbb")
+        self.follow_dot2.pack(side="left")
+        self.follow_var2 = tk.StringVar(value="跟单未启动")
+        self.follow_label2 = tk.Label(
+            r5, textvariable=self.follow_var2, anchor="w",
+            font=(FONT_UI, 11), fg="#666")
+        self.follow_label2.pack(side="left", padx=(4, 0))
 
         ttk.Label(
             fol,
@@ -767,11 +795,47 @@ class App:
             self.root.after(0, lambda: self._render_core_probe(r, auto_start=auto_start))
         threading.Thread(target=work, daemon=True).start()
 
-    def _render_core_state(self, running, pid=None, follow=False):
+    def _render_follow(self, running, count=0, addr=None, core_running=True):
+        """跟单状态灯只由这一处写。
+
+        和 `_render_core_state` 同款理由：轮询、启动探测、开始/停止按钮
+        四条路径都会改它，各写各的必然出现「按钮说停了、顶部还亮着」。
+        颜色分工固定：绿=在跑，灰=没跑，红=内核都没起（谈不上跟单）。
+        """
+        if not core_running:
+            self.follow_dot.configure(fg="#c0392b")
+            self.follow_dot2.configure(fg="#c0392b")
+            self.follow_var.set("跟单：内核未运行")
+            self.follow_var2.set("内核未运行，跟单不可用")
+            self.follow_label.configure(fg="#999")
+            self.follow_label2.configure(fg="#999")
+            return
+
+        if running:
+            n = int(count or 0)
+            where = f" · {addr}" if addr else ""
+            self.follow_dot.configure(fg="#1e8449")
+            self.follow_dot2.configure(fg="#1e8449")
+            self.follow_var.set(f"跟单：运行中 · 已成交 {n} 笔{where}")
+            self.follow_var2.set(f"运行中，本次已成交 {n} 笔{where}")
+            self.follow_label.configure(fg="#1e8449")
+            self.follow_label2.configure(fg="#1e8449")
+        else:
+            self.follow_dot.configure(fg="#bbb")
+            self.follow_dot2.configure(fg="#bbb")
+            self.follow_var.set("跟单：未启动（不会接收任何信号）")
+            self.follow_var2.set("未启动 —— 点「开始跟单」后才会监听信号")
+            self.follow_label.configure(fg="#666")
+            self.follow_label2.configure(fg="#666")
+
+    def _render_core_state(self, running, pid=None):
         """内核指示器只由这一处写。
 
         所有路径（启动探测、定时轮询、启动/停止内核）都调它，
         口径才不会打架 —— 之前「status 通了但标签还说未运行」就是这么来的。
+
+        跟单状态不在这里写：那是另一件事（内核可以活着而跟单没启动），
+        由 `_render_follow` 单独负责，两个标签各说各的，不互相污染。
         """
         owned = self.core_proc is not None and self.core_proc.poll() is None
         self.core_owned = owned and running
@@ -780,6 +844,9 @@ class App:
         if not running:
             self.core_var.set("内核：未运行")
             self.core_label.configure(fg="#999")
+            # 内核没了，跟单必然也没了 —— 顺手把灯压成红色，
+            # 不让它停在绿灯上骗人。
+            self._render_follow(False, core_running=False)
             return
 
         shown = pid or (self.core_proc.pid if owned else None)
@@ -787,10 +854,7 @@ class App:
         # 本 GUI 拉起来的标「本界面」，别处启动的标「外部」，
         # 用户能一眼看出关掉界面会不会把别人的跟单带走
         tag = "本界面" if owned else "外部"
-        text = f"内核：运行中 · {tag}（{who}）"
-        if follow:
-            text += " · 跟单中"
-        self.core_var.set(text)
+        self.core_var.set(f"内核：运行中 · {tag}（{who}）")
         self.core_label.configure(fg="#1e8449")
 
     def _render_core_probe(self, r, auto_start=False):
@@ -804,7 +868,12 @@ class App:
             return
 
         pid = r.get("core_pid")
-        self._render_core_state(True, pid, bool(r.get("follow_running")))
+        self._render_core_state(True, pid)
+        self._render_follow(
+            bool(r.get("follow_running")),
+            r.get("follow_count") or 0,
+            r.get("follow_addr"),
+        )
         if auto_start and not (self.core_proc and self.core_proc.poll() is None):
             who = f"pid {pid}" if pid else "外部启动"
             self.log(f"检测到内核已在运行（{who}），直接接管使用")
@@ -819,7 +888,12 @@ class App:
             self._render_core_state(False)
             return
 
-        self._render_core_state(True, r.get("core_pid"), bool(r.get("follow_running")))
+        self._render_core_state(True, r.get("core_pid"))
+        self._render_follow(
+            bool(r.get("follow_running")),
+            r.get("follow_count") or 0,
+            r.get("follow_addr"),
+        )
 
         state = r.get("state")
         mapping = {
@@ -927,6 +1001,12 @@ class App:
                 self.log("✓ " + (r.get("detail") or "跟单已启动"), "OK")
             else:
                 self.log("✗ " + (r.get("error") or "启动失败"), "ERROR")
+            # 不管成败都按内核的真实回答重画状态灯：失败时不能让它留在
+            # 「启动中」的假象上，成功时也不必等下一轮轮询才变绿。
+            self.root.after(0, lambda: self._render_follow(
+                bool(r.get("follow_running")),
+                r.get("follow_count") or 0,
+                r.get("follow_addr")))
         threading.Thread(target=work, daemon=True).start()
         self.log("正在启动跟单…")
 
@@ -936,6 +1016,10 @@ class App:
             self.log(("✓ " if r.get("ok") else "✗ ")
                      + (r.get("detail") or r.get("error") or ""),
                      "OK" if r.get("ok") else "ERROR")
+            self.root.after(0, lambda: self._render_follow(
+                bool(r.get("follow_running")),
+                r.get("follow_count") or 0,
+                r.get("follow_addr")))
         threading.Thread(target=work, daemon=True).start()
 
     def on_follow_status(self):
@@ -943,6 +1027,10 @@ class App:
             r = self.core.call("follow_status", timeout=30)
             if r.get("ok"):
                 self.log(f"跟单状态：{r.get('state')} · {r.get('detail') or ''}")
+                self.root.after(0, lambda: self._render_follow(
+                    bool(r.get("follow_running")),
+                    r.get("follow_count") or 0,
+                    r.get("follow_addr")))
             else:
                 self.log(f"读取跟单状态失败：{r.get('error')}", "ERROR")
         threading.Thread(target=work, daemon=True).start()
@@ -1227,6 +1315,9 @@ class App:
         )
         self.log(f"核心已启动 (pid {self.core_proc.pid})")
         self._render_core_state(True, self.core_proc.pid)
+        # 刚起的内核跟单必然是关的（跟单状态只在内存里，重启即回 idle）。
+        # 不在这里压一下，灯会停在上一轮的红/灰上，等 3 秒轮询才纠正。
+        self._render_follow(False)
 
         # 内核 bind 失败会立刻退出（比如端口/socket 被占），等一拍确认真的活着
         def verify():

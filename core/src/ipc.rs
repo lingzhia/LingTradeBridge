@@ -94,6 +94,12 @@ pub struct Response {
     /// 跟单是否在运行（内核可能由外部启动并在跑单，GUI 只是旁观者）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub follow_running: Option<bool>,
+    /// 本次跟单已成功的笔数。GUI 的常驻状态灯直接显示它，不用再点「跟单状态」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_count: Option<u64>,
+    /// 跟单 HTTP 信号服务的监听地址。用户得知道信号该发到哪，光说「在跑」不够。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_addr: Option<String>,
 }
 
 impl Response {
@@ -113,6 +119,8 @@ impl Response {
             pid: None,
             core_pid: None,
             follow_running: None,
+            follow_count: None,
+            follow_addr: None,
         }
     }
     fn err(id: u64, msg: impl Into<String>) -> Self {
@@ -150,6 +158,28 @@ impl FollowRuntime {
 }
 
 impl Shared {
+    /// 把跟单三要素（在跑吗、跟了几笔、监听在哪）填进响应
+    ///
+    /// 抽出来是因为**五条路径**都要如实回答同一件事：ping、status、
+    /// follow_start、follow_stop、follow_status。以前只有其中两条带
+    /// `follow_running`，界面只能靠零散的布尔值猜，笔数和端口根本拿不到。
+    /// 口径分散在多处的结果就是自相矛盾（界面显示「跟单中」但端口没监听）。
+    fn fill_follow(&self, r: &mut Response) {
+        let slot = self.follow.lock().unwrap();
+        match slot.as_ref() {
+            Some(rt) => {
+                r.follow_running = Some(true);
+                r.follow_count = Some(rt.ok_count);
+                r.follow_addr = Some(rt.server.addr().to_string());
+            }
+            None => {
+                r.follow_running = Some(false);
+                r.follow_count = Some(0);
+                // 未运行时不带地址 —— 带个空串会让界面误以为"有地址但读不出来"
+            }
+        }
+    }
+
     /// 现读配置
     ///
     /// 每次执行功能都重新读一遍配置文件，而不是用启动时的快照。
@@ -474,9 +504,13 @@ fn do_follow_start(req: &Request, shared: &Shared) -> Response {
     }
 
     let mut slot = shared.follow.lock().unwrap();
-    if slot.is_some() {
+    if let Some(rt) = slot.as_ref() {
         let mut r = Response::ok(req.id);
         r.detail = Some("跟单已在运行中".into());
+        // 重复点「开始跟单」不该让状态灯闪一下变回 idle —— 这里如实回填。
+        r.follow_running = Some(true);
+        r.follow_count = Some(rt.ok_count);
+        r.follow_addr = Some(rt.server.addr().to_string());
         return r;
     }
 
@@ -542,6 +576,11 @@ fn do_follow_start(req: &Request, shared: &Shared) -> Response {
             });
             let mut r = Response::ok(req.id);
             r.detail = Some(format!("跟单已启动，HTTP 信号服务监听 {addr}"));
+            // 这里不能调 shared.fill_follow()：slot 的锁还在本函数手里，
+            // 再 lock 一次就是自己等自己。刚启动必然 0 笔。
+            r.follow_running = Some(true);
+            r.follow_count = Some(0);
+            r.follow_addr = Some(addr);
             r
         }
         Err(e) => Response::err(req.id, format!("启动失败: {e}")),
@@ -559,11 +598,18 @@ fn do_follow_stop(req: &Request, shared: &Shared) -> Response {
                 "跟单已停止，端口已释放；本次共成交 {} 单",
                 rt.ok_count
             ));
+            // 端口确实关了，状态灯必须立刻转 idle，否则用户以为还在跑。
+            // 笔数归零：那是「本次运行」的计数，停了就没有本次了；
+            // 历史成交在台账里，想看得走 follow_status 的 detail。
+            r.follow_running = Some(false);
+            r.follow_count = Some(0);
             r
         }
         None => {
             let mut r = Response::ok(req.id);
             r.detail = Some("跟单本来就没在跑".into());
+            r.follow_running = Some(false);
+            r.follow_count = Some(0);
             r
         }
     }
@@ -584,11 +630,16 @@ fn do_follow_status(req: &Request, shared: &Shared) -> Response {
                 rt.last_note
             ));
             r.total = Some(rt.ok_count as usize);
+            r.follow_running = Some(true);
+            r.follow_count = Some(rt.ok_count);
+            r.follow_addr = Some(rt.server.addr().to_string());
         }
         None => {
             r.state = Some("idle".into());
             r.detail = Some("跟单未启动".into());
             r.total = Some(0);
+            r.follow_running = Some(false);
+            r.follow_count = Some(0);
         }
     }
     r
@@ -1048,7 +1099,7 @@ fn dispatch_account(req: &Request, shared: &Shared) -> Response {
             let mut r = Response::ok(req.id);
             r.detail = Some("pong".into());
             r.core_pid = Some(std::process::id());
-            r.follow_running = Some(shared.follow.lock().unwrap().is_some());
+            shared.fill_follow(&mut r);
             r
         }
 
@@ -1095,6 +1146,8 @@ fn dispatch_account(req: &Request, shared: &Shared) -> Response {
                 pid: Some(pid),
                 core_pid: Some(std::process::id()),
                 follow_running: None,
+                follow_count: None,
+                follow_addr: None,
             };
         }
         // 调试用：在窗口坐标上点一下（x/y 来自请求的 seq/ts 两个数值字段不好读，
@@ -1215,7 +1268,7 @@ fn status(req: &Request, shared: &Shared) -> Response {
     r.unlock_tripped = Some(g.tripped);
     drop(g);
     r.core_pid = Some(std::process::id());
-    r.follow_running = Some(shared.follow.lock().unwrap().is_some());
+    shared.fill_follow(&mut r);
     r
 }
 
