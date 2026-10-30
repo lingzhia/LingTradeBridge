@@ -1397,6 +1397,21 @@ fn dispatch_account(req: &Request, shared: &Shared) -> Response {
 
         "status" => status(req, shared),
 
+        // 版本自证：这份二进制是哪份源码编出来的、要不要重编重启。
+        // 光比 mtime 是推断，这里给的是二进制自己记下的事实。
+        "version" => {
+            let v = crate::version::report();
+            let mut r = Response::ok(req.id);
+            r.detail = Some(format!(
+                "{}（{}）",
+                v["commit"].as_str().unwrap_or("unknown"),
+                v["hint"].as_str().unwrap_or("")
+            ));
+            r.core_pid = Some(std::process::id());
+            r.rows = Some(vec![v]);
+            r
+        }
+
         "unlock" => do_unlock(req, shared),
 
         "reset_unlock" => {

@@ -28,6 +28,7 @@ mod ocr;
 mod order;
 mod panel;
 mod unlock;
+mod version;
 
 use std::path::PathBuf;
 
@@ -80,7 +81,12 @@ fn main() {
                 std::process::exit(if ok { 0 } else { 1 });
             }
             "--version" => {
+                // 版本号要能回答「这份二进制是哪份源码编的」。只印 semver
+                // 对不上任何东西 —— Cargo.toml 里的 0.1.0 半年不会变，
+                // 而「我重启后跑的是不是最新代码」才是真正要问的问题。
                 println!("citics-core {}", env!("CARGO_PKG_VERSION"));
+                println!("commit: {}", crate::version::BuildInfo::commit());
+                println!("built:  {}", crate::version::BuildInfo::build_time());
                 return;
             }
             "--help" | "-h" => {

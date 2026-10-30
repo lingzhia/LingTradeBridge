@@ -238,6 +238,9 @@ class HttpClient:
                 q.append("amount=" + str(int(kw["amount"])))
             tail = ("?" + "&".join(q)) if q else ""
             return "GET", "/follow_records" + tail, None
+        if op == "version":
+            # /version 免鉴权：查版本往往正是为了排查「token 配错了」
+            return "GET", "/version", None
         if op == "ping":
             return "GET", "/ping", None
         return None
@@ -588,6 +591,7 @@ class App:
         ttk.Button(bar, text="立即解锁", command=self.on_unlock_once).pack(side="left")
         ttk.Button(bar, text="重置熔断", command=self.on_reset_breaker).pack(side="left", padx=6)
         ttk.Button(bar, text="环境自检", command=self.on_check_env).pack(side="left")
+        ttk.Button(bar, text="版本检查", command=self.on_check_version).pack(side="left", padx=6)
         ttk.Button(bar, text="打开日志目录",
                    command=self.on_open_log_dir).pack(side="right")
 
@@ -1595,6 +1599,36 @@ class App:
                                text=True, env=env)
             for line in (p.stdout or "").strip().splitlines():
                 self.log(line)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_check_version(self):
+        """问内核「你这份二进制是哪份源码编的，要不要重编重启」。
+
+        以前判断「跑的是不是最新」靠比进程启动时间和二进制 mtime ——
+        那是推断：cargo 判定无需重编就不动 mtime、二进制可能被拷来拷去。
+        现在内核自己报 commit 和构建时刻，再和磁盘源码比，答案是确定的。
+        """
+        def work():
+            r = self.call("version", timeout=15)
+            # 两种通道回的形态不同：HTTP 的 /version 直接回版本对象（免鉴权、
+            # 给人和脚本看都方便），socket 的 dispatch 回统一的 Response，
+            # 版本对象塞在 rows[0]。这里两种都收，免得换个通道就查不了版本。
+            rows = r.get("rows") or []
+            v = rows[0] if rows else r
+            status = v.get("status")
+            if not r.get("ok"):
+                self.log(f"版本检查失败：{r.get('error', '')}", "ERROR")
+                return
+            self.log(f"内核版本 {v.get('commit')} "
+                     f"（编译于 {v.get('build_time')}，pid {v.get('pid')}）")
+            if status == "current":
+                self.log("正在跑的就是当前源码编出来的二进制", "OK")
+            elif status == "stale":
+                newer = v.get("source_newer_than_build") or []
+                tail = f"：{', '.join(newer[:5])}" if newer else ""
+                self.log(f"源码比内核新{tail} —— 需要重新编译并重启内核", "WARN")
+            else:
+                self.log(v.get("hint") or "无法判断", "WARN")
         threading.Thread(target=work, daemon=True).start()
 
     def on_start_core(self):

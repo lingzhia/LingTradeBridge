@@ -7,6 +7,7 @@
 //! 用一套路径加 `?account=` 参数会让调用方分不清语义，也没地方挂信用独有的接口。
 //!
 //!   GET  /health                              健康检查（免鉴权）
+//!   GET  /version                             版本号与是否最新（免鉴权）
 //!   GET  /                                    端点列表（免鉴权，不含账户数据）
 //!
 //!   POST /normal/signal                       普通账户下单信号
@@ -246,13 +247,20 @@ fn handle_conn(
             "ok": true, "service": "citics-order-http"
         }));
     }
+    // 版本号也免鉴权，理由和 /health 同类但更实际：
+    // 想确认「重启后跑的是不是最新二进制」时，鉴权恰好可能是出问题的那一环
+    // （token 配错、配置没保存），拿不到版本号就变成要先把鉴权修好才能查版本。
+    // 内容只有 commit 和构建时刻，没有账户数据、没有凭据。
+    if req.method == "GET" && req.path == "/version" {
+        return respond(&mut stream, 200, &crate::version::report());
+    }
     if req.method == "GET" && req.path == "/" {
         return respond(&mut stream, 200, &serde_json::json!({
             "ok": true,
             "service": "citics-order-http",
             "namespaces": ["normal", "credit"],
             "endpoints": [
-                "GET /health",
+                "GET /health", "GET /version",
                 "POST /normal/signal", "POST /credit/signal",
                 "GET /normal/account", "GET /normal/positions",
                 "GET /normal/orders", "GET /normal/deals",

@@ -1,6 +1,8 @@
 # Rust 构建产物与本地依赖缓存
 core/target/
 core/.cargo/
+# CARGO_HOME 指到仓库内时留下的缓存（在任意目录跑 cargo 都可能生成）
+/.cargo/
 
 # OCR 编译产物（用 tools/build_ocr.sh 重新编译）
 tools/ocr

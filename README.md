@@ -148,8 +148,8 @@ cd core && CARGO_HOME=.cargo ./target/release/citics-core --check
 
 ## HTTP 接口
 
-给外部策略/信号源用。默认 `127.0.0.1:8899`，除 `/health` 和 `/` 外都要
-`Authorization: Bearer <http_api_token>`（token 为空时**服务拒绝启动**）。
+给外部策略/信号源用。默认 `127.0.0.1:8899`，除 `/health`、`/version` 和 `/`
+外都要 `Authorization: Bearer <http_api_token>`（token 为空时**服务拒绝启动**）。
 
 和 IPC 一样按账户分两套命名空间 —— 信用账户的持仓、委托与普通账户完全独立，
 信用区还多出一批普通区没有的动作：
@@ -190,6 +190,34 @@ POST /credit/return_stock   现券还券
 
 老路径 `/signal`、`/positions` 等继续可用（同花顺版的策略推送代码不用改）：
 账户取配置里的 `follow_account`，查询默认普通账户。
+
+### 查版本：这份二进制是哪份源码编的
+
+```bash
+curl http://127.0.0.1:8899/version      # 免鉴权
+```
+
+```json
+{"commit": "972d8f0", "build_time": "2026-10-30 13:29:32", "pid": 12326,
+ "source_head": "972d8f0", "status": "current", "up_to_date": true,
+ "hint": "正在跑的就是当前源码编出来的二进制"}
+```
+
+改完代码忘了重编、或编了忘了重启，都会看到 `status: "stale"`，
+`source_newer_than_build` 里直接列出是哪些文件比这份二进制新。
+
+**不靠 mtime 推断**。比「进程启动时间 vs 二进制修改时间」这种路子会骗人：
+cargo 判定无需重编就不更新 mtime，二进制还可能被拷来拷去。这里让二进制
+报出它**自己**的构建事实（`build.rs` 把 commit、构建时刻烙进去），再和磁盘
+上的 git HEAD、源文件 mtime 对照，两个维度都对得上才算 `current`。
+
+`dirty_at_build` 只作说明，不算「旧」的证据 —— 在脏树上编出来的二进制本来
+就含着那些改动，只要之后没人再动文件，它就是当前代码的忠实产物。
+
+界面底部「版本检查」按钮走同一个接口，结论打到日志里。
+
+免鉴权的理由：查版本往往正是为了排查「token 是不是配错了」，让排查前先过
+一道鉴权是自找麻烦；而且它只回 commit 和 pid，不泄露账户数据。
 
 ### 服务随内核启动，「跟单」只是一道闸门
 
