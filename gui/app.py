@@ -670,10 +670,12 @@ class App:
 
         # HTTP 服务和跟单开关现在是两件事，界面上必须说清，
         # 否则用户会以为「没点开始跟单 ⇒ 接口是关的」，白白以为测不到。
+        # 同时要说清闸门也管 /order 上的真下单：不然「没开跟单就安全」是假象。
         ttk.Label(
             fol,
-            text="HTTP 服务随内核启动就在监听，查询/下单随时可用；"
-                 "「开始跟单」只决定外部信号进来后要不要真下单。",
+            text="HTTP 服务随内核启动就在监听，查询随时可用；"
+                 "「开始跟单」决定外部信号要不要真下单，也决定接口上的真下单"
+                 "（POST /normal/order）放不放行。干跑（dry_run）不受闸门影响。",
             foreground="#555555", wraplength=470, justify="left",
         ).pack(anchor="w", padx=8, pady=(6, 2))
 
@@ -1105,7 +1107,8 @@ class App:
             extra = f" · 已记 {skipped} 条未下单" if skipped else ""
             self.follow_var.set(f"跟单：未启动（信号只记录不下单）{extra}")
             self.follow_var2.set(
-                f"未启动 —— HTTP 在监听，信号会记录但不会下单{extra}")
+                f"未启动 —— HTTP 在监听，信号会记录但不会下单，"
+                f"接口上的真下单也被拒{extra}")
             self.follow_label.configure(fg="#666")
             self.follow_label2.configure(fg="#666")
 
@@ -1568,10 +1571,23 @@ class App:
         def work():
             # 方向编进 op 名（credit.buy / credit.sell），不再单独传 direction，
             # 从根上排除「在卖出面板递了买单」这种错。
-            r = self.call(f"{account}.{'buy' if direction == 1 else 'sell'}",
-                               code=code, price=price, amount=amount,
-                               action="dry_run" if dry else None,
-                               timeout=180)
+            op = f"{account}.{'buy' if direction == 1 else 'sell'}"
+            kw = dict(code=code, price=price, amount=amount,
+                      action="dry_run" if dry else None, timeout=180)
+            # 真委托恒走本地 socket，不跟着「接口通道」切。
+            #
+            # 内核那边有一道闸门：HTTP 渠道的真下单要求跟单开着。用界面下单
+            # 时人并没有开跟单，走 HTTP 只会撞上这道闸门 —— 而且更重要的是，
+            # 这条路上有二次确认框，确认的是「人要点这一单」；把真钱委托
+            # 交给一条可被外部程序复用的接口路径，风险和收益不成比例。
+            #
+            # 干跑照旧走当前通道：它不花钱，而「HTTP 能不能下单」正是要验证的事。
+            if dry:
+                r = self.call(op, **kw)
+            else:
+                if self._channel() == "HTTP":
+                    self.log("真实委托改走本地 socket（HTTP 渠道的真下单需要跟单开启）", "WARN")
+                r = self.sock.call(op, **kw)
             self.root.after(0, lambda: self._after_place(r))
         threading.Thread(target=work, daemon=True).start()
         self.log(f"{'干跑' if dry else '真实'}{side} {code} {amount}股 @{price}…")

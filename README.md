@@ -275,6 +275,40 @@ curl -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8899/follow_records?kin
 HTTP 起不来（Token 为空、端口被占）不阻止内核启动 —— 本地 socket 照常可用，
 只是 `follow_start` 会明确拒绝，不会让状态灯显示「跟单中」而实际收不到信号。
 
+### 闸门也管 `/{ns}/order`
+
+信号受闸门管，但 `POST /normal/order`（界面下单按钮的镜像）原先是一路直通的。
+这留下一个假象：界面上「跟单未启动」，而外部拿着 Token 打 `/order` 不带
+`dry_run` 就真下真钱单。**这两件事必须是同一个开关**，所以：
+
+| 通道 | 干跑 `dry_run` | 真提交 |
+|---|---|---|
+| HTTP | 放行 | **闸门关 → 拒绝（409）** |
+| 本地 socket | 放行 | 放行 |
+
+```bash
+# 闸门关着，真下单被拒
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+     -d '{"direction":1,"code":"600000","price":"10.50","amount":100}' \
+     http://127.0.0.1:8899/normal/order
+# 409 {"ok":false,"state":"follow_stopped",
+#      "error":"跟单未开启，HTTP 渠道的真下单被拒绝。…加 \"dry_run\": true…"}
+
+# 干跑照旧可用：只填单不提交，不花钱
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+     -d '{"direction":1,"code":"600000","price":"10.50","amount":100,"dry_run":true}' \
+     http://127.0.0.1:8899/normal/order
+```
+
+**为什么按通道分，不按动作分**：本地 socket 那条路上是人在界面上按按钮，
+前面有二次确认框，确认框本身就是「人的明确意图」；而 HTTP 对面是谁、有没有
+确认，内核一无所知。界面上的真实委托因此恒走本地 socket —— 「接口通道」开关
+切的是业务按钮走哪条路，但真钱委托不跟着切（干跑照旧跟随，因为它不花钱，
+而「HTTP 能不能下单」正是要验证的事）。
+
+`via` 字段带 `serde(skip)`，只由内核按实际通道填。请求体里自己写
+`"via":"Local"` 无效 —— 否则外部程序填个字段就把闸门绕过去了。
+
 ### 界面上的「接口通道」
 
 顶部有个 `接口通道` 开关，默认 **HTTP**：
@@ -290,6 +324,11 @@ HTTP 起不来（Token 为空、端口被占）不阻止内核启动 —— 本�
 `ping` / `shutdown` 例外：**永远走 socket**。它们管的是「内核进程在不在」，
 而内核没起或 token 没配时 HTTP 本来就不通，用 HTTP 探活会把「内核跑着、
 只是 HTTP 没绑上」误判成「内核没跑」，进而拉起第二个内核顶掉 socket。
+
+下单按钮另有一处不跟随：**真实委托恒走 socket**（干跑照旧跟随开关）。
+理由见上面「闸门也管 `/{ns}/order`」—— 那条路上有二次确认框，
+真钱委托不该交给一条可被外部程序复用的接口路径。切到 HTTP 时点真实下单，
+日志会提示一句「真实委托改走本地 socket」。
 
 ## 内核生命周期
 

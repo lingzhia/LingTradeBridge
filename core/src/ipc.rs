@@ -26,12 +26,32 @@ use crate::config;
 
 use crate::{cancel, capture, follow, http, input, ocr, order, CoreConfig};
 
+/// 请求从哪条通道进来
+///
+/// 存在的唯一理由是「真下单」这道闸门必须分通道：本地 socket 是人在界面上
+/// 按按钮（前面有二次确认框），HTTP 是外部程序打来的、看不见对面是谁。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Channel {
+    /// 本地 unix socket：界面自己发起的动作
+    #[default]
+    Local,
+    /// HTTP 接口：外部程序发起的动作
+    Http,
+}
+
 /// 请求
 #[derive(Debug, Clone, Deserialize)]
 pub struct Request {
     #[serde(default)]
     pub id: u64,
     pub op: String,
+    /// 这条请求从哪条通道来。
+    ///
+    /// **不从 JSON 反序列化**（`skip`）：只由内核按实际通道填。
+    /// 若允许请求体自己填，外部写个 `"via":"Local"` 就把闸门绕过去了 ——
+    /// 那这道闸门从一开始就不该存在。
+    #[serde(skip)]
+    pub via: Channel,
     /// 解锁密码
     #[serde(default)]
     pub password: Option<String>,
@@ -367,6 +387,7 @@ fn start_http(shared: &Arc<Shared>) -> Result<http::HttpServer, String> {
         let req = Request {
             id: 0,
             op: "query".into(),
+            via: Channel::Http,
             password: None,
             code: None,
             direction: None,
@@ -426,6 +447,7 @@ fn start_http(shared: &Arc<Shared>) -> Result<http::HttpServer, String> {
             let req = Request {
                 id: 0,
                 op: op.to_string(),
+                via: Channel::Http,
                 password: text("password"),
                 code: text("code"),
                 direction,
@@ -456,7 +478,9 @@ fn start_http(shared: &Arc<Shared>) -> Result<http::HttpServer, String> {
                 200
             } else {
                 match r.state.as_deref() {
-                    Some("wrong_state") | Some("failed") => 409,
+                    // follow_stopped 也归 409：请求本身合法、参数没错，
+                    // 只是当前状态不允许 —— 用 400 会让人怀疑是不是传错了参数。
+                    Some("wrong_state") | Some("failed") | Some("follow_stopped") => 409,
                     _ => 400,
                 }
             };
@@ -1129,6 +1153,19 @@ fn now_str() -> String {
     follow::now_string()
 }
 
+/// HTTP 渠道的真下单要不要被拦住
+///
+/// 抽成纯函数是为了能测：`do_place_order` 一进门就要窗口和界面，
+/// 测试里跑不动，而「哪几种组合该拦」恰恰是这道闸门唯一容易写错的地方。
+///
+/// 只有「HTTP + 真提交 + 闸门关」这一种组合被拦：
+/// - 本地 socket 放行 —— 那条路是人在按按钮，前面有二次确认框；
+/// - dry_run 放行 —— 只填单不提交，不花钱；
+/// - 闸门开着放行 —— 用户明确开了闸，外部程序下单是他授权过的。
+fn http_order_blocked(via: Channel, dry_run: bool, follow_open: bool) -> bool {
+    via == Channel::Http && !dry_run && !follow_open
+}
+
 /// 下单
 ///
 /// 请求字段：
@@ -1138,7 +1175,37 @@ fn now_str() -> String {
 ///   direction 1=买入 2=卖出（默认 1）
 ///   account   normal / credit（默认 normal）
 ///   action    下单后是否提交：不给或 "submit" 提交；"dry_run" 只填不提交
+///
+/// 这里有两道闸门叠着：
+/// 1. `action == "dry_run"` → 只填单不提交（不花钱，任何通道都放行）；
+/// 2. 真提交 + `via == Http` → 必须有跟单闸门开着（见函数内注释）。
 fn do_place_order(req: &Request, shared: &Shared) -> Response {
+    // 真下单的第二道闸门：HTTP 通道来的真委托，必须有跟单闸门开着。
+    //
+    // 闸门原本只管信号（`/{ns}/signal`），而 `/{ns}/order` 是界面下单按钮的
+    // 镜像，一路直通 —— 结果「没开跟单就安全」是个假象：外部拿着 Token 打
+    // `POST /normal/order` 不带 dry_run 就会真下真钱单，而界面上跟单显示
+    // 「未启动」。这两件事必须是同一个开关。
+    //
+    // 为什么不挡本地 socket：那条路上是人在界面上按按钮，前面有二次确认框，
+    // 确认框本身就是「人的明确意图」；而 HTTP 对面是谁、有没有确认，内核
+    // 一无所知。所以闸门按通道区分，而不是按动作区分。
+    //
+    // 干跑（dry_run）永远放行：它只填单不提交，不花钱，而且「不真下单也能
+    // 验证接口通不通」正是这个工具存在的意义。
+    let dry_run = req.action.as_deref() == Some("dry_run");
+    if http_order_blocked(req.via, dry_run, shared.follow.lock().unwrap().is_some()) {
+        let mut r = Response::err(
+            req.id,
+            "跟单未开启，HTTP 渠道的真下单被拒绝。\
+             要真的下单请先在界面上「开始跟单」，或改用本地通道；\
+             只想验证接口传参请加 \"dry_run\": true（只填单不提交，不花钱）。",
+        );
+        r.state = Some("follow_stopped".into());
+        shared.fill_follow(&mut r);
+        return r;
+    }
+
     let cfg = shared.cfg();
     let (pid, win) = match panel::ensure_window(&cfg.app_path) {
         Some(v) => v,
@@ -1171,7 +1238,6 @@ fn do_place_order(req: &Request, shared: &Shared) -> Response {
         Some("credit") => panel::Account::Credit,
         Some(o) => return Response::err(req.id, format!("未知账户类型: {o}")),
     };
-    let dry_run = req.action.as_deref() == Some("dry_run");
 
     let mut r = Response::ok(req.id);
     r.account = Some(account.as_str().into());
@@ -1932,5 +1998,29 @@ mod tests {
         let r2 = credit_pending("no_such_thing", 8);
         assert!(!r2.ok);
         assert!(r2.error.unwrap_or_default().contains("未知操作"));
+    }
+
+    #[test]
+    fn 闸门关着只拦http的真下单() {
+        // 唯一该拦的组合：HTTP + 真提交 + 闸门关
+        assert!(http_order_blocked(Channel::Http, false, false));
+        // 闸门开着 —— 用户明确开了闸，外部下单是他授权过的
+        assert!(!http_order_blocked(Channel::Http, false, true));
+        // 干跑 —— 只填单不提交，不花钱
+        assert!(!http_order_blocked(Channel::Http, true, false));
+        // 本地 socket —— 人在界面上按按钮，前面有二次确认框
+        assert!(!http_order_blocked(Channel::Local, false, false));
+        assert!(!http_order_blocked(Channel::Local, true, false));
+    }
+
+    #[test]
+    fn 通道不能被请求体伪造() {
+        // via 带 serde(skip)：请求体里写 "via":"Http" 之类也不会生效，
+        // 否则外部程序填个字段就把真下单闸门绕过去了。
+        let r: Request = serde_json::from_str(
+            r#"{"id":1,"op":"place_order","code":"600000","via":"Http"}"#,
+        )
+        .expect("请求体应能解析");
+        assert_eq!(r.via, Channel::Local, "via 只能由内核按实际通道填");
     }
 }
