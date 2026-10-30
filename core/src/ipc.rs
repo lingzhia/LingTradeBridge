@@ -100,6 +100,12 @@ pub struct Response {
     /// 跟单 HTTP 信号服务的监听地址。用户得知道信号该发到哪，光说「在跑」不够。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub follow_addr: Option<String>,
+    /// 闸门关着时「收到但没下单」的信号条数（台账累计）。
+    ///
+    /// 光说「信号会被记录」不够 —— 用户得能看见到底记到了没有、记了几条，
+    /// 否则「记录」和「丢弃」在界面上长得一模一样。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_skipped: Option<u64>,
 }
 
 impl Response {
@@ -121,6 +127,7 @@ impl Response {
             follow_running: None,
             follow_count: None,
             follow_addr: None,
+            follow_skipped: None,
         }
     }
     fn err(id: u64, msg: impl Into<String>) -> Self {
@@ -136,8 +143,13 @@ struct Shared {
     /// 启动时的基础配置（socket 路径等命令行相关项）
     base: CoreConfig,
     guard: Mutex<UnlockGuard>,
-    /// 跟单引擎状态（惰性初始化，只有真正启动跟单时才建台账）
+    /// 跟单闸门：`Some` 表示开闸（信号来了真下单），`None` 表示关闸。
+    ///
+    /// 注意闸门**不是**信号通道 —— HTTP 一直在监听，闸门只管下不下单。
     follow: Mutex<Option<FollowRuntime>>,
+    /// 信号台账。**不放闸门里**：闸门关着时信号也要记一笔，
+    /// 放闸门里就会出现「跟单没开 ⇒ 连记录都没有」的空档。
+    ledger: Mutex<follow::Ledger>,
     /// HTTP 服务的监听地址；空串表示没起来（未配置 Token，或端口被别的进程占着）。
     ///
     /// HTTP 服务从**内核启动**起就监听，跟单开关只管信号要不要真下单 ——
@@ -145,12 +157,14 @@ struct Shared {
     http_addr: Mutex<String>,
 }
 
-/// 跟单运行期
+/// 跟单闸门打开时的运行态
 ///
-/// 这里**不持有 HTTP 服务**：HTTP 从内核启动就一直在监听，跟单开关只决定
-/// 「信号来了要不要真下单」。信号进来时跟单没开，就丢弃并回 `not_running`。
+/// 这里**不持有 HTTP 服务**，也**不持有台账**：
+/// - HTTP 从内核启动就一直在监听；
+/// - 台账在 `Shared` 上，闸门关着时也要往里记信号。
+///
+/// 所以这个结构只回答「这次开闸从什么时候开始、成了几笔、最近一条怎么了」。
 struct FollowRuntime {
-    ledger: follow::Ledger,
     started_at: String,
     /// 累计跟单成功数
     ok_count: u64,
@@ -177,19 +191,24 @@ impl Shared {
     /// `follow_running`，界面只能靠零散的布尔值猜，笔数和端口根本拿不到。
     /// 口径分散在多处的结果就是自相矛盾（界面显示「跟单中」但端口没监听）。
     fn fill_follow(&self, r: &mut Response) {
-        let slot = self.follow.lock().unwrap();
-        match slot.as_ref() {
-            Some(rt) => {
-                r.follow_running = Some(true);
-                r.follow_count = Some(rt.ok_count);
-                r.follow_addr = Some(self.http_addr());
-            }
-            None => {
-                r.follow_running = Some(false);
-                r.follow_count = Some(0);
-                // 未运行时不带地址 —— 带个空串会让界面误以为"有地址但读不出来"
+        {
+            let slot = self.follow.lock().unwrap();
+            match slot.as_ref() {
+                Some(rt) => {
+                    r.follow_running = Some(true);
+                    r.follow_count = Some(rt.ok_count);
+                    r.follow_addr = Some(self.http_addr());
+                }
+                None => {
+                    r.follow_running = Some(false);
+                    r.follow_count = Some(0);
+                    // 未运行时不带地址 —— 带个空串会让界面误以为"有地址但读不出来"
+                }
             }
         }
+        // 闸门关着时也被收录的信号条数。锁要单独取：上面那段只碰闸门，
+        // 两个锁别嵌套，免得将来有人反过来加锁造成死锁。
+        r.follow_skipped = Some(self.ledger.lock().unwrap().skipped_count());
     }
 
     /// 现读配置
@@ -282,6 +301,9 @@ pub fn serve(cfg: CoreConfig) -> std::io::Result<()> {
         base: cfg,
         guard: Mutex::new(guard),
         follow: Mutex::new(None),
+        // 台账从进程启动就加载，不等开闸。闸门关着时收到的信号也往这里记，
+        // 否则「信号被记录下来」这句话在闸门关着时就成了空话。
+        ledger: Mutex::new(follow::Ledger::load()),
         http_addr: Mutex::new(String::new()),
     });
 
@@ -682,13 +704,14 @@ fn do_follow_start(req: &Request, shared: &Shared) -> Response {
         // 重复点「开始跟单」不该让状态灯闪一下变回 idle —— 这里如实回填。
         r.follow_running = Some(true);
         r.follow_count = Some(rt.ok_count);
-        r.follow_addr = Some(addr);
+        r.follow_addr = Some(addr.clone());
+        drop(slot);
+        r.follow_skipped = Some(shared.ledger.lock().unwrap().skipped_count());
         return r;
     }
 
     let lan = !matches!(app.http_host.as_str(), "127.0.0.1" | "localhost" | "::1");
     *slot = Some(FollowRuntime {
-        ledger: follow::Ledger::load(),
         started_at: now_str(),
         ok_count: 0,
         last_note: if lan {
@@ -703,26 +726,32 @@ fn do_follow_start(req: &Request, shared: &Shared) -> Response {
     // 再 lock 一次就是自己等自己。刚启动必然 0 笔。
     r.follow_running = Some(true);
     r.follow_count = Some(0);
-    r.follow_addr = Some(addr);
+    r.follow_addr = Some(addr.clone());
+    drop(slot);
+    r.follow_skipped = Some(shared.ledger.lock().unwrap().skipped_count());
     r
 }
 
 /// 停止跟单：只关闸门，HTTP 端口照常监听
 ///
-/// 信号仍能打进来，但会被丢弃并回 `not_running` —— 界面要测接口时端口得一直在。
+/// 信号仍能打进来，会被记进台账但不下单，回 `recorded_not_placed`。
+/// 记录而不是丢弃，是因为「没开闸」和「信号没到」在外部看来一模一样，
+/// 策略方没法判断该排查推送还是排查闸门。
 fn do_follow_stop(req: &Request, shared: &Shared) -> Response {
     let mut slot = shared.follow.lock().unwrap();
     match slot.take() {
         Some(rt) => {
             let mut r = Response::ok(req.id);
             r.detail = Some(format!(
-                "跟单已停止，信号将丢弃；本次共成交 {} 单",
+                "跟单已停止，信号只记录不下单；本次共成交 {} 单",
                 rt.ok_count
             ));
             // 笔数归零：那是「本次运行」的计数，停了就没有本次了；
             // 历史成交在台账里，想看得走 follow_status 的 detail。
             r.follow_running = Some(false);
             r.follow_count = Some(0);
+            drop(slot);
+            r.follow_skipped = Some(shared.ledger.lock().unwrap().skipped_count());
             r
         }
         None => {
@@ -730,6 +759,8 @@ fn do_follow_stop(req: &Request, shared: &Shared) -> Response {
             r.detail = Some("跟单本来就没在跑".into());
             r.follow_running = Some(false);
             r.follow_count = Some(0);
+            drop(slot);
+            r.follow_skipped = Some(shared.ledger.lock().unwrap().skipped_count());
             r
         }
     }
@@ -738,35 +769,77 @@ fn do_follow_stop(req: &Request, shared: &Shared) -> Response {
 /// 跟单状态
 fn do_follow_status(req: &Request, shared: &Shared) -> Response {
     let addr = shared.http_addr();
-    let mut slot = shared.follow.lock().unwrap();
     let mut r = Response::ok(req.id);
-    match slot.as_mut() {
-        Some(rt) => {
-            r.state = Some("running".into());
-            r.detail = Some(format!(
-                "监听 {}，启动于 {}，已跟单 {} 笔；最近：{}",
-                addr, rt.started_at, rt.ok_count, rt.last_note
-            ));
-            r.total = Some(rt.ok_count as usize);
-            r.follow_running = Some(true);
-            r.follow_count = Some(rt.ok_count);
-            r.follow_addr = Some(addr);
-        }
-        None => {
-            r.state = Some("idle".into());
-            r.detail = Some(if addr.is_empty() {
-                "跟单未启动（HTTP 服务也没起来）".into()
-            } else {
-                format!("跟单未启动；HTTP 在 {addr} 监听，信号会被丢弃")
-            });
-            r.total = Some(0);
-            r.follow_running = Some(false);
-            r.follow_count = Some(0);
-            if !addr.is_empty() {
+    {
+        let mut slot = shared.follow.lock().unwrap();
+        match slot.as_mut() {
+            Some(rt) => {
+                r.state = Some("running".into());
+                r.detail = Some(format!(
+                    "监听 {}，启动于 {}，已跟单 {} 笔；最近：{}",
+                    addr, rt.started_at, rt.ok_count, rt.last_note
+                ));
+                r.total = Some(rt.ok_count as usize);
+                r.follow_running = Some(true);
+                r.follow_count = Some(rt.ok_count);
                 r.follow_addr = Some(addr);
+            }
+            None => {
+                r.state = Some("idle".into());
+                r.detail = Some(if addr.is_empty() {
+                    "跟单未启动（HTTP 服务也没起来），信号会被记录但不会下单".into()
+                } else {
+                    format!("跟单未启动；HTTP 在 {addr} 监听，信号会被记录但不会下单")
+                });
+                r.total = Some(0);
+                r.follow_running = Some(false);
+                r.follow_count = Some(0);
+                if !addr.is_empty() {
+                    r.follow_addr = Some(addr);
+                }
             }
         }
     }
+    // 闸门关着时也被收录的信号条数：用户得能看见「记录」到底发生了没有
+    r.follow_skipped = Some(shared.ledger.lock().unwrap().skipped_count());
+    r
+}
+
+/// 最近收到的信号记录
+///
+/// 存在的理由：闸门关着时信号「被记录」了，但记录躺在台账 JSON 里，
+/// 界面看不见就等于没有。这个 op 让它可见。
+///
+/// 请求字段：
+///   kind   "skipped" 只看没下单的；"placed" 只看下过单的；不给=全部
+///   amount 最多返回几条（默认 50，上限 500）
+fn do_follow_records(req: &Request, shared: &Shared) -> Response {
+    let n = req.amount.unwrap_or(50).clamp(1, 500) as usize;
+    let ledger = shared.ledger.lock().unwrap();
+    let mut rows = ledger.recent(500, false);
+    match req.kind.as_deref() {
+        Some("skipped") => rows.retain(|r| {
+            matches!(
+                r.get("status").and_then(|x| x.as_str()),
+                Some("skipped") | Some("filtered") | Some("duplicate")
+            )
+        }),
+        Some("placed") => rows.retain(|r| {
+            matches!(
+                r.get("status").and_then(|x| x.as_str()),
+                Some("placed") | Some("failed")
+            )
+        }),
+        _ => {}
+    }
+    rows.truncate(n);
+    let total = rows.len();
+    let mut r = Response::ok(req.id);
+    r.detail = Some(format!("台账共 {} 条记录，本次返回 {total} 条", ledger.records.len()));
+    r.rows = Some(rows);
+    r.total = Some(total);
+    drop(ledger);
+    r.follow_skipped = Some(shared.ledger.lock().unwrap().skipped_count());
     r
 }
 
@@ -789,6 +862,58 @@ fn resolve_signal_account(
     }
 }
 
+/// 往台账里记一条「收到过的信号」
+///
+/// 记的东西比分单记录全一点：**原始信号原文也要留下**。闸门关着时没人下单，
+/// 事后想复盘「当时到底收到了什么、为什么没下」就只能靠这份原文。
+fn record_signal(shared: &Shared, rec: serde_json::Value) {
+    shared.ledger.lock().unwrap().push_record(rec);
+}
+
+/// 拼一条信号记录
+///
+/// `status` 取值：
+/// - `placed`    已下单（另由 handle_signal 末尾写，这里不产生）
+/// - `failed`    下过单但失败（同上）
+/// - `skipped`   闸门关着，收到但没下单
+/// - `filtered`  被过滤闸门拦下（与闸门无关，闸门开着也不会下）
+/// - `duplicate` 重复信号
+///
+/// 用同一个字段而不是散落的布尔值，是因为界面要能直接按状态筛。
+fn signal_record(
+    raw: &serde_json::Value,
+    order: Option<&follow::Order>,
+    status: &str,
+    detail: &str,
+    account: &str,
+) -> serde_json::Value {
+    let mut rec = serde_json::json!({
+        "time": order.map(|o| o.time.clone())
+            .unwrap_or_else(|| follow::now_string()),
+        "status": status,
+        "detail": detail,
+        "account": account,
+        "uid": order.map(|o| o.uid.clone()),
+        "code": order.map(|o| o.code.clone()),
+        "name": order.map(|o| o.name.clone()),
+        "direction": order.map(|o| o.side_str()),
+        "amount": order.map(|o| o.amount),
+        "raw_amount": order.map(|o| o.raw_amount),
+        "price": order.map(|o| o.price),
+        "strategy": order.map(|o| o.strategy.clone()),
+        // 原始信号原文。归一化会丢掉不认识的钱段（比如聚宽的各种附加字段），
+        // 排查「策略到底推了什么」只能靠它。
+        "raw": raw,
+        "received_at": now_str(),
+    });
+    // 上面那些 None 会在 JSON 里变成 null，去掉更干净 —— 界面直接显示，
+    // 一片 null 比字段缺失更让人困惑。
+    if let Some(m) = rec.as_object_mut() {
+        m.retain(|_, v| !v.is_null());
+    }
+    rec
+}
+
 /// 处理一条信号
 ///
 /// `account_override` 是 HTTP 路径里指定的账户（`/credit/signal`）；为 None 时
@@ -802,47 +927,88 @@ fn handle_signal(
     let cfg = shared.cfg();
     let app = config::AppConfig::load(std::path::Path::new(&cfg.config_path));
 
+    // 0. 这条信号打算记到哪个账户名下。先算出来只为记账用 ——
+    //    解析失败也不影响记录：记录本身不该因为账户写错就丢掉。
+    let acct_name = resolve_signal_account(account_override, &app)
+        .map(|a| a.as_str().to_string())
+        .unwrap_or_else(|_| account_override.unwrap_or("unknown").to_string());
+
     // 1. 归一化
     let order = match follow::signal_to_order(v, &app) {
         Ok(o) => o,
         Err(f) => {
-            return serde_json::json!({"ok": false, "status": "filtered", "reason": f.reason()})
+            record_signal(shared, signal_record(v, None, "filtered", f.reason(), &acct_name));
+            return serde_json::json!({
+                "ok": false, "status": "filtered", "reason": f.reason(),
+                "recorded": true
+            });
         }
     };
 
     // 2. 过滤闸门（必须在判重之前，见 follow.rs 顶部说明）
     if let Err(f) = follow::apply_filters(&order, &app) {
+        record_signal(shared, signal_record(v, Some(&order), "filtered", f.reason(), &acct_name));
         return serde_json::json!({
             "ok": false, "status": "filtered", "reason": f.reason(),
-            "code": order.code, "direction": order.side_str()
+            "code": order.code, "direction": order.side_str(),
+            "recorded": true
         });
     }
 
+    // 3. 闸门
+    //
+    // 闸门关着 ≠ 接口关着：信号照样到、照样记进台账，只是不下单。
+    // 以前这里直接丢弃，结果「没开跟单」和「信号根本没收到」在外部看来
+    // 一模一样 —— 策略方无法判断是自己的推送出了问题还是对方没开闸。
+    //
+    // 这里**不把 uid 记进去重集合**：闸门一开，同一信号重推必须还能下单。
+    // （同花顺版就栽在把被拦下的信号占掉去重名额上，见 follow.rs 顶部。）
     let mut slot = shared.follow.lock().unwrap();
     let Some(rt) = slot.as_mut() else {
+        drop(slot);
+        record_signal(
+            shared,
+            signal_record(
+                v, Some(&order), "skipped",
+                "跟单未开启，信号只记录不下单", &acct_name,
+            ),
+        );
         return serde_json::json!({
-            "ok": false, "status": "not_running",
-            "reason": "跟单已停止，信号被丢弃"
+            "ok": false,
+            "status": "recorded_not_placed",
+            "reason": "跟单未开启，信号已记录但未下单",
+            "recorded": true,
+            "uid": order.uid,
+            "code": order.code,
+            "direction": order.side_str(),
+            "amount": order.amount,
+            "price": order.price,
+            "account": acct_name,
         });
     };
 
-    // 3. 判重
-    if !app.allow_reorder && rt.ledger.contains(&order.uid) {
+    // 4. 判重
+    if !app.allow_reorder && shared.ledger.lock().unwrap().contains(&order.uid) {
         rt.note(format!("重复信号已跳过: {} {}", order.code, order.side_str()));
+        record_signal(
+            shared,
+            signal_record(v, Some(&order), "duplicate", "重复信号，已下过单", &acct_name),
+        );
         return serde_json::json!({
             "ok": false, "status": "duplicate", "uid": order.uid,
-            "code": order.code, "direction": order.side_str()
+            "code": order.code, "direction": order.side_str(),
+            "recorded": true
         });
     }
 
-    // 4. 先记 uid 再下单：这样即使下单中途崩溃，重启后也不会重复下同一单。
+    // 5. 先记 uid 再下单：这样即使下单中途崩溃，重启后也不会重复下同一单。
     //    下单失败时按 allow_reorder 决定是否回滚。
-    rt.ledger.mark(&order.uid);
+    shared.ledger.lock().unwrap().mark(&order.uid);
 
     let (pid, win) = match panel::ensure_window(&cfg.app_path) {
         Some(v) => v,
         None => {
-            rt.ledger.unmark(&order.uid);
+            shared.ledger.lock().unwrap().unmark(&order.uid);
             rt.note("客户端窗口不可用".into());
             return serde_json::json!({
                 "ok": false, "status": "error", "reason": "客户端窗口不可用"
@@ -851,7 +1017,7 @@ fn handle_signal(
     };
 
     if let Err(e) = ensure_unlocked(&win, pid, &cfg, shared) {
-        rt.ledger.unmark(&order.uid);
+        shared.ledger.lock().unwrap().unmark(&order.uid);
         rt.note(format!("解锁失败: {e}"));
         return serde_json::json!({"ok": false, "status": "error", "reason": e});
     }
@@ -859,7 +1025,7 @@ fn handle_signal(
     let account = match resolve_signal_account(account_override, &app) {
         Ok(a) => a,
         Err(e) => {
-            rt.ledger.unmark(&order.uid);
+            shared.ledger.lock().unwrap().unmark(&order.uid);
             rt.note(e.clone());
             return serde_json::json!({
                 "ok": false, "status": "error", "reason": e
@@ -875,7 +1041,7 @@ fn handle_signal(
     let price = if order.price > 0.0 {
         format!("{:.3}", order.price)
     } else {
-        rt.ledger.unmark(&order.uid);
+        shared.ledger.lock().unwrap().unmark(&order.uid);
         rt.note("信号没有价格，拒绝下单".into());
         return serde_json::json!({
             "ok": false, "status": "error",
@@ -917,7 +1083,7 @@ fn handle_signal(
         rt.ok_count += 1;
     } else if app.allow_reorder {
         // 允许重试时把 uid 摘掉，下次同信号还能再试
-        rt.ledger.unmark(&order.uid);
+        shared.ledger.lock().unwrap().unmark(&order.uid);
     }
     rt.note(format!(
         "{} {} {}股 @{} → {}",
@@ -928,7 +1094,7 @@ fn handle_signal(
         detail
     ));
 
-    rt.ledger.push_record(serde_json::json!({
+    shared.ledger.lock().unwrap().push_record(serde_json::json!({
         "uid": order.uid,
         "time": order.time,
         "code": order.code,
@@ -940,6 +1106,7 @@ fn handle_signal(
         "ratio": order.ratio,
         "strategy": order.strategy,
         "account": account.as_str(),
+        "status": if success { "placed" } else { "failed" },
         "success": success,
         "detail": detail,
         "place_at": now_str(),
@@ -1273,6 +1440,7 @@ fn dispatch_account(req: &Request, shared: &Shared) -> Response {
                 follow_running: None,
                 follow_count: None,
                 follow_addr: None,
+                follow_skipped: None,
             };
         }
         // 调试用：在窗口坐标上点一下（x/y 来自请求的 seq/ts 两个数值字段不好读，
@@ -1355,6 +1523,7 @@ fn dispatch_account(req: &Request, shared: &Shared) -> Response {
         "follow_start" => do_follow_start(req, shared),
         "follow_stop" => do_follow_stop(req, shared),
         "follow_status" => do_follow_status(req, shared),
+        "follow_records" => do_follow_records(req, shared),
 
         other => Response::err(req.id, format!("未知操作: {other}")),
     }

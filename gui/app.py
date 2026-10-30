@@ -39,6 +39,7 @@ import subprocess
 import threading
 import tkinter as tk
 import urllib.error
+import urllib.parse
 import urllib.request
 from tkinter import filedialog, messagebox, ttk
 
@@ -228,6 +229,15 @@ class HttpClient:
             return "POST", "/follow_stop", None
         if op == "follow_status":
             return "GET", "/follow_status", None
+        if op == "follow_records":
+            # 台账里的信号流水查表：只读，参数走查询串
+            q = []
+            if kw.get("kind"):
+                q.append("kind=" + urllib.parse.quote(str(kw["kind"])))
+            if kw.get("amount"):
+                q.append("amount=" + str(int(kw["amount"])))
+            tail = ("?" + "&".join(q)) if q else ""
+            return "GET", "/follow_records" + tail, None
         if op == "ping":
             return "GET", "/ping", None
         return None
@@ -291,6 +301,17 @@ class HttpClient:
             return {"ok": False, "error": "HTTP 请求超时"}
         except Exception as e:
             return {"ok": False, "error": f"HTTP 请求失败: {e}"}
+
+
+# 台账里的状态 → 界面上的中文。台账用英文键是为了程序好判断，
+# 界面直接显示英文会让人分不清 skipped（闸门关着没下）和 failed（下了没成）。
+STATUS_CN = {
+    "placed": "已下单",
+    "failed": "下单失败",
+    "skipped": "未下单（闸门关着）",
+    "filtered": "已过滤",
+    "duplicate": "重复信号",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +751,10 @@ class App:
         # 还得看日志，所以按钮留着，只是不再承担「有没有在跑」这个职责。
         ttk.Button(r4, text="跟单详情", command=self.on_follow_status).pack(
             side="left", padx=6)
+        # 闸门关着时信号只记录不下单，「记录」得有地方看，
+        # 否则「记下来了」这句话在界面上无从验证。
+        ttk.Button(r4, text="信号记录", command=self.on_follow_records).pack(
+            side="left")
 
         # 状态灯就放在按钮旁边 —— 用户按完按钮视线还在这块，
         # 立刻能看到它变成什么颜色，不用另找地方确认。
@@ -1041,7 +1066,8 @@ class App:
             self.root.after(0, lambda: self._render_core_probe(r, auto_start=auto_start))
         threading.Thread(target=work, daemon=True).start()
 
-    def _render_follow(self, running, count=0, addr=None, core_running=True):
+    def _render_follow(self, running, count=0, addr=None, core_running=True,
+                       skipped=None):
         """跟单状态灯只由这一处写。
 
         和 `_render_core_state` 同款理由：轮询、启动探测、开始/停止按钮
@@ -1069,11 +1095,13 @@ class App:
         else:
             self.follow_dot.configure(fg="#bbb")
             self.follow_dot2.configure(fg="#bbb")
-            # 端口一直在监听，所以不能说「不会接收信号」——
-            # 信号会进来、会被明确丢弃并回 not_running。措辞含糊会让人
-            # 以为接口是关的，从而怀疑 HTTP 通道坏了。
-            self.follow_var.set("跟单：未启动（信号会收到但不下单）")
-            self.follow_var2.set("未启动 —— HTTP 在监听，信号会被丢弃")
+            # 端口一直在监听，闸门关着时信号**会被记进台账**而不是丢掉。
+            # 以前文案写「会被丢弃」，与现在的行为相反，必须改：
+            # 用户看到「丢弃」会以为信号真没了，从而重复推送。
+            extra = f" · 已记 {skipped} 条未下单" if skipped else ""
+            self.follow_var.set(f"跟单：未启动（信号只记录不下单）{extra}")
+            self.follow_var2.set(
+                f"未启动 —— HTTP 在监听，信号会记录但不会下单{extra}")
             self.follow_label.configure(fg="#666")
             self.follow_label2.configure(fg="#666")
 
@@ -1122,6 +1150,7 @@ class App:
             bool(r.get("follow_running")),
             r.get("follow_count") or 0,
             r.get("follow_addr"),
+            skipped=r.get("follow_skipped"),
         )
         if auto_start and not (self.core_proc and self.core_proc.poll() is None):
             who = f"pid {pid}" if pid else "外部启动"
@@ -1142,6 +1171,7 @@ class App:
             bool(r.get("follow_running")),
             r.get("follow_count") or 0,
             r.get("follow_addr"),
+            skipped=r.get("follow_skipped"),
         )
 
         state = r.get("state")
@@ -1256,7 +1286,8 @@ class App:
             self.root.after(0, lambda: self._render_follow(
                 bool(r.get("follow_running")),
                 r.get("follow_count") or 0,
-                r.get("follow_addr")))
+                r.get("follow_addr"),
+                skipped=r.get("follow_skipped")))
         threading.Thread(target=work, daemon=True).start()
         self.log("正在启动跟单…")
 
@@ -1269,7 +1300,8 @@ class App:
             self.root.after(0, lambda: self._render_follow(
                 bool(r.get("follow_running")),
                 r.get("follow_count") or 0,
-                r.get("follow_addr")))
+                r.get("follow_addr"),
+                skipped=r.get("follow_skipped")))
         threading.Thread(target=work, daemon=True).start()
 
     def on_follow_status(self):
@@ -1280,9 +1312,49 @@ class App:
                 self.root.after(0, lambda: self._render_follow(
                     bool(r.get("follow_running")),
                     r.get("follow_count") or 0,
-                    r.get("follow_addr")))
+                    r.get("follow_addr"),
+                    skipped=r.get("follow_skipped")))
             else:
                 self.log(f"读取跟单状态失败：{r.get('error')}", "ERROR")
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_follow_records(self):
+        """看台账里的信号流水。
+
+        闸门关着时信号只记录不下单，这些记录得有个地方能看 —— 否则
+        「已记录」就只是句口头承诺，用户没法确认策略到底推上来了没有。
+        """
+        def work():
+            r = self.call("follow_records", amount=50, timeout=30)
+            if not r.get("ok"):
+                self.log(f"✗ 读取信号记录失败：{r.get('error')}", "ERROR")
+                return
+            rows = r.get("rows") or []
+            # 只挑人看得懂的几个字段，原始 JSON 原文放到最后一列，
+            # 排查「策略到底推了什么」时直接读它。
+            view = [{
+                "状态": STATUS_CN.get(row.get("status"), row.get("status") or ""),
+                "收到时间": row.get("received_at") or row.get("time") or "",
+                "代码": row.get("code") or "",
+                "方向": row.get("direction") or "",
+                "数量": row.get("amount") or "",
+                "价格": row.get("price") or "",
+                "账户": row.get("account") or "",
+                "说明": row.get("detail") or "",
+                "原始信号": (json.dumps(row.get("raw"), ensure_ascii=False)
+                            if row.get("raw") else ""),
+            } for row in rows]
+            self.root.after(0, lambda: self._show_rows(
+                f"信号记录 · {len(rows)} 条（{r.get('detail') or ''}）", view))
+            skipped = r.get("follow_skipped") or 0
+            self.log(f"✓ 信号记录 {len(rows)} 条，其中未下单 {skipped} 条",
+                     "OK" if rows else "INFO")
+            # 顺带把状态灯上的计数刷新一下，省得等下一轮轮询
+            self.root.after(0, lambda: self._render_follow(
+                bool(r.get("follow_running")),
+                r.get("follow_count") or 0,
+                r.get("follow_addr"),
+                skipped=skipped))
         threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------------

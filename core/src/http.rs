@@ -183,6 +183,27 @@ const CREDIT_PENDING: &[&str] = &[
 /// `/credit/positions` → `(Some("credit"), "positions")`
 /// `/positions`        → `(None, "positions")`（老路径，账户由实现决定）
 /// `/`                 → `(None, "")`
+/// 只解 %XX，不处理 `+` —— 本接口的参数都是简单的标志位和数字，
+/// 犯不上为它引一个完整的 URL 解码依赖。
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("");
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 fn parse_path(path: &str) -> (Option<&'static str>, &str) {
     let rest = path.trim_start_matches('/');
     for ns in ["normal", "credit"] {
@@ -244,6 +265,7 @@ fn handle_conn(
                 "GET /{ns}/cancel_list",
                 "GET /status", "GET /follow_status",
                 "GET /raw_ocr", "GET /lock_probe",
+                "GET /follow_records",
                 "POST /unlock", "POST /reset_unlock",
                 "POST /follow_start", "POST /follow_stop",
             ],
@@ -333,7 +355,7 @@ fn handle_conn(
             "ok": false, "error": format!("not_found：{} {}", req.method, req.path)
             }));
         }
-        let body: serde_json::Value = if req.body.trim().is_empty() {
+        let mut body: serde_json::Value = if req.body.trim().is_empty() {
             serde_json::json!({})
         } else {
             match serde_json::from_str(&req.body) {
@@ -345,6 +367,24 @@ fn handle_conn(
                 }
             }
         };
+        // 查询串参数并进 body：GET 请求带不了 body，`?kind=skipped&amount=20`
+        // 这种过滤条件只能从这里进来。**不覆盖** body 里已有的键 ——
+        // 显式写在 body 里的比 URL 上的更可信。
+        if !req.query.is_empty() {
+            if let Some(m) = body.as_object_mut() {
+                for pair in req.query.split('&') {
+                    let (k, v) = match pair.split_once('=') {
+                        Some(kv) => kv,
+                        None => continue,
+                    };
+                    if k.is_empty() || m.contains_key(k) {
+                        continue;
+                    }
+                    m.insert(k.to_string(), serde_json::Value::String(
+                        percent_decode(v).to_string()));
+                }
+            }
+        }
         let (status, out) = rpc(ns, op, &body);
         return respond(&mut stream, status, &out);
     }
@@ -371,6 +411,7 @@ fn rpc_op(action: &str) -> Option<&'static str> {
         "follow_start" => Some("follow_start"),
         "follow_stop" => Some("follow_stop"),
         "follow_status" => Some("follow_status"),
+        "follow_records" => Some("follow_records"),
         _ => None,
     }
 }
@@ -386,7 +427,15 @@ const RPC_POST: &[&str] = &[
 ];
 
 /// 只接受 GET 的动作（纯读取）
-const RPC_GET: &[&str] = &["cancel_list", "status", "ping", "raw_ocr", "lock_probe", "follow_status"];
+const RPC_GET: &[&str] = &[
+    "cancel_list",
+    "status",
+    "ping",
+    "raw_ocr",
+    "lock_probe",
+    "follow_status",
+    "follow_records",
+];
 
 /// 读一个 HTTP 请求。只支持 HTTP/1.1 + Content-Length，够用。
 fn read_request(stream: &mut TcpStream) -> Option<Request> {

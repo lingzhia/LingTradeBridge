@@ -270,6 +270,37 @@ impl Ledger {
         self.processed.remove(uid);
     }
 
+    /// 最近的信号记录，最新在前。
+    ///
+    /// `only_skipped` 只挑「收到了但没下单」的那些 —— 闸门关着时的记录就靠它
+    /// 单独取出来看。台账本身不区分来源，用记录里的 `status` 区分。
+    pub fn recent(&self, n: usize, only_skipped: bool) -> Vec<serde_json::Value> {
+        self.records
+            .iter()
+            .rev()
+            .filter(|r| {
+                !only_skipped
+                    || matches!(
+                        r.get("status").and_then(|x| x.as_str()),
+                        Some("skipped") | Some("filtered")
+                    )
+            })
+            .take(n)
+            .cloned()
+            .collect()
+    }
+
+    /// 「闸门关着时收到、只记录没下单」的条数，供状态栏显示。
+    ///
+    /// 只数 `skipped`，不数 `filtered` —— 后者是被过滤规则拦下的，
+    /// 跟闸门开没开无关，混进来会让用户以为「开闸就能下」。
+    pub fn skipped_count(&self) -> u64 {
+        self.records
+            .iter()
+            .filter(|r| r.get("status").and_then(|x| x.as_str()) == Some("skipped"))
+            .count() as u64
+    }
+
     pub fn push_record(&mut self, rec: serde_json::Value) {
         self.records.push(rec);
         // 只留最近 2000 条，文件别无限长
