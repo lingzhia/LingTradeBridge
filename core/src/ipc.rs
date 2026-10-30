@@ -627,7 +627,6 @@ fn do_cancel_list(req: &Request, shared: &Shared) -> Response {
 /// 请求字段：code（证券代码，可选）、order_no（委托编号，可选），两者至少给一个；
 /// 两个都给时要求同时匹配，避免撤错同代码的其他委托。
 fn do_cancel(req: &Request, shared: &Shared) -> Response {
-    let cfg = shared.cfg();
     let code = req.code.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let order_no = req.order_no.as_deref().map(str::trim).filter(|s| !s.is_empty());
     if code.is_none() && order_no.is_none() {
@@ -638,7 +637,33 @@ fn do_cancel(req: &Request, shared: &Shared) -> Response {
             return Response::err(req.id, format!("证券代码不合法: {c}"));
         }
     }
+    let account = match req.account.as_deref() {
+        Some("credit") => panel::Account::Credit,
+        Some("normal") | None => panel::Account::Normal,
+        Some(other) => return Response::err(req.id, format!("未知账户类型: {other}")),
+    };
 
+    // 撤单也走同一个总开关，关着时同样什么都不做 —— 撤单也是在动真钱
+    // （撤掉就没了），漏掉它等于开关只关了一半。
+    if !shared.follow.lock().unwrap().is_some() {
+        let mut r = Response::ok(req.id);
+        r.placed = Some(false);
+        r.account = Some(account.as_str().to_string());
+        r.detail = Some(format!(
+            "{}目标 {}",
+            simulated_note("撤单"),
+            match (code, order_no) {
+                (Some(c), Some(n)) => format!("{c} {n}"),
+                (Some(c), None) => c.to_string(),
+                (None, Some(n)) => n.to_string(),
+                (None, None) => String::new(),
+            }
+        ));
+        r.state = Some("cancelled".into());
+        return r;
+    }
+
+    let cfg = shared.cfg();
     let (pid, win) = match panel::ensure_window(&cfg.app_path) {
         Some(v) => v,
         None => return Response::err(req.id, "客户端未运行"),
@@ -646,28 +671,13 @@ fn do_cancel(req: &Request, shared: &Shared) -> Response {
     if let Err(e) = ensure_unlocked(&win, pid, &cfg, shared) {
         return Response::err(req.id, e);
     }
-    let account = match req.account.as_deref() {
-        Some("credit") => panel::Account::Credit,
-        Some("normal") | None => panel::Account::Normal,
-        Some(other) => return Response::err(req.id, format!("未知账户类型: {other}")),
-    };
-    // 撤单也走同一个总开关：关着时只走完「定位到哪一笔」，不真的点撤销。
-    //
-    // 撤单是在动真钱（撤掉就没了），漏掉它等于开关只关了一半。
-    // 换句话说，开关关着 = 这个内核不碰真实委托，无论买卖还是撤。
-    let gate_open = shared.follow.lock().unwrap().is_some();
-    let asked_dry_run = req.action.as_deref() == Some("dry_run");
-    let dry_run = effective_dry_run(asked_dry_run, gate_open);
+    let dry_run = req.action.as_deref() == Some("dry_run");
 
     match cancel::cancel_one(&win, pid, &cfg, account, code, order_no, dry_run) {
         cancel::CancelOutcome::Cancelled { code, order_no } => {
             let mut r = Response::ok(req.id);
             r.placed = Some(!dry_run);
-            r.detail = Some(if gate_open {
-                format!("已撤销 {code} {order_no}")
-            } else {
-                format!("（测试模式，未实际撤单）定位到可撤委托 {code} {order_no}")
-            });
+            r.detail = Some(format!("已撤销 {code} {order_no}"));
             r.state = Some("cancelled".into());
             r.account = Some(account.as_str().to_string());
             r
@@ -1153,19 +1163,12 @@ fn now_str() -> String {
     follow::now_string()
 }
 
-/// 「这一单到底要不要真的提交给券商」的唯一判定
+/// 开关关着时的回应前缀
 ///
-/// 抽成纯函数是为了能测：`do_place_order` 一进门就要窗口和界面，
-/// 测试里跑不动，而这道判断恰恰是最容易写歪的地方。
-///
-/// 规则只有一条：**总开关（跟单闸门）关着，就不真提交**。
-/// 关着时仍然走完填单，所以「参数对不对、界面能不能填进去」照样能验证，
-/// 只是最后不点提交按钮 —— 钱不会动。
-///
-/// `asked_dry_run` 是调用方自己要求的只填单（老接口参数，保留兼容）。
-/// 两者取「或」：任何一方要求不提交，就不提交。
-fn effective_dry_run(asked_dry_run: bool, gate_open: bool) -> bool {
-    asked_dry_run || !gate_open
+/// 抽出来是因为它要被断言：主路径一进门就要客户端窗口，测试里跑不动，
+/// 而「用户能不能从响应里一眼看出这单没真下」恰恰是最该守住的一条。
+fn simulated_note(real_action: &str) -> String {
+    format!("（模拟{real_action}，未真正{real_action}）")
 }
 
 /// 下单
@@ -1178,28 +1181,20 @@ fn effective_dry_run(asked_dry_run: bool, gate_open: bool) -> bool {
 ///   account   normal / credit（默认 normal）
 ///   action    下单后是否提交：不给或 "submit" 提交；"dry_run" 只填不提交
 ///
-/// 真提交与否由「开始/停止跟单」这个总开关决定，见 `effective_dry_run`。
-/// 开关关着时本函数**照常返回成功**，只是不做最后那一下点击，
-/// 并在响应里带 `placed: false` —— 调用方不会因为开关状态而收到报错，
-/// 报错留给真正的错误（代码填错、价格缺失、窗口不可用……）。
+/// 真提交与否由「开始/停止跟单」这个总开关决定。开关关着时本函数**什么都不做**：
+/// 不切账户、不解锁、不碰客户端窗口，直接回一个成功响应说明这单是模拟的。
 fn do_place_order(req: &Request, shared: &Shared) -> Response {
     // 总开关：一个开关管所有真下单 —— 信号、接口、界面按钮，全看它。
     //
-    // 关着时不是「拒绝请求」，而是「照常走完、不点提交」。原因：
-    // 这个开关是给人测功能的，用起来得像没这个开关一样；返回报错等于
-    // 逼调用方去理解一个测试用的内部状态。
+    // 关着时什么都不做，直接回响应。三个理由：
+    // 1. 这个开关是给人测功能的，测试时客户端可以根本没开；
+    // 2. 调一次接口不该改动界面上任何东西 —— 否则「只是想试试接口」
+    //    和「真的要下单」在客户端那边长得一模一样；
+    // 3. 不碰界面就没有副作用，调一百次也不会把窗口弄乱。
+    //
+    // 参数照旧校验：响应里要回「哪只票、多少股、什么价」，而且不校验就分不清
+    // 「参数传错了」和「开关关着」—— 那测试接口本身就没意义了。
     let gate_open = shared.follow.lock().unwrap().is_some();
-    let asked_dry_run = req.action.as_deref() == Some("dry_run");
-    let dry_run = effective_dry_run(asked_dry_run, gate_open);
-
-    let cfg = shared.cfg();
-    let (pid, win) = match panel::ensure_window(&cfg.app_path) {
-        Some(v) => v,
-        None => return Response::err(req.id, "客户端窗口不可用"),
-    };
-    if let Err(e) = ensure_unlocked(&win, pid, &cfg, shared) {
-        return Response::err(req.id, e);
-    }
 
     let code = match req.code.as_deref() {
         Some(c) if !c.trim().is_empty() => c.trim().to_string(),
@@ -1225,6 +1220,32 @@ fn do_place_order(req: &Request, shared: &Shared) -> Response {
         Some(o) => return Response::err(req.id, format!("未知账户类型: {o}")),
     };
 
+    if !gate_open {
+        let mut r = Response::ok(req.id);
+        r.placed = Some(false);
+        r.account = Some(account.as_str().into());
+        r.detail = Some(format!(
+            "{}{} {} {}股 @{}",
+            simulated_note("下单"),
+            side.as_str(),
+            code,
+            amount,
+            price
+        ));
+        return r;
+    }
+
+    // 走到这里开关是开着的：动真格，先把窗口和解锁备好。
+    let dry_run = req.action.as_deref() == Some("dry_run");
+    let cfg = shared.cfg();
+    let (pid, win) = match panel::ensure_window(&cfg.app_path) {
+        Some(v) => v,
+        None => return Response::err(req.id, "客户端窗口不可用"),
+    };
+    if let Err(e) = ensure_unlocked(&win, pid, &cfg, shared) {
+        return Response::err(req.id, e);
+    }
+
     let mut r = Response::ok(req.id);
     r.account = Some(account.as_str().into());
     match order::place_order(&win, pid, &cfg, account, side, &code, &price, amount, dry_run) {
@@ -1232,13 +1253,7 @@ fn do_place_order(req: &Request, shared: &Shared) -> Response {
             // placed 只在这条「成功」路上出现：它回答的是「这一单真的交出去了吗」。
             // 拿不到合同号也是成功（填单成功但没提交），所以按 dry_run 判而不是按 order_no。
             r.placed = Some(!dry_run);
-            let prefix = if !gate_open {
-                "（测试模式，未实际下单）"
-            } else if asked_dry_run {
-                "[干跑] 仅填单，"
-            } else {
-                ""
-            };
+            let prefix = if dry_run { "[干跑] 仅填单，" } else { "" };
             r.detail = Some(format!(
                 "{}{} {} {}股 @{} {}",
                 prefix,
@@ -1998,13 +2013,12 @@ mod tests {
     }
 
     #[test]
-    fn 开关关着任何真下单都不提交() {
-        // 关着：不管调用方有没有要求干跑，都不提交
-        assert!(effective_dry_run(false, false), "开关关着必须不提交");
-        assert!(effective_dry_run(true, false));
-        // 开着：不要求干跑就真提交
-        assert!(!effective_dry_run(false, true), "开关开着必须真提交");
-        // 开着时调用方自己要求干跑，仍然只填单（老接口参数保留兼容）
-        assert!(effective_dry_run(true, true));
+    fn 开关关着时响应用模拟字样说明() {
+        // 这是开关关着时唯一还会发生的事：回一句话说这单没真下。
+        // 措辞要能被一眼看懂 —— 调用方拿到的 ok 是 true，
+        // 全靠这句和 placed:false 区分「下了」和「没下」。
+        let note = simulated_note("下单");
+        assert_eq!(note, "（模拟下单，未真正下单）");
+        assert_eq!(simulated_note("撤单"), "（模拟撤单，未真正撤单）");
     }
 }
